@@ -1,0 +1,8 @@
+indexerd
+indexerd.san
+build/
+*.db
+*.db-wal
+*.db-shm
+*.dSYM/
+.DS_Store
