@@ -823,12 +823,21 @@ static int branch_outweighs(int fd, const Coin *coin, sqlite3 *db,
         memset(gh + o, 0, 32); o += 32;                    // hash_stop
         net_send(fd, coin->magic, "getheaders", gh, (uint32_t)o);
         char cmd[13]; uint8_t *pl = NULL; uint32_t pl_len = 0; int got = 0;
-        for (int tries = 0; tries < 8 && !got && !idx_sync_stop; tries++) {
+        // Drain until the `headers` reply. This weigh runs INSIDE the block
+        // receive loop, right after a getdata for a whole inv batch (≤600
+        // blocks) — so the peer streams that block backlog ahead of the headers
+        // it queues for our getheaders. An 8-message window gave up inside the
+        // flood and returned "not heavier", wedging a node on a minority fork
+        // forever (the branch it declined was the majority chain). The real
+        // timeout still bounds a dead peer: net_recv returns 0 on a 15 s stall,
+        // taking the `r != 1` exit below. Cap well above one batch as a
+        // junk-flood backstop.
+        for (int tries = 0; tries < 4096 && !got && !idx_sync_stop; tries++) {
             int r = net_recv(fd, coin->magic, cmd, &pl, &pl_len, 15000);
             if (r != 1) { if (r == -1) continue; return 0; }         // dead/timeout → keep ours
             if (!strcmp(cmd, "ping")) { net_send(fd, coin->magic, "pong", pl, pl_len); free(pl); continue; }
             if (!strcmp(cmd, "headers")) { got = 1; break; }
-            free(pl);                                                // drop interleaved inv/addr/block
+            free(pl);                                                // drop interleaved inv/addr/block backlog
         }
         if (!got) return 0;
         int n = branch_weigh(&bc, coin, db, pl, pl_len, why, cap);
