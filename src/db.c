@@ -86,6 +86,9 @@ int64_t idx_db_get_activation(sqlite3 *db, int64_t dflt) { char b[32]; return me
 // so a later refold/digest on this db uses the same subsidy, even for a non-default chain.
 void idx_db_set_subsidy(sqlite3 *db, int64_t s) { char b[32]; snprintf(b, sizeof b, "%lld", (long long)s); meta_set(db, "subsidy", b); }
 int64_t idx_db_get_subsidy(sqlite3 *db, int64_t dflt) { char b[32]; return meta_get(db, "subsidy", b, sizeof b) ? strtoll(b, NULL, 10) : dflt; }
+// one-shot markers in meta (migrations/repairs that must run once per db)
+int  idx_db_flag_get(sqlite3 *db, const char *k) { char b[8]; return meta_get(db, k, b, sizeof b); }
+void idx_db_flag_set(sqlite3 *db, const char *k) { meta_set(db, k, "1"); }
 
 // ── harvested chain peers (see peers table note in SCHEMA) ────────────────────
 void idx_db_peer_note(sqlite3 *db, const char *addr, int64_t services, int64_t now) {
@@ -383,19 +386,34 @@ int idx_db_watch_list(sqlite3 *db, uint8_t (*out)[20], int max) {
 }
 void idx_db_utxo_put(sqlite3 *db, const uint8_t txid[32], uint32_t vout,
                      const uint8_t h160[20], int64_t value, int64_t height) {
+    // IGNORE, not REPLACE: a conflicting row is always the same funding event
+    // seen again (rollback replay, crash-recovery refold) — a funding that was
+    // disconnected by a reorg is DELETEd by prune before any re-insert. REPLACE
+    // would re-write spent_height=NULL and resurrect an already-spent output.
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO utxos(txid,vout,h160,value,height,spent_height) VALUES(?,?,?,?,?,NULL)", -1, &st, NULL);
+    sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO utxos(txid,vout,h160,value,height,spent_height) VALUES(?,?,?,?,?,NULL)", -1, &st, NULL);
     sqlite3_bind_blob(st, 1, txid, 32, SQLITE_STATIC); sqlite3_bind_int(st, 2, (int)vout);
     sqlite3_bind_blob(st, 3, h160, 20, SQLITE_STATIC);
     sqlite3_bind_int64(st, 4, value); sqlite3_bind_int64(st, 5, height);
     sqlite3_step(st); sqlite3_finalize(st);
 }
-void idx_db_utxo_spend(sqlite3 *db, const uint8_t txid[32], uint32_t vout, int64_t height) {
+int idx_db_utxo_spend(sqlite3 *db, const uint8_t txid[32], uint32_t vout, int64_t height) {
     sqlite3_stmt *st;
     sqlite3_prepare_v2(db, "UPDATE utxos SET spent_height=? WHERE txid=? AND vout=?", -1, &st, NULL);
     sqlite3_bind_int64(st, 1, height);
     sqlite3_bind_blob(st, 2, txid, 32, SQLITE_STATIC); sqlite3_bind_int(st, 3, (int)vout);
     sqlite3_step(st); sqlite3_finalize(st);
+    return sqlite3_changes(db);          // 1 if this input hit a watched utxo
+}
+// Oldest funding height still marked unspent (any watched address) — the floor
+// a wallet re-walk must re-fold from. -1 when the table holds no unspent rows.
+int64_t idx_db_utxo_min_unspent(sqlite3 *db) {
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(db, "SELECT MIN(height) FROM utxos WHERE spent_height IS NULL", -1, &st, NULL);
+    int64_t h = -1;
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL)
+        h = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st); return h;
 }
 int idx_db_utxos(sqlite3 *db, const uint8_t h160[20],
                  void (*cb)(void *u, const uint8_t txid[32], uint32_t vout, int64_t value, int64_t height),

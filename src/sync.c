@@ -102,6 +102,7 @@ uint16_t idx_coin_port(const char *coin) {
 #define IDX_MAX_WATCH 16
 typedef struct { SmState *s; sqlite3 *db; OracleFeed *oracle; int folded;
                  int64_t height;
+                 int wallet_touched;   // this block put or spent a watched utxo
                  ServeStore *serve;    // NULL unless this pass feeds the serve cache
                  uint8_t watch[IDX_MAX_WATCH][20]; int nwatch; } FoldCtx;
 static void fold_load_watch(FoldCtx *fc) {
@@ -122,6 +123,7 @@ static void tx_cb(void *u, const IdxTx *tx, uint32_t txindex) {
                 if (!memcmp(h160, fc->watch[w], 20)) {
                     idx_db_utxo_put(fc->db, tx->txid, tx->outs[o].vout, h160,
                                     tx->outs[o].value, fc->height);
+                    fc->wallet_touched = 1;
                     break;
                 }
         }
@@ -130,7 +132,8 @@ static void tx_cb(void *u, const IdxTx *tx, uint32_t txindex) {
             uint32_t vout = (uint32_t)po[32] | (uint32_t)po[33] << 8 |
                             (uint32_t)po[34] << 16 | (uint32_t)po[35] << 24;
             if (vout == 0xFFFFFFFF) continue;     // coinbase
-            idx_db_utxo_spend(fc->db, po, vout, fc->height);
+            if (idx_db_utxo_spend(fc->db, po, vout, fc->height) > 0)
+                fc->wallet_touched = 1;
         }
     }
     // relay mempool: this tx just confirmed — drop it (and anything that now
@@ -147,12 +150,17 @@ static int connect_block(FoldCtx *fc, int64_t height, const uint8_t *raw, size_t
     int64_t lapses_before = fc->s->ev[SM_EV_LAPSE];
     sm_begin_block(fc->s, height, mtp, rate);
     int folded_before = fc->folded;
+    fc->wallet_touched = 0;
     if (!idx_parse_block(raw, len, &meta, tx_cb, fc)) { fprintf(stderr, "block %lld malformed\n", (long long)height); return 0; }
     oracle_record(fc->oracle, height, meta.time, meta.coinbase_out_total, meta.block_bytes);
     if (fc->db) {
         idx_db_block_put(fc->db, height, meta.block_hash, meta.time, meta.coinbase_out_total, meta.block_bytes, meta.bits);
-        if (fc->folded > folded_before)                 // reorg-replay substrate: keep raw
-            idx_db_rawblock_put(fc->db, height, raw, len);   // bytes of carrier blocks only
+        // reorg-replay substrate: keep the raw bytes of carrier blocks AND
+        // wallet-touching blocks — replay must re-see wallet spends too, or a
+        // rollback would leave spent outputs looking unspent (they were, once:
+        // the pre-repair builds' resurrected-balance bug).
+        if (fc->folded > folded_before || fc->wallet_touched)
+            idx_db_rawblock_put(fc->db, height, raw, len);
         // serve cache (NODE_NETWORK_LIMITED): every header + a rolling 288-block
         // window, in its own aux db. len >= 80 guaranteed (parse succeeded).
         if (fc->serve) serve_store_put(fc->serve, height, meta.block_hash, raw, raw, len, height);
@@ -185,9 +193,11 @@ static int rollback_replay_cb(void *u, int64_t height, const uint8_t *raw, size_
 }
 // Roll the fold back to `to_height` (kept): prune every height-keyed projection
 // above it, drop its oracle rows, and rebuild the state by replaying the stored
-// raw carrier blocks ≤ to_height in order — a byte-identical refold, because
-// carrier-less blocks touch no state and their oracle rows (all heights) are
-// already in the feed. Replaces *s (old state freed). Returns 1, 0 on failure.
+// raw blocks ≤ to_height in order (carrier blocks + wallet-touching blocks) — a
+// byte-identical refold, because the skipped blocks touch no state and their
+// oracle rows (all heights) are already in the feed. The wallet blocks in the
+// substrate re-mark spends the replayed carrier funds would otherwise shed.
+// Replaces *s (old state freed). Returns 1, 0 on failure.
 int idx_sync_rollback(SmState **s, sqlite3 *db, OracleFeed *oracle,
                       int64_t activation, int64_t to_height) {
     idx_db_block_prune_above(db, to_height);
@@ -918,6 +928,32 @@ static int cmd_sync(int argc, char **argv) {
         if (height <= coin->start) { height = coin->start; memcpy(tip, coin->start_hash, 32); }
         else if (!idx_db_block_get(db, height, tip)) memcpy(tip, coin->start_hash, 32);
         idx_db_save_sync(db, height, tip);
+    }
+    // One-time wallet re-walk ("wallet_rewalk_v1"): earlier builds' rollback
+    // replay re-INSERTed watched outputs with spent_height=NULL (OR REPLACE),
+    // so an accepted reorg could resurrect an output whose spend sat in a
+    // non-carrier block — a block the replay substrate never stored, leaving
+    // nothing local to repair from. Heal by re-walking the chain: roll the fold
+    // back to just below the oldest unspent watched output and let this same
+    // pass re-download and refold from there — utxo_put now preserves standing
+    // rows and the refold re-marks every lost spend, so the walk converges on
+    // the true balance. Runs once per db; a no-wallet db just sets the flag.
+    if (!idx_db_flag_get(db, "wallet_rewalk_v1")) {
+        int64_t mh = idx_db_utxo_min_unspent(db);
+        int64_t to = mh > 0 ? mh - 1 : -1;
+        if (to >= 0 && to < coin->start) to = coin->start;
+        if (to >= 0 && to < height) {
+            fprintf(stderr, "wallet re-walk: re-verifying spends over blocks %lld..%lld\n",
+                    (long long)(to + 1), (long long)height);
+            if (idx_sync_rollback(&s, db, oracle, activation, to)) {
+                height = to;
+                if (height <= coin->start) { height = coin->start; memcpy(tip, coin->start_hash, 32); }
+                else if (!idx_db_block_get(db, height, tip)) memcpy(tip, coin->start_hash, 32);
+                idx_db_save_sync(db, height, tip);
+                idx_db_flag_set(db, "wallet_rewalk_v1");
+            }   // rollback failure: leave the flag unset, retry next pass
+        } else
+            idx_db_flag_set(db, "wallet_rewalk_v1");
     }
     // The loaded state IS the projection at `height` (post-recovery). Seed the
     // fold cursor: sm_new starts cur_height at 0 and idx_db_load_state never

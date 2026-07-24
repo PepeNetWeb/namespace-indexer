@@ -25,6 +25,9 @@ void idx_db_set_activation(sqlite3 *db, int64_t activation);
 int64_t idx_db_get_activation(sqlite3 *db, int64_t dflt);
 void    idx_db_set_subsidy(sqlite3 *db, int64_t subsidy_koinu);
 int64_t idx_db_get_subsidy(sqlite3 *db, int64_t dflt);
+// one-shot meta markers (migrations/repairs that must run once per db)
+int  idx_db_flag_get(sqlite3 *db, const char *k);
+void idx_db_flag_set(sqlite3 *db, const char *k);
 
 // chain peers harvested from addr gossip ("ip:port" text): the sync-failover
 // pool and the pepenet crawl frontier. note = seen in gossip (upserts services
@@ -125,7 +128,10 @@ void idx_db_watch_add(sqlite3 *db, const uint8_t h160[20]);
 int  idx_db_watch_list(sqlite3 *db, uint8_t (*out)[20], int max);            // returns count
 void idx_db_utxo_put(sqlite3 *db, const uint8_t txid[32], uint32_t vout,
                      const uint8_t h160[20], int64_t value, int64_t height);
-void idx_db_utxo_spend(sqlite3 *db, const uint8_t txid[32], uint32_t vout, int64_t height);
+// mark txid:vout spent at height; returns rows hit (1 = it was a watched utxo)
+int  idx_db_utxo_spend(sqlite3 *db, const uint8_t txid[32], uint32_t vout, int64_t height);
+// MIN(height) over unspent rows (all watched addresses), -1 if none
+int64_t idx_db_utxo_min_unspent(sqlite3 *db);
 // unspent rows for h160, largest-first. Returns count.
 int  idx_db_utxos(sqlite3 *db, const uint8_t h160[20],
                   void (*cb)(void *u, const uint8_t txid[32], uint32_t vout, int64_t value, int64_t height),
