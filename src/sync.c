@@ -1975,8 +1975,19 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
         struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET; sa.sin_addr.s_addr = INADDR_ANY; sa.sin_port = htons(port);
         if (bind(lfd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(lfd, 16) != 0) {
-            fprintf(stderr, "serve: cannot listen on %u: %s\n", port, strerror(errno));
-            close(lfd); idx_db_close(db); return -1;
+            // The port is already taken — almost always a full node (Pepecoin
+            // Core) bound to the chain port on the same box. That must NOT kill
+            // the serve plane: this thread also carries the DNS mesh gossip and
+            // the publish drain, and returning here left the node unable to
+            // issue or sync DNS records at all. Degrade to dial-only (what a
+            // NAT'd node does anyway): we lose inbound crawl-discoverability —
+            // which needs a forwarded, unshared port regardless — but keep the
+            // outbound mesh, block staging, and publish drain fully alive.
+            // (strerror(errno) reads "No error" on Windows: Winsock reports the
+            // in-use bind via WSAGetLastError, not errno — so name the cause.)
+            fprintf(stderr, "serve: port %u already in use (a full node on this "
+                    "host?) — running dial-only, no inbound\n", port);
+            close(lfd); lfd = -1;
         }
     }
     char serve_path[600];
