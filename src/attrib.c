@@ -243,6 +243,11 @@ static void attribute(const ATx *t, int k, IdxAttr *res) {
     if (kind == 0) { res->status = IDX_ATTR_CLASSIFY; return; }
 
     for (int i = 0; i < nsig; i++) {
+        // every sig here passed der_parse, which admits only 9..73 bytes, so
+        // the push pattern is at most 3 + 73 = 76 bytes. The guard is
+        // unreachable; it restates that bound where GCC's range analysis can
+        // see it (-Wstringop-overflow can't track it through der_parse).
+        if (sigs[i].dlen < 9 || sigs[i].dlen > 73) continue;
         uint8_t pat[80]; int pl = 0; emit_push(pat, &pl, sigs[i].data, sigs[i].dlen);
         find_and_delete(scriptCode, &scLen, pat, pl);
     }
