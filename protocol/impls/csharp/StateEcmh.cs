@@ -2,27 +2,25 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
-/// §13.2 ECMH state digest — the incremental twin of Digest.Compute. Five per-table
+/// §13.2 ECMH state digest — the incremental twin of Digest.Compute. Three per-table
 /// Elliptic-Curve Multiset Hash sub-accumulators over the SAME canonical per-row
 /// encoding Digest uses (so the two digests induce the identical equality relation),
 /// combined into one 32-byte value. A point-sum is order-independent and invertible.
-/// Mirrors impls/c/src/ecmh.c (sm_state_ecmh). Reuses the ECMH primitive in
-/// Secp256k1.cs and the per-row field layout from Digest.cs (no count prefix, no
-/// "SMv1"/overflow framing — just the per-row field bytes).
+/// Mirrors impls/c/src/ecmh.c (sm_state_ecmh). Names-only: names + commits + muts.
 /// </summary>
 public static class StateEcmh
 {
     // domain tags — second-preimage separation between tables (match ecmh.c).
-    private const byte TagName = 0x01, TagCommit = 0x02, TagVote = 0x03, TagMut = 0x04, TagDecor = 0x05;
+    // TAG_MUT keeps 0x04 (0x03 was the removed vote table).
+    private const byte TagName = 0x01, TagCommit = 0x02, TagMut = 0x04;
     private static readonly byte[] RecTag = { (byte)'E', (byte)'C', (byte)'M', (byte)'H', (byte)'v', (byte)'1' };
 
     public static byte[] Compute(Fold f)
     {
-        byte[] an = Secp256k1.EcmhIdentity(), ac = Secp256k1.EcmhIdentity(), av = Secp256k1.EcmhIdentity();
-        byte[] am = Secp256k1.EcmhIdentity(), ad = Secp256k1.EcmhIdentity();
+        byte[] an = Secp256k1.EcmhIdentity(), ac = Secp256k1.EcmhIdentity(), am = Secp256k1.EcmhIdentity();
 
         foreach (var r in f.Names.Values)
         {
@@ -43,32 +41,17 @@ public static class StateEcmh
             b.U32(c.TxIndex); b.I64(c.CommitTime);
             FoldRow(ac, TagCommit, b);
         }
-        foreach (var kv in f.VoteScore)
-        {
-            var (target, vout) = f.VoteKeyInfo[kv.Key];
-            var b = new Row();
-            b.Fixed(target, 32); b.U32(vout); b.I128(kv.Value);
-            FoldRow(av, TagVote, b);
-        }
         foreach (var kv in f.Muts)
         {
             var b = new Row();
             b.Fixed(f.MutOwnerBytes[kv.Key], 20); b.I64(kv.Value);
             FoldRow(am, TagMut, b);
         }
-        foreach (var d in f.Decors)
-        {
-            var b = new Row();
-            b.Fixed(d.Txid, 32); b.U32(d.Vout);
-            b.U8((byte)d.Rec.Length); b.Bytes(d.Rec);
-            FoldRow(ad, TagDecor, b);
-        }
 
-        // combined = SHA256("ECMHtop1" ‖ the five sub-accumulators ‖ overflow flag).
+        // combined = SHA256("ECMHtop1" ‖ the three sub-accumulators).
         var top = new Row();
         top.Ascii("ECMHtop1");
-        top.Raw(an); top.Raw(ac); top.Raw(av); top.Raw(am); top.Raw(ad);
-        top.U8((byte)(f.OverflowFlag != 0 ? 1 : 0));
+        top.Raw(an); top.Raw(ac); top.Raw(am);
         return Hashing.Sha256(top.ToArray());
     }
 
@@ -107,12 +90,6 @@ public static class StateEcmh
         public void U32(uint v) { Ensure(4); BinaryPrimitives.WriteUInt32LittleEndian(_b.AsSpan(_len, 4), v); _len += 4; }
         public void U64(ulong v) { Ensure(8); BinaryPrimitives.WriteUInt64LittleEndian(_b.AsSpan(_len, 8), v); _len += 8; }
         public void I64(long v) { Ensure(8); BinaryPrimitives.WriteInt64LittleEndian(_b.AsSpan(_len, 8), v); _len += 8; }
-        public void I128(Int128 v)
-        {
-            UInt128 u = unchecked((UInt128)v);
-            U64((ulong)(u & (UInt128)ulong.MaxValue));
-            U64((ulong)(u >> 64));
-        }
         public byte[] ToArray() { byte[] r = new byte[_len]; Buffer.BlockCopy(_b, 0, r, 0, _len); return r; }
     }
 }

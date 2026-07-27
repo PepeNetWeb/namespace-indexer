@@ -6,7 +6,7 @@
 //! independent impls agreeing on every fork vector is the strongest correctness signal.
 //!
 //! MTP control: this impl derives MTP from the timestamp array (median of the 11 prior
-//! blocks, §6), not directly. We use a monotone array `ts[i] = base + i*step` and apply blocks
+//! blocks, §5), not directly. We use a monotone array `ts[i] = base + i*step` and apply blocks
 //! at heights ≥ 11, where the window is a full 11 and `MTP(H) = ts[H-6] = base + (H-6)*step`.
 //! That gives exact per-block MTP control for the boundary vectors (TV-1 at +COMMIT_EXPIRY,
 //! TV-7 at +1 day). Only the meaningful blocks are applied; the earlier indices just populate

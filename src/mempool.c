@@ -95,7 +95,26 @@ static void note_seen_locked(const uint8_t txid[32]) {
 int mempool_accept(const uint8_t *raw, size_t len, uint8_t txid_out[32],
                    char *reason, size_t rc) {
     if (txid_out) memset(txid_out, 0, 32);
-    if (!txcheck_stateless(raw, len, reason, rc)) return 0;
+    if (!txcheck_stateless(raw, len, reason, rc)) {
+        // mempool.h: the seen ring covers "(accepted OR rejected) — suppresses
+        // re-requesting a tx we already processed and dropped", and sync.c's
+        // inv handler is the consumer (`if (mempool_has(h) || mempool_seen(h))
+        // continue;`). Without this, a peer re-announcing the same nonstandard
+        // tx makes us getdata + re-validate identical bytes on every cycle.
+        // Only bytes that PARSE carry a txid we can trust: a blob that fails to
+        // parse has no txid at all (whatever we hashed would not be the id the
+        // peer invs), so it must never be written into the ring — recording a
+        // bogus 32 bytes would both miss the intended suppression and burn a
+        // ring slot that a real txid needs.
+        IdxTx bad;
+        if (idx_tx_parse(raw, len, &bad)) {
+            pthread_mutex_lock(&g_mu);
+            note_seen_locked(bad.txid);
+            pthread_mutex_unlock(&g_mu);
+            idx_tx_free(&bad);
+        }
+        return 0;                       // txid_out stays zeroed on a txcheck reject
+    }
 
     IdxTx tx;
     if (!idx_tx_parse(raw, len, &tx)) { if (reason && rc) snprintf(reason, rc, "malformed tx"); return 0; }

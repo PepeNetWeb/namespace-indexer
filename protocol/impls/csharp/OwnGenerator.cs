@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Buffers.Binary;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
 /// THIS implementation's OWN generator — internally consistent and deterministic,
@@ -16,6 +16,7 @@ namespace Shibpost;
 /// re-foldable List&lt;Block&gt; (it folds an internal scratch state only to decide
 /// which ops are currently valid). The recorded list can be folded multiple times,
 /// partially, or forked — which is exactly what reorg/reorgfuzz need.
+/// Names-only: no POST/VOTE/DECORATE.
 /// </summary>
 public static class OwnGenerator
 {
@@ -23,10 +24,9 @@ public static class OwnGenerator
     public const int NAME_POOL = 400;
     public const long BASE_TS = 1_700_000_000L;
 
-    // op weights, indexed by the op-class enum below (mirrors the Java generator shape;
-    // values only, NOT the pinned draw-order):
-    // 0=POST 1=VOTE 2=COMMIT 3=CLAIM 4=RENEW 5=TRANSFER 6=SELL 7=RESERVE 8=SETTLE 9=RELEASE 10=SELL_TO 11=PAY 12=TRADE
-    private static readonly int[] WEIGHTS = { 12, 12, 14, 13, 5, 5, 8, 7, 7, 3, 6, 5, 4 };
+    // op weights (names/market only; mirrors C gen.c WEIGHT[]):
+    // 0=COMMIT 1=CLAIM 2=RENEW 3=TRANSFER 4=SELL 5=RESERVE 6=SETTLE 7=RELEASE 8=SELL_TO 9=PAY 10=TRADE
+    private static readonly int[] WEIGHTS = { 14, 13, 5, 5, 8, 7, 7, 3, 6, 5, 4 };
     private static readonly int WSUM;
     static OwnGenerator() { int s = 0; foreach (var w in WEIGHTS) s += w; WSUM = s; }
 
@@ -131,14 +131,14 @@ public static class OwnGenerator
 
         switch (op)
         {
-            case 2: // COMMIT
+            case 0: // COMMIT
             {
                 int j = rng.Bnd(NAME_POOL); byte[] name = NameOf(j); byte[] salt = SaltOf(saltCtr);
                 ready.Add(new Pending { IdIdx = i, Name = name, Salt = salt, CommitHeight = height, CommitTime = mtp });
                 byte[] cmt = Hashing.Sha256(B.Concat(salt, name, id));
                 return OneIn(i, Out.Carrier(B.Commit(cmt), 0));
             }
-            case 3: // CLAIM a ready commit (>=1 deep, live, not yet a live name)
+            case 1: // CLAIM a ready commit (>=1 deep, live, not yet a live name)
             {
                 for (int k = 0; k < ready.Count; k++)
                 {
@@ -152,19 +152,19 @@ public static class OwnGenerator
                 }
                 break;
             }
-            case 4: // RENEW all
+            case 2: // RENEW all
             {
                 var owned = NamesWhere(st, id, -1);
                 if (owned.Count > 0) return OneIn(i, Out.Carrier(B.RenewAll(), leaseVal));
                 break;
             }
-            case 5: // TRANSFER all to a random id
+            case 3: // TRANSFER all to a random id
             {
                 var owned = NamesWhere(st, id, K.ST_OWNED);
                 if (owned.Count > 0) return OneIn(i, Out.Carrier(B.TransferAll(Identity(rng.Bnd(N_IDS))), 0));
                 break;
             }
-            case 6: // SELL an owned name with enough lease tail
+            case 4: // SELL an owned name with enough lease tail
             {
                 foreach (var nm in NamesWhere(st, id, K.ST_OWNED))
                 {
@@ -177,7 +177,7 @@ public static class OwnGenerator
                 }
                 break;
             }
-            case 7: // RESERVE a listed name (buyer != seller possible)
+            case 5: // RESERVE a listed name (buyer != seller possible)
             {
                 var listed = NamesWhere(st, null, K.ST_LISTED);
                 if (listed.Count > 0)
@@ -189,7 +189,7 @@ public static class OwnGenerator
                 }
                 break;
             }
-            case 8: // SETTLE a reserved name by its reserver
+            case 6: // SETTLE a reserved name by its reserver
             {
                 var res = NamesWhere(st, null, K.ST_RESERVED);
                 if (res.Count > 0)
@@ -201,7 +201,7 @@ public static class OwnGenerator
                 }
                 break;
             }
-            case 9: // RELEASE owned names via a full-ish bitmap
+            case 7: // RELEASE owned names via a full-ish bitmap
             {
                 var set = OwnedSetSorted(st, id);
                 if (set.Count > 0)
@@ -214,7 +214,7 @@ public static class OwnGenerator
                 }
                 break;
             }
-            case 10: // SELL_TO
+            case 8: // SELL_TO
             {
                 foreach (var nm in NamesWhere(st, id, K.ST_OWNED))
                 {
@@ -227,7 +227,7 @@ public static class OwnGenerator
                 }
                 break;
             }
-            case 11: // PAY an offered name by its named buyer
+            case 9: // PAY an offered name by its named buyer
             {
                 var off = NamesWhere(st, null, K.ST_OFFERED);
                 if (off.Count > 0)
@@ -238,7 +238,7 @@ public static class OwnGenerator
                 }
                 break;
             }
-            case 12: // TRADE two owned names between two ids
+            case 10: // TRADE two owned names between two ids
             {
                 var myOwned = NamesWhere(st, id, K.ST_OWNED);
                 int i2 = (i + 1 + rng.Bnd(N_IDS - 1)) % N_IDS; byte[] id2 = Identity(i2);
@@ -259,23 +259,15 @@ public static class OwnGenerator
                 }
                 break;
             }
-            case 0: // POST (optionally decorated if the author owns a name)
-            {
-                byte[] body = B.Name("post" + Base36(saltCtr % 1000));
-                if (NamesWhere(st, id, -1).Count > 0 && rng.Bnd(2) == 0)
-                {
-                    byte[] dec = B.Decorate(B.DecRecord((byte)(1 + rng.Bnd(20)), new byte[] { (byte)rng.Bnd(256) }));
-                    return OneIn(i, Out.Carrier(dec, 0), Out.Carrier(body, 1UL + rng.Bounded(50)));
-                }
-                return OneIn(i, Out.Carrier(body, 1UL + rng.Bounded(50)));
-            }
         }
 
-        // VOTE fallback (always valid): target a synthetic earlier post id.
-        long th = height == 0 ? 0 : (long)rng.Bounded((ulong)height);
-        byte[] target = Fold.SyntheticTxid(th, rng.Bnd(8));
-        bool up = rng.Bnd(2) == 0;
-        return OneIn(i, Out.Carrier(B.Vote(up, target, (uint)rng.Bnd(4)), 1UL + rng.Bounded(1000)));
+        // COMMIT fallback (always valid).
+        {
+            int j = rng.Bnd(NAME_POOL); byte[] name = NameOf(j); byte[] salt = SaltOf(saltCtr + 1);
+            ready.Add(new Pending { IdIdx = i, Name = name, Salt = salt, CommitHeight = height, CommitTime = mtp });
+            byte[] cmt = Hashing.Sha256(B.Concat(salt, name, id));
+            return OneIn(i, Out.Carrier(B.Commit(cmt), 0));
+        }
     }
 
     private static ulong DepositLeg(ulong price, ulong bps)

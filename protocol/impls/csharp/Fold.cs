@@ -2,26 +2,23 @@ using System;
 using System.Collections.Generic;
 using System.Buffers.Binary;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
-/// The deterministic fold (§3 + §6). A single forward pass: pre-block
+/// The deterministic fold (§3 + §5). A single forward pass: pre-block
 /// time-triggered transitions, then txs in (tx_index, vout) order.
 /// Identity is pre-resolved (abstract); the real §4 byte-logic is Attribution.cs.
+/// Names-only: only name-action carriers mutate state.
 /// </summary>
 public sealed class Fold
 {
     public readonly long ActivationHeight;
 
-    // Live state.
+    // Live state (names + commits + muts — the digested tables).
     public readonly Dictionary<string, NameRow> Names = new();          // key = name as Latin1 string
     public readonly List<CommitRow> Commits = new();
-    public readonly Dictionary<string, Int128> VoteScore = new();        // key = hex(target)|vout
-    public readonly Dictionary<string, (byte[] target, uint vout)> VoteKeyInfo = new();
     public readonly Dictionary<string, long> Muts = new();               // key = hex(owner20)
     public readonly Dictionary<string, byte[]> MutOwnerBytes = new();
-    public readonly List<DecorRow> Decors = new();
-    public byte OverflowFlag = 0;
 
     // Per-block claim displacement scratch (reset each begin_block; NOT digested).
     private readonly Dictionary<string, (long ch, uint ctx, byte[] owner)> _claimScratch = new();
@@ -55,12 +52,8 @@ public sealed class Fold
     {
         Names.Clear();
         Commits.Clear();
-        VoteScore.Clear();
-        VoteKeyInfo.Clear();
         Muts.Clear();
         MutOwnerBytes.Clear();
-        Decors.Clear();
-        OverflowFlag = 0;
         _claimScratch.Clear();
     }
 
@@ -105,7 +98,6 @@ public sealed class Fold
         byte[]? actor = ActorOf(tx, 0);
         byte actorType = actor != null ? tx.Inputs[0].Type : (byte)0;
 
-        var pendingDecor = new List<byte[]>(); // buffered records, verbatim
         bool[] consumed = new bool[tx.Outputs.Count];
 
         for (int vout = 0; vout < tx.Outputs.Count; vout++)
@@ -114,25 +106,15 @@ public sealed class Fold
             if (o.Kind != OutKind.Carrier) continue; // spendable outputs are matched by the market ops
 
             Decoded d = Decoder.Decode(o.Payload, o.Value);
+            if (d.Kind != DecodeKind.Action) continue; // IGNORE
 
-            if (d.Kind == DecodeKind.Ignore) continue; // buffer survives
-
-            if (d.Kind == DecodeKind.Post)
-            {
-                BindDecorations(pendingDecor, actor, height, txIndex, (uint)vout);
-                pendingDecor.Clear();
-                continue;
-            }
-
-            // ACTION
             byte op = d.Opcode;
 
-            // Forward-only activation gate (§3.0): gated ops below the height are dropped.
-            if (op >= K.OP_COMMIT && height < ActivationHeight) continue;
+            // Forward-only activation gate (§3.0): all ops gate at one height.
+            if (height < ActivationHeight) continue;
 
             if (op == K.OP_AS)
             {
-                pendingDecor.Clear(); // AS flushes the buffer (orphan), BEFORE validating the index
                 int k = d.Body[0];
                 actor = ActorOf(tx, k);
                 actorType = actor != null ? tx.Inputs[k].Type : (byte)0;
@@ -148,10 +130,8 @@ public sealed class Fold
             // Every other op acts as the acting identity.
             if (actor == null) continue; // ⊥ ⇒ drop
 
-            DispatchAction(op, d.Body, o.Value, actor, actorType, tx, consumed, height, mtp, rate, txIndex, (uint)vout, pendingDecor);
+            DispatchAction(op, d.Body, o.Value, actor, actorType, tx, consumed, height, mtp, rate, txIndex);
         }
-
-        // end of tx: orphan decorations discarded (pendingDecor goes out of scope)
     }
 
     /// <summary>Returns the input's hash160 if vin[k] exists and signs SIGHASH_ALL, else null (⊥).</summary>
@@ -166,40 +146,24 @@ public sealed class Fold
     // ---------------- opcode dispatch ----------------
 
     private void DispatchAction(byte op, byte[] body, ulong value, byte[] actor, byte actorType,
-        Tx tx, bool[] consumed, long height, long mtp, ulong rate, int txIndex, uint vout, List<byte[]> pendingDecor)
+        Tx tx, bool[] consumed, long height, long mtp, ulong rate, int txIndex)
     {
         switch (op)
         {
-            case K.OP_VOTE_UP:   Vote(body, value, up: true);  break;
-            case K.OP_VOTE_DOWN: Vote(body, value, up: false); break;
             case K.OP_COMMIT:    Commit(body, height, mtp, txIndex); break;
             case K.OP_CLAIM:     Claim(body, value, actor, rate, height, mtp); break;
             case K.OP_RENEW:     Renew(body, value, actor, rate, height, mtp); break;
             case K.OP_TRANSFER:  Transfer(body, actor, height); break;
             case K.OP_RELEASE:   Release(body, actor, height); break;
+            case K.OP_RENEW_NAME:    RenewName(body, value, actor, rate, mtp); break;
+            case K.OP_TRANSFER_NAME: TransferName(body, actor, height); break;
+            case K.OP_RELEASE_NAME:  ReleaseName(body, actor, height); break;
             case K.OP_SELL:      Sell(body, actor, actorType, mtp); break;
             case K.OP_RESERVE:   Reserve(body, value, actor, tx, consumed, mtp); break;
             case K.OP_SETTLE:    Settle(body, actor, tx, consumed, height, mtp); break;
             case K.OP_SELL_TO:   SellTo(body, actor, actorType, mtp); break;
             case K.OP_PAY:       Pay(body, actor, tx, consumed, height, mtp); break;
-            case K.OP_DECORATE:  Decorate(body, pendingDecor); break;
         }
-    }
-
-    // ---- VOTE ----
-    private void Vote(byte[] body, ulong weight, bool up)
-    {
-        if (weight < K.DUST_FLOOR) return; // zero/under-floor vote carries no signal → drop
-        byte[] target = body[..32];
-        uint v = BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(32, 4));
-        string key = Hashing.Hex(target) + "|" + v;
-        Int128 cur = VoteScore.TryGetValue(key, out var s) ? s : Int128.Zero;
-        Int128 delta = (Int128)weight;
-        Int128 next;
-        try { next = checked(up ? cur + delta : cur - delta); }
-        catch (OverflowException) { OverflowFlag = 1; unchecked { next = up ? cur + delta : cur - delta; } }
-        VoteScore[key] = next;
-        VoteKeyInfo[key] = (target, v);
     }
 
     // ---- COMMIT ----
@@ -314,6 +278,45 @@ public sealed class Fold
         for (int i = 0; i < selected.Count; i++)
             selected[i].LeaseExpiry += add[i] * K.BILLING_UNIT;
         // RENEW is not a set/ordering mutation → no anchor bump.
+    }
+
+    // ---- the by-name forms (§3.5): singleton siblings of the bitmap ops ----
+    // A name string is its own position-independent address into the owned set —
+    // no anchor, no anchor guard. The name MUST be the actor's (the owner stays
+    // the seller while LISTED/OFFERED/RESERVED); else drop.
+    private NameRow? FindMine(byte[] name, byte[] actor)
+    {
+        if (!Names.TryGetValue(NameKey(name), out var r)) return null;
+        return ByteEq(r.Owner, actor) ? r : null;
+    }
+
+    private void RenewName(byte[] body, ulong burn, byte[] actor, ulong rate, long mtp)
+    {
+        var r = FindMine(body, actor);
+        if (r == null) return;                                   // absent / not mine → drop
+        UInt128 T = Lease.TotalNameDays(burn, rate);
+        if (T == UInt128.Zero) return;                           // fail-closed at T=0
+        long[] add = Lease.WaterFill(T, new[] { Lease.HeadroomDays(r.LeaseExpiry, mtp) });
+        r.LeaseExpiry += add[0] * K.BILLING_UNIT;
+        // renewal is not a set mutation → no bump (listed/offered still renewable)
+    }
+
+    private void TransferName(byte[] body, byte[] actor, long height)
+    {
+        byte[] target = body[..20];
+        var r = FindMine(body[20..], actor);
+        if (r == null || r.Locked) return;                       // absent / not mine / locked → no-op
+        r.Owner = (byte[])target.Clone();                        // lease conveys
+        Bump(actor, height);                                     // a move bumps BOTH parties
+        Bump(target, height);
+    }
+
+    private void ReleaseName(byte[] body, byte[] actor, long height)
+    {
+        var r = FindMine(body, actor);
+        if (r == null || r.Locked) return;                       // absent / not mine / locked → no-op
+        Names.Remove(NameKey(r.Name));                           // → pool, immediately reclaimable
+        Bump(actor, height);
     }
 
     // ---- TRANSFER ----
@@ -484,42 +487,7 @@ public sealed class Fold
         Bump(pA, height); Bump(pB, height);
     }
 
-    // ---- DECORATE ----
-    private const int PendDecorMax = 64;                                       // §1 pending-record cap (pinned all 7 impls)
-    private void Decorate(byte[] body, List<byte[]> pending)
-    {
-        int i = 0;
-        while (i < body.Length)
-        {
-            if (i + 3 > body.Length) break;                                   // remnant < 3-byte header → drop tail
-            int len = body[i + 1] | (body[i + 2] << 8);                        // [tag][len:2 LE]
-            if (i + 3 + len > body.Length) break;                              // len overrun → drop tail
-            if (pending.Count < PendDecorMax)                                  // records past 64 dropped; parsing continues
-            {
-                byte[] rec = body[i..(i + 3 + len)];                          // verbatim full record
-                pending.Add(rec);
-            }
-            i += 3 + len;
-        }
-    }
-
-    private void BindDecorations(List<byte[]> pending, byte[]? author, long height, int txIndex, uint vout)
-    {
-        if (pending.Count == 0) return;
-        // Gate: author must own ≥1 name at confirmation height (anonymous owns none).
-        if (author == null || !OwnsAnyName(author)) return;
-        byte[] txid = SyntheticTxid(height, txIndex);
-        foreach (var rec in pending)
-            Decors.Add(new DecorRow { Txid = txid, Vout = vout, Rec = rec });
-    }
-
     // ---------------- helpers ----------------
-
-    private bool OwnsAnyName(byte[] owner)
-    {
-        foreach (var r in Names.Values) if (ByteEq(r.Owner, owner)) return true;
-        return false;
-    }
 
     /// <summary>Owned-set rows for an owner, sorted ascending unsigned-bytewise on raw name (§3.5).</summary>
     private List<NameRow> OwnedSortedRows(byte[] owner)

@@ -50,7 +50,7 @@ actually derived) rather than only at the byte-logic level.
 - `sm attrib-scenario` — RIPEMD-160 KATs + fixed vectors + FindAndDelete KATs + §3.10 wallet-preview
   vectors + the A7 off-curve-P2PKH lock. Combined golden `9fb14077…` (C; the soak ports intentionally
   diverge here per the "ignore the other implementations" rule that applied during the audits — that
-  rule is **lifted** for this task, see §6).
+  rule is **lifted** for this task, see §5).
 
 Everything up to the curve is **real and pinned**: strict-DER parsing, low-S (32-byte BE compare vs
 N/2), pubkey canonical *encoding* (length/prefix/coordinate < p), the P2SH-multisig template
@@ -146,8 +146,8 @@ and every other byte-path stay byte-for-byte identical.** Do this behind a compi
 (§5) so you can diff the real-curve stream against the injected stream on the *reject-dominant* corpus
 and confirm only the genuinely-different verdicts changed.
 
-The §6 fold is untouched — it already consumes `{h160, type, SIGHASH_ALL}` which §4 emits. An
-end-to-end "§4 feeds §6" mode is explicitly **not** part of this MVP.
+The §5 fold is untouched — it already consumes `{h160, type, SIGHASH_ALL}` which §4 emits. An
+end-to-end "§4 feeds §5" mode is explicitly **not** part of this MVP.
 
 ---
 

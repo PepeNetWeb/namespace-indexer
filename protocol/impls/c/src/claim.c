@@ -18,13 +18,22 @@ static SmClaimWin *find_scratch(SmState *s, const char *name) {
     return NULL;
 }
 
-static SmClaimWin *add_scratch(SmState *s, const char *name, int64_t ch, uint32_t ti, const uint8_t owner[20]) {
-    if (s->n_claimsc == s->cap_claimsc) {
-        int nc = s->cap_claimsc ? s->cap_claimsc * 2 : 16;
-        SmClaimWin *p = realloc(s->claimsc, (size_t)nc * sizeof(SmClaimWin));
-        s->claimsc = p; s->cap_claimsc = nc;
+// Upsert the per-block scratch entry for `name` (overwrite if present, else
+// append). Overwrite-on-present mirrors Go/TS (map assignment): a fresh mint of a
+// name whose earlier same-block mint was RELEASEd re-stamps the scratch with the
+// new winner's priority, so a later same-block claim displaces off the CURRENT
+// owner — never a stale, already-departed one.
+static SmClaimWin *set_scratch(SmState *s, const char *name, int64_t ch, uint32_t ti, const uint8_t owner[20]) {
+    SmClaimWin *w = find_scratch(s, name);
+    if (!w) {
+        if (s->n_claimsc == s->cap_claimsc) {
+            int nc = s->cap_claimsc ? s->cap_claimsc * 2 : 16;
+            SmClaimWin *p = realloc(s->claimsc, (size_t)nc * sizeof(SmClaimWin));
+            if (!p) abort();                          // deterministic fail (cf. GROW assert)
+            s->claimsc = p; s->cap_claimsc = nc;
+        }
+        w = &s->claimsc[s->n_claimsc++];
     }
-    SmClaimWin *w = &s->claimsc[s->n_claimsc++];
     memset(w, 0, sizeof(*w));
     snprintf(w->name, sizeof(w->name), "%s", name);
     w->commit_height = ch; w->commit_tx_index = ti; memcpy(w->owner, owner, 20);
@@ -56,35 +65,38 @@ void sm_op_claim(SmState *s, SmTxCtx *cx, const SmAction *a) {
     if (!found) return;                                  // no ≥1-deep commit → drop (no FCFS)
     if (!sm_lease_covers_day(cx->car_value, cx->rate)) return;   // must buy ≥1 day
 
-    SmNameRow *row  = sm_find_name(s, a->name);
-    SmClaimWin *scr = find_scratch(s, a->name);
+    // Row existence is authoritative (matches Go/TS): a name removed earlier in
+    // THIS block (e.g. minted then RELEASEd) is absent here and re-mints fresh —
+    // the lingering scratch entry does NOT block it (§3.6 "a released name is
+    // immediately reclaimable"). Only a name still present can be displaced.
+    SmNameRow *row = sm_find_name(s, a->name);
 
-    if (scr) {
-        // Name was minted THIS block. A smaller backing-commit priority
-        // (commit_height, then commit tx_index — §3.2's tuple, NOT claim chain
-        // order) displaces the provisional winner — but only while it is still
-        // that winner's fresh OWNED mint (an intervening same-block move/list locks it in).
+    if (row) {
+        // Present → displace only if it is still a fresh same-block mint (scratch
+        // present, unmoved, still this owner's OWNED row) AND this claim's backing
+        // commit priority (commit_height, then commit tx_index — §3.2's tuple, NOT
+        // claim chain order) is strictly smaller.
+        SmClaimWin *scr = find_scratch(s, a->name);
+        if (!scr) return;                                // owned from a prior block → drop
+        if (row->st != SM_OWNED || memcmp(row->owner, scr->owner, 20) != 0) return;
         int higher_priority = best_ch < scr->commit_height ||
             (best_ch == scr->commit_height && best_ti < scr->commit_tx_index);
-        if (higher_priority && row && row->st == SM_OWNED &&
-            memcmp(row->owner, scr->owner, 20) == 0) {
-            memcpy(row->owner, cx->actor, 20); row->owner_type = cx->actor_type;
-            row->lease_expiry = cx->mtp;                 // reset, re-buy below
-            SmNameRow *rr = row; sm_waterfill(s, cx->mtp, cx->rate, cx->car_value, &rr, 1);
-            sm_bump_mutation(s, cx->actor, cx->height);
-            memcpy(scr->owner, cx->actor, 20); scr->commit_height = best_ch; scr->commit_tx_index = best_ti;
-            s->ev[SM_EV_CLAIM_DISPLACE]++;
-        }
+        if (!higher_priority) return;
+        memcpy(row->owner, cx->actor, 20); row->owner_type = cx->actor_type;
+        row->lease_expiry = cx->mtp;                     // reset, re-buy below
+        SmNameRow *rr = row; sm_waterfill(s, cx->mtp, cx->rate, cx->car_value, &rr, 1);
+        sm_bump_mutation(s, cx->actor, cx->height);
+        set_scratch(s, a->name, best_ch, best_ti, cx->actor);
+        s->ev[SM_EV_CLAIM_DISPLACE]++;
         return;
     }
 
-    if (row) return;                                     // already owned (earlier block) → drop
-
+    // Fresh mint (row absent — a first claim, or a same-block re-claim after release).
     SmNameRow *r = sm_add_name(s, a->name, a->name_len);
     memcpy(r->owner, cx->actor, 20); r->owner_type = cx->actor_type;
     r->st = SM_OWNED; r->lease_expiry = cx->mtp;         // 0 remaining; water-fill buys the lease
     SmNameRow *rr = r; sm_waterfill(s, cx->mtp, cx->rate, cx->car_value, &rr, 1);
     sm_bump_mutation(s, cx->actor, cx->height);
-    add_scratch(s, a->name, best_ch, best_ti, cx->actor);
+    set_scratch(s, a->name, best_ch, best_ti, cx->actor);
     s->ev[SM_EV_CLAIM_MINT]++;
 }

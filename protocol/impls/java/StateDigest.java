@@ -1,8 +1,9 @@
 import java.util.*;
 
 // Canonical state digest — SPEC-conformance §4. Serialize into a buffer (LE; signed
-// two's-complement LE; i128 16 bytes LE) then SHA-256. Sort keys are pinned per
-// table. owner_type is NOT digested; seller_type IS.
+// two's-complement LE) then SHA-256. Sort keys are pinned per table. Magic "SMv1".
+// Names-only: names + commits + muts (no votes / decors / overflow flag).
+// owner_type is NOT digested; seller_type IS.
 final class StateDigest {
 
     static byte[] serialize(State s) {
@@ -35,17 +36,6 @@ final class StateDigest {
         for (State.Commit c : cs)
             b.bytes(c.commitment).i64(c.commitHeight).u32(c.txIndex).i64(c.commitTime);
 
-        // votes — by (target[32], vout)
-        List<State.Vote> vs = new ArrayList<>(s.votes.values());
-        vs.sort((x, y) -> {
-            int d = State.cmpBytes(x.target, y.target);
-            if (d != 0) return d;
-            return Long.compareUnsigned(x.vout, y.vout);
-        });
-        b.u32(vs.size());
-        for (State.Vote v : vs)
-            b.bytes(v.target).u32(v.vout).i128(v.score);
-
         // muts — by owner bytes
         List<Map.Entry<String, Long>> ms = new ArrayList<>(s.muts.entrySet());
         ms.sort((x, y) -> State.cmpBytes(Hex.dec(x.getKey()), Hex.dec(y.getKey())));
@@ -53,19 +43,6 @@ final class StateDigest {
         for (Map.Entry<String, Long> e : ms)
             b.bytes(Hex.dec(e.getKey())).i64(e.getValue());
 
-        // decors — by (txid[32], vout), STABLE within a post (insertion seq)
-        List<State.Decor> ds = new ArrayList<>(s.decors);
-        ds.sort((x, y) -> {
-            int d = State.cmpBytes(x.txid, y.txid);
-            if (d != 0) return d;
-            d = Long.compareUnsigned(x.vout, y.vout); if (d != 0) return d;
-            return Integer.compare(x.seq, y.seq);
-        });
-        b.u32(ds.size());
-        for (State.Decor d : ds)
-            b.bytes(d.txid).u32(d.vout).u8(d.rec.length).bytes(d.rec);
-
-        b.u8(s.overflow ? 1 : 0);
         return b.toBytes();
     }
 
@@ -73,7 +50,7 @@ final class StateDigest {
     static String digest16(State s) { return digest(s).substring(0, 16); }
 
     // ── per-row encoders (BYTE-IDENTICAL to serialize()'s per-row field bytes,
-    //    WITHOUT count prefixes / SMv1 / overflow framing) — reused by stateEcmh.
+    //    WITHOUT count prefixes / SMv1 framing) — reused by stateEcmh.
     private static byte[] rowName(State.NameRow r, String k) {
         byte[] nm = k.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
         return new Buf().u8(nm.length).bytes(nm)
@@ -84,19 +61,12 @@ final class StateDigest {
     private static byte[] rowCommit(State.Commit c) {
         return new Buf().bytes(c.commitment).i64(c.commitHeight).u32(c.txIndex).i64(c.commitTime).toBytes();
     }
-    private static byte[] rowVote(State.Vote v) {
-        return new Buf().bytes(v.target).u32(v.vout).i128(v.score).toBytes();
-    }
     private static byte[] rowMut(byte[] owner, long height) {
         return new Buf().bytes(owner).i64(height).toBytes();
     }
-    private static byte[] rowDecor(State.Decor d) {
-        return new Buf().bytes(d.txid).u32(d.vout).u8(d.rec.length).bytes(d.rec).toBytes();
-    }
 
-    // domain tags — second-preimage separation between tables.
-    private static final byte TAG_NAME = 0x01, TAG_COMMIT = 0x02, TAG_VOTE = 0x03,
-                              TAG_MUT = 0x04, TAG_DECOR = 0x05;
+    // domain tags — second-preimage separation between tables (3 tags; TAG_VOTE/TAG_DECOR removed).
+    private static final byte TAG_NAME = 0x01, TAG_COMMIT = 0x02, TAG_MUT = 0x04;
     private static final byte[] ECMH_REC_TAG = { 'E','C','M','H','v','1' };
 
     // acc ← acc + H2C("ECMHv1" ‖ tag ‖ row_bytes)
@@ -108,27 +78,21 @@ final class StateDigest {
         return Secp.ecmhAdd(acc, Secp.ecmhHash(pre)[0]);
     }
 
-    // §13.2 — the incremental ECMH twin of the canonical state digest. Five
+    // §13.2 — the incremental ECMH twin of the canonical state digest. Three
     // per-table multiset sums (order-independent) folded into one SHA-256.
     static byte[] stateEcmh(State s) {
-        byte[] an = Secp.ecmhIdentity(), ac = Secp.ecmhIdentity(), av = Secp.ecmhIdentity(),
-               am = Secp.ecmhIdentity(), ad = Secp.ecmhIdentity();
+        byte[] an = Secp.ecmhIdentity(), ac = Secp.ecmhIdentity(), am = Secp.ecmhIdentity();
         for (Map.Entry<String, State.NameRow> e : s.names.entrySet())
             an = ecmhFold(an, TAG_NAME, rowName(e.getValue(), e.getKey()));
         for (State.Commit c : s.commits)
             ac = ecmhFold(ac, TAG_COMMIT, rowCommit(c));
-        for (State.Vote v : s.votes.values())
-            av = ecmhFold(av, TAG_VOTE, rowVote(v));
         for (Map.Entry<String, Long> e : s.muts.entrySet())
             am = ecmhFold(am, TAG_MUT, rowMut(Hex.dec(e.getKey()), e.getValue()));
-        for (State.Decor d : s.decors)
-            ad = ecmhFold(ad, TAG_DECOR, rowDecor(d));
 
-        // combined = SHA256("ECMHtop1" ‖ the five sub-accumulators ‖ overflow flag).
+        // combined = SHA256("ECMHtop1" ‖ the three sub-accumulators).
         Buf top = new Buf();
         top.bytes(new byte[]{'E','C','M','H','t','o','p','1'});
-        top.bytes(an).bytes(ac).bytes(av).bytes(am).bytes(ad);
-        top.u8(s.overflow ? 1 : 0);
+        top.bytes(an).bytes(ac).bytes(am);
         return Hashes.sha256(top.toBytes());
     }
 

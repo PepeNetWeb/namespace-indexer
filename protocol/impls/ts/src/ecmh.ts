@@ -4,13 +4,15 @@
 // impl's secp256k1 ECMH primitive and must print BYTE-IDENTICAL output to the C reference: a
 // hash-to-curve KAT, accumulator algebra (identity / tagged multiset sum / commutativity / inverse
 // round-trip), and a single cross-language `combined` digest. See SPEC-conformance.md §13.2.
+//
+// Names-only: 3 table tags (name/commit/mut). TAG_VOTE was removed with votes from consensus.
 import type { Bytes } from "./bytes.ts";
 import { hex, concat, u8 } from "./bytes.ts";
 import { sha256 } from "./sha256.ts";
 import { ecmhIdentity, ecmhHash, ecmhNegate, ecmhAdd } from "./secp256k1.ts";
 
 // domain tags — second-preimage separation between tables (mirrors ecmh.c enum).
-const TAG_NAME = 0x01, TAG_COMMIT = 0x02, TAG_VOTE = 0x03, TAG_MUT = 0x04;
+const TAG_NAME = 0x01, TAG_COMMIT = 0x02, TAG_MUT = 0x04;
 const ECMH_REC_TAG = Uint8Array.of(0x45, 0x43, 0x4d, 0x48, 0x76, 0x31); // "ECMHv1"
 
 // per-record H2C preimage = "ECMHv1" ‖ tag ‖ body.
@@ -32,7 +34,7 @@ export function cmdEcmh(): number {
   const h2c: { label: string; pre: Bytes }[] = [
     { label: "empty", pre: new Uint8Array(0) },
     { label: "a",     pre: enc.encode("a") },
-    { label: "shib",  pre: enc.encode("shibpost") },
+    { label: "pepe",  pre: enc.encode("pepenet") },
     { label: "doge",  pre: enc.encode("doge") },
     { label: "ff32",  pre: new Uint8Array(32).fill(0xff) },
     { label: "z32",   pre: new Uint8Array(32) },
@@ -52,7 +54,6 @@ export function cmdEcmh(): number {
     { tag: TAG_NAME,   body: enc.encode("\x03foo") },
     { tag: TAG_NAME,   body: enc.encode("\x03bar") },
     { tag: TAG_COMMIT, body: enc.encode("commitment-blob-32-bytes-xxxxxx") }, // 31 bytes
-    { tag: TAG_VOTE,   body: enc.encode("vote-target-row") },                 // 15 bytes
     { tag: TAG_MUT,    body: enc.encode("owner-mutation") },                  // 14 bytes
   ];
   let fwd = ecmhIdentity(), rev = ecmhIdentity();

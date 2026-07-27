@@ -3,19 +3,18 @@ import java.util.Arrays;
 
 // Strict wire codec — derived from SPEC-conformance §9 + spec §1/§2/§3.1.
 //
-// decode(payload, value) -> ACTION | POST | IGNORE, fail-closed. encode(Action)
+// decode(payload, value) -> ACTION | IGNORE, fail-closed (no POST). encode(Action)
 // is the canonical inverse (used by the generators + round-trip selftest). The
 // single-minimal-push carrier rule (§1) is handled one layer up (Output gives us
 // the already-extracted lone-push payload, or null if not a single minimal push).
 final class Wire {
 
-    enum Kind { ACTION, POST, IGNORE }
+    enum Kind { ACTION, IGNORE }
 
     static final class Decoded {
         final Kind kind;
         final Action action;
         Decoded(Kind k, Action a) { kind = k; action = a; }
-        static final Decoded POST = new Decoded(Kind.POST, null);
         static final Decoded IGNORE = new Decoded(Kind.IGNORE, null);
         static Decoded action(Action a) { return new Decoded(Kind.ACTION, a); }
     }
@@ -23,26 +22,22 @@ final class Wire {
     // ---- decode ------------------------------------------------------------
 
     static Decoded decode(byte[] p, BigInteger value) {
+        // value unused by demux (kept for call-site uniformity); everything non-action → IGNORE
         if (p.length >= 4 && p[0] == Const.P0 && p[1] == Const.P1 && p[2] == Const.P2) {
-            Action a = decodeAction(p);          // committed to the action path
-            return a != null ? Decoded.action(a) : Decoded.IGNORE; // malformed action is never a post
+            Action a = decodeAction(p);
+            return a != null ? Decoded.action(a) : Decoded.IGNORE; // malformed / unknown opcode
         }
-        if (value.signum() > 0 && p.length >= 1 && validUtf8(p)) return Decoded.POST;
         return Decoded.IGNORE;
     }
 
     private static Action decodeAction(byte[] p) {
         int op = p[3] & 0xFF;
+        if (op < Const.OP_MIN || op > Const.OP_MAX) return null;
         int bl = p.length - 4;
         byte[] b = Arrays.copyOfRange(p, 4, p.length);
         Action a = new Action();
         a.op = op;
         switch (op) {
-            case Const.VOTE_UP, Const.VOTE_DOWN -> {
-                if (bl != 36) return null;
-                a.target = Arrays.copyOfRange(b, 0, 32);
-                a.vout = Buf.u32(b, 32);
-            }
             case Const.COMMIT -> {
                 if (bl != 32) return null;
                 a.commitment = Arrays.copyOfRange(b, 0, 32);
@@ -56,14 +51,14 @@ final class Wire {
             case Const.RENEW -> {
                 if (bl == 0) { a.renewMode = 0; }                       // all
                 else if (bl == 5) { a.renewMode = 1; a.anchor = Buf.u40(b, 0); } // all-safe
-                else if (bl >= 6 && bl <= 76) {                          // selective: anchor5 + flags 1..71
+                else if (bl >= 6 && bl <= Const.BODY_MAX) {              // selective: anchor5 + flags 1..FLAGS_MAX
                     a.renewMode = 2; a.anchor = Buf.u40(b, 0);
                     a.flags = Arrays.copyOfRange(b, 5, bl);
                 } else return null;
             }
             case Const.TRANSFER -> {
                 if (bl == 20) { a.tTarget = Arrays.copyOfRange(b, 0, 20); a.selective = false; } // all
-                else if (bl >= 26 && bl <= 76) {                         // selective: target20 + anchor5 + flags 1..51
+                else if (bl >= 26 && bl <= Const.BODY_MAX) {             // selective: target20 + anchor5 + flags 1..FLAGS_XFER_MAX
                     a.tTarget = Arrays.copyOfRange(b, 0, 20);
                     a.anchor = Buf.u40(b, 20);
                     a.flags = Arrays.copyOfRange(b, 25, bl);
@@ -77,19 +72,21 @@ final class Wire {
                 a.name = Arrays.copyOfRange(b, 12, bl);
                 if (!validName(a.name)) return null;
             }
-            case Const.RESERVE, Const.SETTLE, Const.PAY -> {
+            case Const.RENEW_NAME, Const.RELEASE_NAME, Const.RESERVE, Const.SETTLE, Const.PAY -> {
                 if (bl < 1 || bl > 32) return null;     // name1..32
                 a.name = Arrays.copyOfRange(b, 0, bl);
                 if (!validName(a.name)) return null;
             }
+            case Const.TRANSFER_NAME -> {
+                if (bl < 21 || bl > 52) return null;    // target20 + name1..32
+                a.tTarget = Arrays.copyOfRange(b, 0, 20);
+                a.name = Arrays.copyOfRange(b, 20, bl);
+                if (!validName(a.name)) return null;
+            }
             case Const.RELEASE -> {
-                if (bl < 6 || bl > 76) return null;                      // anchor5 + flags 1..71
+                if (bl < 6 || bl > Const.BODY_MAX) return null;          // anchor5 + flags 1..FLAGS_MAX
                 a.anchor = Buf.u40(b, 0);
                 a.flags = Arrays.copyOfRange(b, 5, bl);
-            }
-            case Const.DECORATE -> {
-                if (bl < 0 || bl > Const.DEC_MAX) return null;           // <= SM_DEC_MAX (80); impls/c decode.c
-                a.decTlv = b;                                            // raw TLV, fold parses
             }
             case Const.SELL_TO -> {
                 if (bl < 29 || bl > 60) return null;    // price8 + buyer20 + name1..32
@@ -124,7 +121,6 @@ final class Wire {
     static byte[] encode(Action a) {
         Buf body = new Buf();
         switch (a.op) {
-            case Const.VOTE_UP, Const.VOTE_DOWN -> body.bytes(a.target).u32(a.vout);
             case Const.COMMIT -> body.bytes(a.commitment);
             case Const.CLAIM -> body.bytes(a.salt).bytes(a.name);
             case Const.RENEW -> {
@@ -136,9 +132,9 @@ final class Wire {
                 if (a.selective) body.bytes(le40(a.anchor)).bytes(a.flags);
             }
             case Const.SELL -> body.u64(a.price).u32(a.window).bytes(a.name);
-            case Const.RESERVE, Const.SETTLE, Const.PAY -> body.bytes(a.name);
+            case Const.RENEW_NAME, Const.RELEASE_NAME, Const.RESERVE, Const.SETTLE, Const.PAY -> body.bytes(a.name);
+            case Const.TRANSFER_NAME -> body.bytes(a.tTarget).bytes(a.name);
             case Const.RELEASE -> body.bytes(le40(a.anchor)).bytes(a.flags);
-            case Const.DECORATE -> body.bytes(a.decTlv);
             case Const.SELL_TO -> body.u64(a.price).bytes(a.buyer).bytes(a.name);
             case Const.AS -> body.u8(a.asIndex);
             case Const.TRADE -> body.u8(a.idxA).u8(a.idxB).bytes(a.nameA).u8(0x2C).bytes(a.nameB);
@@ -158,9 +154,8 @@ final class Wire {
 
     // ---- validators --------------------------------------------------------
 
-    // §3.1: canonical charset [a-z0-9-] (a DNS label), length 1..32. Re-pin 2026-07-07:
-    // '.'/'_' dropped, '-' added (supersedes the 2026-07-02 dot rule). No structural
-    // rules — '-a', 'a-', 'xn--x' are all valid names; uppercase stays invalid.
+    // §3.1: [a-z0-9-], 1..32; no leading/trailing hyphen; no `--` at positions 3–4
+    // (kills xn-- and every ACE prefix). Every consensus-valid name is a safe hostname label.
     static boolean validName(byte[] n) {
         if (n.length < 1 || n.length > 32) return false;
         for (byte x : n) {
@@ -168,32 +163,8 @@ final class Wire {
             boolean ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
             if (!ok) return false;
         }
-        return true;
-    }
-
-    // Strict RFC-3629 UTF-8 (Unicode Table 3-7 well-formed byte sequences): reject
-    // overlong, surrogates U+D800..U+DFFF, and code points > U+10FFFF.
-    static boolean validUtf8(byte[] s) {
-        int i = 0, n = s.length;
-        while (i < n) {
-            int c = s[i] & 0xFF;
-            if (c < 0x80) { i++; }
-            else if (c >= 0xC2 && c <= 0xDF) { if (!cont(s, i + 1, n, 1)) return false; i += 2; }
-            else if (c == 0xE0) { if (i + 2 >= n || !rng(s[i+1], 0xA0, 0xBF) || !rng(s[i+2], 0x80, 0xBF)) return false; i += 3; }
-            else if (c >= 0xE1 && c <= 0xEC) { if (!cont(s, i + 1, n, 2)) return false; i += 3; }
-            else if (c == 0xED) { if (i + 2 >= n || !rng(s[i+1], 0x80, 0x9F) || !rng(s[i+2], 0x80, 0xBF)) return false; i += 3; }
-            else if (c >= 0xEE && c <= 0xEF) { if (!cont(s, i + 1, n, 2)) return false; i += 3; }
-            else if (c == 0xF0) { if (i + 3 >= n || !rng(s[i+1], 0x90, 0xBF) || !rng(s[i+2], 0x80, 0xBF) || !rng(s[i+3], 0x80, 0xBF)) return false; i += 4; }
-            else if (c >= 0xF1 && c <= 0xF3) { if (!cont(s, i + 1, n, 3)) return false; i += 4; }
-            else if (c == 0xF4) { if (i + 3 >= n || !rng(s[i+1], 0x80, 0x8F) || !rng(s[i+2], 0x80, 0xBF) || !rng(s[i+3], 0x80, 0xBF)) return false; i += 4; }
-            else return false; // 0x80..0xC1 (incl. overlong leads C0/C1), 0xF5..0xFF
-        }
-        return true;
-    }
-    private static boolean rng(byte x, int lo, int hi) { int v = x & 0xFF; return v >= lo && v <= hi; }
-    private static boolean cont(byte[] s, int from, int n, int k) {
-        if (from + k > n) return false;
-        for (int j = 0; j < k; j++) if (!rng(s[from + j], 0x80, 0xBF)) return false;
+        if ((n[0] & 0xFF) == '-' || (n[n.length - 1] & 0xFF) == '-') return false;
+        if (n.length >= 4 && (n[2] & 0xFF) == '-' && (n[3] & 0xFF) == '-') return false;
         return true;
     }
 }

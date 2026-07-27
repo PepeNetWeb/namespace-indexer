@@ -51,7 +51,7 @@ confirm + hex-dest checksum), C10 (index usage string), D2 (consolidate the 3 co
 |---|---|---|---|
 | A1 | **indexers/c never attributes TRADE's named inputs — every on-chain TRADE drops.** The adapter marks only `vin[0]` + AS-named inputs for §4 attribution (`adapter.c` lazy loop); TRADE's `idx_a`/`idx_b` are never marked, so `trade.c` sees ⊥ and drops. Spec §3.10 says a conformant fold settles it → ownership fork vs a from-spec indexer on the first real TRADE. Latent only because the wallet can't build TRADE yet. Fix: mark trade indices like AS targets (one line) + a live-path regression. | indexers/c/src/adapter.c (attribution loop) | OPEN |
 | A2 | **`MAX_PEND 64` DECORATE pending-record cap is C-only.** fold.c silently drops decoration records past 64; py/ts/go/cs (and rust/java) buffer unbounded. One tx with 15 minimal-TLV DECORATE carriers = 375 records → C forks against the other six reference impls. Fuzzer structurally can't reach it (draws ≤ ~24 records). Fix (consensus ruling needed): pin 64 in spec + all impls **or** make C unbounded; either way add a 64/65 boundary vector + re-freeze golden. | protocol-sm/impls/c/src/fold.c:32 | OPEN |
-| A3 | **SmTx caps contradict the spec's normative "no per-tx count caps".** `SM_MAX_INPUTS 8 / SM_MAX_CARRIERS 16 / SM_MAX_OUTS 16` exist only in impls/c structs + the adapter; the six ports model txs unbounded. Three inconsistent overflow behaviors today: >16 carriers → whole-tx drop (logged); >16 payee outs on a carrier tx → whole-tx drop (a sloppy SETTLE with many change outs triggers this!); >8 inputs → **silent truncation** (an AS/TRADE index ≥ 8 — spec-valid — reads ⊥ and drops with no trace). A miner-assisted 17-carrier tx forks indexers/c against a from-spec impl. No vector exercises any cap. Fix (consensus ruling needed, cross-impl by prior ruling): pin caps as protocol constants with ONE deterministic rule (recommend: over-cap ⇒ whole-tx not folded), spec §0/§6 rewrite, boundary vectors (16/17 carriers, 16/17 outs, 8/9 inputs incl. AS@8 + TRADE idx 8), golden re-freeze across 7 impls. | protocol-sm sm.h:65-70 · indexers/c/src/adapter.c | OPEN |
+| A3 | **SmTx caps contradict the spec's normative "no per-tx count caps".** `SM_MAX_INPUTS 8 / SM_MAX_CARRIERS 16 / SM_MAX_OUTS 16` exist only in impls/c structs + the adapter; the six ports model txs unbounded. Three inconsistent overflow behaviors today: >16 carriers → whole-tx drop (logged); >16 payee outs on a carrier tx → whole-tx drop (a sloppy SETTLE with many change outs triggers this!); >8 inputs → **silent truncation** (an AS/TRADE index ≥ 8 — spec-valid — reads ⊥ and drops with no trace). A miner-assisted 17-carrier tx forks indexers/c against a from-spec impl. No vector exercises any cap. Fix (consensus ruling needed, cross-impl by prior ruling): pin caps as protocol constants with ONE deterministic rule (recommend: over-cap ⇒ whole-tx not folded), spec §0/§5 rewrite, boundary vectors (16/17 carriers, 16/17 outs, 8/9 inputs incl. AS@8 + TRADE idx 8), golden re-freeze across 7 impls. | protocol-sm sm.h:65-70 · indexers/c/src/adapter.c | OPEN |
 
 ## B. Local-state integrity (indexerd)
 
@@ -60,24 +60,15 @@ confirm + hex-dest checksum), C10 (index usage string), D2 (consolidate the 3 co
 | B1 | **Sync persistence is not atomic; crash mid-batch silently desyncs projection from block store.** Per-block writes (blocks/raw_blocks/utxos + meta height) autocommit individually; the names/commits/votes/muts projection commits once per inv batch (≤500 blocks). SIGKILL between ⇒ meta height ahead of projection; restart loads stale projection state but resumes at meta height ⇒ the gap's actions are never folded, digest silently diverges, and every wallet guard reasons from wrong state. Also: sqlite step/exec return codes unchecked throughout db.c (disk-full = same desync, no crash); duplicate oracle rows possible on re-connect. `refold` recovers, but nothing detects the need. Fix: one transaction per connected block (or per batch incl. projection + meta), a projection-height sentinel checked at open, error-check db writes. | indexers/c/src/{sync.c,db.c} | OPEN |
 | B2 | Deterministically corrupt raw block during reorg replay ⇒ rollback loops forever, projection stays on abandoned branch until manual refold. Low likelihood; document + surface loudly. | sync.c rollback path | OPEN |
 
-## C. Wallet money guards (shibwallet)
+## C. Wallet money guards
+
+RETIRED (2026-07-13): the reviewed component was the wallet CLI once bundled with the
+indexer repo; it has since been removed (the indexer ships no write path). The findings
+here concerned that tool only, not the indexer or the engine, except one that survives it:
 
 | # | Finding | Status |
 |---|---|---|
-| C1 | **Warns instead of refuses where staleness burns money**: settle/pay/reserve proceed past expiry warnings; no db-tip-freshness gate on any §3 command. A 6-h-stale db + settle = full remainder paid to seller, fold conveys nothing. Fix: refuse by default (`--force` to override) + refuse when db tip older than a bound. | OPEN |
-| C2 | **`claim` has no is-it-owned check and no commit-expiry check** — the two largest burns (a year's rent) with the fewest guards. Both are one-query fixes (names table; commits.commit_time + SM_COMMIT_EXPIRY vs now). | OPEN |
-| C3 | **`vote` argc off-by-one** — guard `argc < 8` but weight read from `argv[8]` ⇒ argc==8 segfaults (pre-signing; no funds at risk). Fix: `argc < 9`. | OPEN |
-| C4 | **Koinu vs decimal-coin split across commands** (claim/sell/sellto/renew/vote = raw koinu; send/post/fees = decimal) with no sanity prompt — `sell … 500` lists at 500 koinu, irreversible. Fix: display-value confirmation on all koinu args + a fee upper sanity. | OPEN |
-| C5 | **Broadcast fire-and-forget**: signed tx never persisted; no rebroadcast artifact; "sent, unechoed" reported as success; rapid sequential commands collide on the largest UTXO (largest-first selection + spent-until-sync). RFC-6979 makes pure retries benign. Fix: persist rawtx+txid, mark inputs locally pending. | OPEN |
-| C6 | Sub-dust exact-value P2PKH legs: listings under ~2 coins produce pay-legs below relay dust ⇒ peer rejects reserve/settle/pay (fail-safe but confusing). Add client-side pre-check. | OPEN |
-| C7 | `parse_amt` signed-overflow UB at the 1e11 whole-coin bound (all downstream paths currently guard; still UB in a money parser). Cap at 92233720368 or checked mul. | OPEN |
-| C8 | Salt sidecar: last-match-wins after failed re-commit broadcast can strand the first (still-live) commit; no fsync/unchecked writes (power-loss right after commit broadcast can lose the salt); loose-perm pre-existing file appended as-is. Entropy itself is getentropy, checked — good. | OPEN |
-| C9 | `transfer` gifts ALL unlocked names with no pre-broadcast confirmation; `parse_dest` accepts any 40-hex as raw h160 without checksum (one typo ⇒ unspendable). | OPEN |
 | C10 | Usage-string drift: `indexerd index` usage omits `<db> <activation>` (typed-wrong activation forks a fresh db silently). | OPEN |
-
-Confirmed non-issues (verified): entropy (getentropy, checked), change/fee arithmetic incl.
-sub-dust-change→fee, guard set for reserve/sell/settle/pay/release when db is fresh,
-same-block claim impossibility, deterministic-retry safety, cooperative-stop cleanliness.
 
 ## D. Host-chain portability (the reconfiguration question)
 
@@ -91,10 +82,10 @@ Gaps to close for "minimal-effort" ports:
 | # | Finding | Status |
 |---|---|---|
 | D1 | **Subsidy is a hardcoded `#define` (flat 10,000), not a profile row** — the one consensus-critical portability leak. A chain with a different tail subsidy forks rates silently. Fix: `subsidy_tail` (+ tail-start height) in the Coin profile, used by oracle_feed; plus a startup validation that the first N post-activation blocks match the pinned subsidy (reject loudly on mismatch). | OPEN |
-| D2 | Three independent coin tables (sync.c COINS, wallet.c WCOINS, clients/gui coinparams) can drift; consolidate into one shared profile header. | OPEN |
+| D2 | Independent coin tables across consumers can drift; consolidate into one shared profile header. (The indexer itself now has a single COINS[] table in sync.c.) | OPEN |
 | D3 | Protocol version 70015 inline in 3 call sites → profile row (fails only on chains with MIN_PEER_PROTO_VERSION > 70015). | OPEN |
 | D4 | Block-count constants (FEE_WINDOW 10081, MIN_FEE_SAMPLE 1000, MAX_ANCHOR_AGE 1024; vpost TTL 60480) assume ~1-min blocks — by design these re-pin per host **as a protocol version**, not a runtime knob; document the derivation formulas in host-profiles.md. | OPEN |
-| D5 | Cosmetic: relay-dust constant, DEFAULT_PEER, desktop PASS_PAUSE_S — move to profile when convenient. | OPEN |
+| D5 | Cosmetic: relay-dust constant, DEFAULT_PEER — move to profile when convenient. | OPEN |
 
 **Port checklist (Doge-family, same 60 s blocks):** research chain facts (magic, port,
 subsidy tail + start, AuxPoW height, address/WIF versions, OP_RETURN standardness ≥80) →

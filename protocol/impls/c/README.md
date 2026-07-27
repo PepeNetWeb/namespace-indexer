@@ -1,6 +1,6 @@
-# pepenet protocol — C reference implementation (normative)
+# PepeNet namespace — C reference implementation (normative)
 
-The **normative** implementation of the pepenet protocol state machine. Where the prose of
+The **normative** implementation of the PepeNet namespace state machine. Where the prose of
 `docs/protocol-spec.md` + `protocol-sm/SPEC-conformance.md` is ambiguous, **this implementation is
 the tie-breaker** — the other six impls (`py`, `ts`, `java`, `rust`, `go`, `csharp`) are independent
 clean-room reimplementations that cross-validate the spec against it. The consolidated rationale for

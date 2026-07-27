@@ -27,7 +27,7 @@ final class Buf {
         return this;
     }
 
-    // signed i128 (vote score), 16 bytes two's-complement LE (wrapping mod 2^128).
+    // signed i128, 16 bytes two's-complement LE (wrapping mod 2^128) — property fingerprint aggregates.
     Buf i128(BigInteger v) {
         BigInteger m = v.mod(Const.TWO128); // mod yields non-negative two's-complement repr
         for (int i = 0; i < 16; i++) b.write(m.shiftRight(8 * i).and(BigInteger.valueOf(0xFF)).intValue());

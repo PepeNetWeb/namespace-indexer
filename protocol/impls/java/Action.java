@@ -1,13 +1,9 @@
 import java.math.BigInteger;
 
 // A decoded protocol action (§2). Grab-bag of per-opcode fields; only the fields
-// for `op` are populated. Carrier value (weight/rent/burn) lives on the TxOut.
+// for `op` are populated. Carrier value (rent/burn) lives on the TxOut.
 final class Action {
     int op;
-
-    // VOTE_UP / VOTE_DOWN
-    byte[] target;          // 32
-    long vout;              // u32
 
     // COMMIT
     byte[] commitment;      // 32
@@ -29,9 +25,6 @@ final class Action {
     BigInteger price;       // u64
     long window;            // u32 (SELL)
     byte[] buyer;           // 20 (SELL_TO)
-
-    // DECORATE
-    byte[] decTlv;
 
     // AS
     int asIndex;

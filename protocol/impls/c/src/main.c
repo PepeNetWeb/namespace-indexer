@@ -35,18 +35,6 @@ static void add_action(SmTx *t, SmAction a, uint64_t value) {
     c->kind = SM_CAR_ACTION; c->act = a;
     c->value = value; c->vout = (uint32_t)(t->n_carriers - 1);
 }
-static void add_post(SmTx *t, uint64_t value) {
-    SmCarrier *cr = sm_tx_carrier(t); int c = t->n_carriers - 1;
-    cr->kind = SM_CAR_POST; cr->value = value; cr->vout = (uint32_t)c;
-    cr->post_len = 5; memcpy(cr->post, "hello", 5);
-}
-
-static SmAction vote(int up, uint8_t target_tag, uint32_t tvout) {
-    SmAction a; memset(&a, 0, sizeof a);
-    a.op = up ? SM_OP_VOTE_UP : SM_OP_VOTE_DOWN;
-    a.target_txid[0] = target_tag; a.target_vout = tvout;
-    return a;
-}
 static SmAction commit(uint8_t c0) {
     SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_COMMIT; a.commitment[0] = c0; return a;
 }
@@ -101,23 +89,6 @@ static SmAction sell_to(uint64_t price, const uint8_t buyer[20], const char *n) 
     SmAction a = nameact(SM_OP_SELL_TO, n); a.price = price; memcpy(a.addr, buyer, 20); return a;
 }
 
-static SmAction decorate(uint8_t tag, const char *val) {   // one TLV record
-    SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_DECORATE;
-    size_t vl = strlen(val);
-    a.dec[0] = tag; a.dec[1] = (uint8_t)(vl & 0xff); a.dec[2] = (uint8_t)(vl >> 8);
-    memcpy(&a.dec[3], val, vl); a.dec_len = (uint8_t)(3 + vl);
-    return a;
-}
-// A DECORATE carrier packed with `nrec` empty (len-0) TLV records — 3 bytes each,
-// so ≤26 fit one 80-byte payload. Used to drive the §1 pending-record cap vector.
-static SmAction decorate_n(int nrec) {
-    SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_DECORATE;
-    int off = 0;
-    for (int i = 0; i < nrec; i++) { a.dec[off] = (uint8_t)(i + 1); a.dec[off+1] = 0; a.dec[off+2] = 0; off += 3; }
-    a.dec_len = (uint8_t)off;
-    return a;
-}
-
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 static void test_prng(void) {
@@ -137,24 +108,6 @@ static void test_empty_digest_stable(void) {
     sm_free(x); sm_free(y);
 }
 
-static void test_votes(void) {
-    SmState *s = sm_new(0);
-    sm_begin_block(s, 100, 1000, SM_DUST_FLOOR);
-    SmTx t = {0}; tx1(&t, 0xAA, 0);
-    add_action(&t, vote(1, 0x11, 0), 5);   // +5
-    add_action(&t, vote(0, 0x11, 0), 2);   // -2
-    add_action(&t, vote(1, 0x11, 0), 0);   // weight 0 → DROP (below DUST_FLOOR)
-    sm_apply_tx(s, &t);
-    CHECK(s->n_votes == 1 && s->votes[0].score == 3, "vote score = +5 -2, zero-weight dropped");
-
-    // drop-closed: a zero-weight vote leaves the digest identical to skipping it.
-    uint8_t before[32]; sm_state_digest(s, before);
-    SmTx z = {0}; tx1(&z, 0xAA, 1); add_action(&z, vote(1, 0x11, 0), 0); sm_apply_tx(s, &z);
-    uint8_t after[32]; sm_state_digest(s, after);
-    CHECK(memcmp(before, after, 32) == 0, "drop-closed: ignored action leaves digest unchanged");
-    sm_free(s);
-}
-
 static void test_activation_gate(void) {
     SmState *s = sm_new(50);                 // COMMIT gated at height 50
     sm_begin_block(s, 40, 1000, 1);
@@ -166,37 +119,13 @@ static void test_activation_gate(void) {
     sm_free(s);
 }
 
-static void test_decorate_gate(void) {
-    // Author owns no name → records drop. Then give them a name → records bind.
-    SmState *s = sm_new(0);
-    sm_begin_block(s, 100, 1000, 1);
-    SmTx t = {0}; tx1(&t, 0xAA, 0);
-    add_action(&t, decorate(7, "reply"), 0);   // vout0 decoration
-    add_post(&t, 1);                            // vout1 body (burn 1)
-    sm_apply_tx(s, &t);
-    CHECK(s->n_decors == 0, "decoration from a nameless author drops");
-
-    SmNameRow *r = sm_add_name(s, "alice", 5);  // manually grant a name to 0xAA
-    r->owner[0] = 0xAA; r->owner[19] = 0xAA; r->st = SM_OWNED; r->lease_expiry = 1LL << 40;
-    SmTx u = {0}; tx1(&u, 0xAA, 1);
-    add_action(&u, decorate(7, "reply"), 0);
-    add_post(&u, 1);
-    sm_apply_tx(s, &u);
-    CHECK(s->n_decors == 1, "decoration binds when author owns a name");
-
-    // orphan: a DECORATE with no following body is dropped.
-    SmTx v = {0}; tx1(&v, 0xAA, 2); add_action(&v, decorate(7, "x"), 0); sm_apply_tx(s, &v);
-    CHECK(s->n_decors == 1, "orphan decoration (no body) dropped");
-    sm_free(s);
-}
-
 static void test_fold_determinism(void) {
     // Same script twice → identical digest.
     uint8_t d[2][32];
     for (int run = 0; run < 2; run++) {
         SmState *s = sm_new(0);
         sm_begin_block(s, 100, 1000, 1);
-        SmTx t = {0}; tx1(&t, 0xAA, 0); add_action(&t, vote(1, 0x22, 3), 9); sm_apply_tx(s, &t);
+        SmTx t = {0}; tx1(&t, 0xAA, 0); add_action(&t, commit(0x22), 0); sm_apply_tx(s, &t);
         sm_begin_block(s, 101, 1100, 1);
         SmTx u = {0}; tx1(&u, 0xBB, 0); add_action(&u, commit(0x44), 0); sm_apply_tx(s, &u);
         sm_state_digest(s, d[run]); sm_free(s);
@@ -301,6 +230,41 @@ static void test_renew(void) {
     sm_begin_block(s, 12, 1600, RATE_DAYS);
     SmTx t = {0}; tx1(&t, 0xAA, 0); add_action(&t, renew_all(), 5); sm_apply_tx(s, &t);   // +5 days
     CHECK(sm_lookup(s, "bob")->lease_expiry == 865500 + 5*86400, "renew-all adds 5 days, lease stacks");
+    sm_free(s);
+}
+
+// §6 ceiling reach: a selective RENEW whose flag bit sits PAST the old
+// 80-byte carrier (bit 590 needs 74 flag bytes) folds correctly — the bitmap
+// ops scale to Pepecoin's script ceiling, not to the relay default.
+static void test_wide_bitmap(void) {
+    SmState *s = sm_new(0);
+    uint8_t H[20]; mk_h160(H, 0xAA);
+    char nm[8];
+    sm_begin_block(s, 10, 1400, RATE_DAYS);
+    for (int i = 0; i < 600; i++) {
+        snprintf(nm, sizeof nm, "n%03d", i);
+        SmTx c = {0}; tx1(&c, 0xAA, 0); add_action(&c, mk_commit(nm, H, 0x33), 0);
+        sm_apply_tx(s, &c); sm_tx_free(&c);
+    }
+    sm_begin_block(s, 11, 1500, RATE_DAYS);
+    for (int i = 0; i < 600; i++) {
+        snprintf(nm, sizeof nm, "n%03d", i);
+        SmTx k = {0}; tx1(&k, 0xAA, 0); add_action(&k, mk_claim(nm, 0x33), 10);
+        sm_apply_tx(s, &k); sm_tx_free(&k);
+    }
+    CHECK(sm_lookup(s, "n590") != NULL, "600-name owned set minted");
+    int64_t exp0 = sm_lookup(s, "n590")->lease_expiry;
+    int64_t nb0  = sm_lookup(s, "n589")->lease_expiry;
+    sm_begin_block(s, 12, 1600, RATE_DAYS);
+    SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_RENEW;
+    a.has_anchor = 1; a.anchor = 12;
+    a.flags_len = 74;                        // impossible under the old 71-byte cap
+    a.flags[73] = 0x40;                      // LSB-first bit 590 = byte 73, bit 6
+    SmTx t = {0}; tx1(&t, 0xAA, 0); add_action(&t, a, 5);
+    sm_apply_tx(s, &t); sm_tx_free(&t);
+    CHECK(sm_lookup(s, "n590")->lease_expiry == exp0 + 5*86400,
+          "wide-bitmap RENEW (bit 590, 74 flag bytes) water-fills the flagged name");
+    CHECK(sm_lookup(s, "n589")->lease_expiry == nb0, "neighbor at bit 589 untouched");
     sm_free(s);
 }
 
@@ -498,10 +462,8 @@ static void test_trade(void) {
     sm_free(s);
 }
 
-// charset re-pin (2026-07-07): [a-z0-9-] — a DNS label, lowercased. '.' and '_'
-// dropped, '-' added (supersedes the 2026-07-02 dot rule). Still no structural
-// rules; hyphen and a 32-byte name are valid, '.'/'_'/uppercase/comma/33-byte are
-// not. Pins the OUTCOME behind scenario 52 (its digest only proves agreement).
+// charset + structural rules (§3.1): [a-z0-9-], 1..32; no leading/trailing hyphen;
+// no `--` at positions 3–4. Pins the OUTCOME behind scenario 52.
 static void test_dotted_names(void) {
     uint8_t A[20]; mk_h160(A, 0xAA);
     CHECK(sm_name_valid("shib-p2p", 8), "hyphen name valid");
@@ -511,6 +473,9 @@ static void test_dotted_names(void) {
     CHECK(!sm_name_valid("shib_p2p", 8), "underscore now invalid");
     CHECK(!sm_name_valid("Shib-p2p", 8), "uppercase still invalid");
     CHECK(!sm_name_valid("a,b", 3), "comma still invalid (TRADE pair split relies on it)");
+    CHECK(!sm_name_valid("-a", 2), "leading hyphen invalid");
+    CHECK(!sm_name_valid("a-", 2), "trailing hyphen invalid");
+    CHECK(!sm_name_valid("xn--x", 5), "ACE prefix (xn--) invalid");
     SmState *s = sm_new(0);
     sm_begin_block(s, 10, 1000, RATE_DAYS);
     { SmTx c = {0}; tx1(&c, 0xAA, 0); add_action(&c, mk_commit("shib-p2p", A, 0x71), 0); sm_apply_tx(s, &c); }
@@ -523,26 +488,18 @@ static void test_dotted_names(void) {
     sm_free(s);
 }
 
-// Outcome locks for the boundary vectors 53/54 (so the digests can't pass "for the
-// wrong reason"): the §1 pending-decor cap binds exactly 64, and a tx folds 17 vote
-// carriers past the historical 16 (no per-tx count cap, §0).
+// Outcome lock for vector 54: no per-tx count cap — 17 COMMIT carriers fold.
 static void test_tx_bounds(void) {
-    uint8_t A[20]; mk_h160(A, 0xAA);
-    { SmState *s = minted(0xAA, "d", 10, 1500);
-      sm_begin_block(s, 12, 1600, RATE_DAYS);
-      SmTx t = {0}; tx1(&t, 0xAA, 0);
-      add_action(&t, decorate_n(26), 0); add_action(&t, decorate_n(26), 0); add_action(&t, decorate_n(13), 0);
-      add_post(&t, 100);
-      sm_apply_tx(s, &t); sm_tx_free(&t);
-      CHECK(s->n_decors == SM_MAX_PEND_DECOR, "DECORATE pending-record cap binds exactly 64 of 65");
-      sm_free(s); }
     { SmState *s = sm_new(0);
       sm_begin_block(s, 10, 1000, RATE_DAYS);
       SmTx t = {0}; tx1(&t, 0xAA, 0);
-      for (int i = 0; i < 17; i++) add_action(&t, vote(1, 0x55, 7), 3);
+      for (int i = 0; i < 17; i++) {
+          SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_COMMIT; a.commitment[0] = (uint8_t)i;
+          add_action(&t, a, 0);
+      }
       CHECK(t.n_carriers == 17 && t.carriers != t.car_inline, "SmTx folds 17 carriers (spilled past inline, no cap)");
       sm_apply_tx(s, &t);
-      CHECK(s->n_votes == 1 && (uint64_t)s->votes[0].score == 51, "17 up-votes ×3 fold to score 51");
+      CHECK(s->n_commits == 17, "17 COMMITs all record");
       sm_tx_free(&t); sm_free(s); }
 }
 
@@ -550,18 +507,16 @@ static void test_tx_bounds(void) {
 // enc(a) → decode → enc again must reproduce the bytes (the codec is a bijection
 // on well-formed actions); the demux/drop cases pin the fail-closed parse.
 static int codec_rt(const SmAction *a) {
-    uint8_t b1[80]; size_t l1 = sm_encode_action(a, b1);
+    static uint8_t b1[SM_CARRIER_MAX]; size_t l1 = sm_encode_action(a, b1);
     if (l1 == 0) return 0;
-    SmCarrier c; sm_decode_payload(b1, l1, 0, &c);
+    static SmCarrier c; sm_decode_payload(b1, l1, 0, &c);
     if (c.kind != SM_CAR_ACTION) return 0;
-    uint8_t b2[80]; size_t l2 = sm_encode_action(&c.act, b2);
+    static uint8_t b2[SM_CARRIER_MAX]; size_t l2 = sm_encode_action(&c.act, b2);
     return l2 == l1 && memcmp(b1, b2, l1) == 0;
 }
 static void test_codec(void) {
     uint8_t A[20], B[20]; mk_h160(A, 0xAA); mk_h160(B, 0xBB);
     SmAction a;
-    a = vote(1, 0x11, 7);              CHECK(codec_rt(&a), "codec round-trip VOTE_UP");
-    a = vote(0, 0x11, 7);              CHECK(codec_rt(&a), "codec round-trip VOTE_DOWN");
     a = mk_commit("bob", A, 0x11);     CHECK(codec_rt(&a), "codec round-trip COMMIT");
     a = mk_claim("bob", 0x11);         CHECK(codec_rt(&a), "codec round-trip CLAIM");
     a = mk_claim("abcdefghijklmnopqrstuvwxyz0123ab", 0x11); CHECK(codec_rt(&a), "codec round-trip CLAIM name32 (encoder 1..32)");
@@ -577,33 +532,51 @@ static void test_codec(void) {
     a = nameact(SM_OP_SETTLE, "wname");  CHECK(codec_rt(&a), "codec round-trip SETTLE");
     a = nameact(SM_OP_PAY, "wname");     CHECK(codec_rt(&a), "codec round-trip PAY");
     { uint8_t f[2] = { 0x01, 0x40 }; SmAction r = release_bits(12, f, 2); CHECK(codec_rt(&r), "codec round-trip RELEASE"); }
-    a = decorate(7, "reply-target");   CHECK(codec_rt(&a), "codec round-trip DECORATE");
     a = sell_to(5000, B, "wname");     CHECK(codec_rt(&a), "codec round-trip SELL_TO");
     a = as_to(3);                      CHECK(codec_rt(&a), "codec round-trip AS");
     a = trade(0, 1, "aaa", "bbb");     CHECK(codec_rt(&a), "codec round-trip TRADE");
 
-    // demux: valid UTF-8 + burn → POST; zero-value → IGNORE; invalid UTF-8 → IGNORE.
+    // §6 pinned carrier ceiling: flags at the exact consensus caps
+    // round-trip; one byte past fails BOTH directions (fail-closed codec).
+    { SmAction r; memset(&r, 0, sizeof r); r.op = SM_OP_RENEW; r.has_anchor = 1; r.anchor = 7;
+      r.flags_len = SM_FLAGS_MAX;
+      for (int i = 0; i < SM_FLAGS_MAX; i++) r.flags[i] = (uint8_t)(i * 7 + 1);
+      CHECK(codec_rt(&r), "codec round-trip RENEW-selective at SM_FLAGS_MAX (9987 flag bytes)");
+      static uint8_t w[SM_CARRIER_MAX + 8]; size_t l = sm_encode_action(&r, w);
+      CHECK(l == (size_t)SM_CARRIER_MAX, "RENEW at cap encodes to exactly SM_CARRIER_MAX (9996) bytes");
+      SmCarrier cw; sm_decode_payload(w, l, 0, &cw);
+      CHECK(cw.kind == SM_CAR_ACTION && cw.act.flags_len == SM_FLAGS_MAX,
+            "...and decodes with every flag byte intact");
+      w[l] = 0x00; sm_decode_payload(w, l + 1, 0, &cw);
+      CHECK(cw.kind == SM_CAR_IGNORE, "one byte past the L1 carrier ceiling -> ignore"); }
+    { SmAction t; memset(&t, 0, sizeof t); t.op = SM_OP_TRANSFER; mk_h160(t.addr, 0xBB);
+      t.has_anchor = 1; t.anchor = 7;
+      t.flags_len = SM_FLAGS_XFER_MAX;
+      for (int i = 0; i < SM_FLAGS_XFER_MAX; i++) t.flags[i] = (uint8_t)(i + 1);
+      CHECK(codec_rt(&t), "codec round-trip TRANSFER-selective at SM_FLAGS_XFER_MAX (9967)");
+      static uint8_t w2[SM_CARRIER_MAX + 8];
+      t.flags_len = SM_FLAGS_XFER_MAX + 1;
+      CHECK(sm_encode_action(&t, w2) == 0, "TRANSFER flags past the cap refuse to encode"); }
+    { SmAction r; memset(&r, 0, sizeof r); r.op = SM_OP_RELEASE; r.has_anchor = 1; r.anchor = 3;
+      r.flags_len = SM_FLAGS_MAX;
+      for (int i = 0; i < SM_FLAGS_MAX; i++) r.flags[i] = 0xFF;
+      CHECK(codec_rt(&r), "codec round-trip RELEASE at SM_FLAGS_MAX"); }
+
+    // demux: non-prefix / overlay / bare UTF-8 → IGNORE; only name actions → ACTION.
     SmCarrier c;
     const uint8_t hello[5] = { 'h','e','l','l','o' };
-    sm_decode_payload(hello, 5, 1, &c); CHECK(c.kind == SM_CAR_POST,   "demux UTF-8 post with burn");
-    sm_decode_payload(hello, 5, 0, &c); CHECK(c.kind == SM_CAR_IGNORE, "demux zero-value post → ignore");
-    const uint8_t two[2] = { 0xE2, 0x82 };                         // truncated 3-byte sequence
-    sm_decode_payload(two, 2, 1, &c);   CHECK(c.kind == SM_CAR_IGNORE, "demux truncated UTF-8 → ignore");
-    const uint8_t over[2] = { 0xC0, 0x80 };                        // overlong NUL
-    sm_decode_payload(over, 2, 1, &c);  CHECK(c.kind == SM_CAR_IGNORE, "demux overlong UTF-8 → ignore");
-    const uint8_t sur[3] = { 0xED, 0xA0, 0x80 };                   // surrogate U+D800
-    sm_decode_payload(sur, 3, 1, &c);   CHECK(c.kind == SM_CAR_IGNORE, "demux surrogate UTF-8 → ignore");
-    const uint8_t euro[3] = { 0xE2, 0x82, 0xAC };                  // U+20AC, valid
-    sm_decode_payload(euro, 3, 1, &c);  CHECK(c.kind == SM_CAR_POST,   "demux valid 3-byte UTF-8 → post");
+    sm_decode_payload(hello, 5, 1, &c); CHECK(c.kind == SM_CAR_IGNORE, "demux bare UTF-8 → ignore");
     const uint8_t ff[1] = { 0xFF };
     sm_decode_payload(ff, 1, 1, &c);    CHECK(c.kind == SM_CAR_IGNORE, "demux lone 0xFF → ignore");
+    { uint8_t ov[5] = { 0xFF, 0x50, 0x4E, 0xD6, 0x00 };
+      sm_decode_payload(ov, 5, 0, &c);  CHECK(c.kind == SM_CAR_IGNORE, "demux overlay opcode → ignore"); }
 
     // fail-closed action parse: truncated / wrong-length / bad-name / bad-opcode → IGNORE.
-    { uint8_t b[80]; a = mk_claim("bob", 0x11); size_t l = sm_encode_action(&a, b);
+    { static uint8_t b[SM_CARRIER_MAX]; a = mk_claim("bob", 0x11); size_t l = sm_encode_action(&a, b);
       sm_decode_payload(b, 36, 0, &c);    CHECK(c.kind == SM_CAR_IGNORE, "parse CLAIM with no name (salt only) → ignore");
       sm_decode_payload(b, l, 0, &c);     CHECK(c.kind == SM_CAR_ACTION && c.act.op == SM_OP_CLAIM, "parse exact CLAIM → action"); }
-    { uint8_t b[80]; a = vote(1, 0x11, 0); size_t l = sm_encode_action(&a, b);
-      sm_decode_payload(b, l - 1, 5, &c); CHECK(c.kind == SM_CAR_IGNORE, "parse short VOTE → ignore"); }
+    { static uint8_t b[SM_CARRIER_MAX]; a = mk_commit("bob", A, 0x11); size_t l = sm_encode_action(&a, b);
+      sm_decode_payload(b, l - 1, 0, &c); CHECK(c.kind == SM_CAR_IGNORE, "parse short COMMIT → ignore"); }
     { uint8_t b[5] = { 0xFF, 0x50, 0x4E, SM_OP_RESERVE, ',' };       // comma is not a name char
       sm_decode_payload(b, 5, 0, &c);     CHECK(c.kind == SM_CAR_IGNORE, "parse RESERVE bad-name → ignore"); }
     { uint8_t b[4] = { 0xFF, 0x50, 0x4E, 0x00 };
@@ -633,9 +606,7 @@ static void test_digest_sensitivity(void) {
     R->seller[0] = 0xB2; R->seller_type = 1; R->price = 500; R->offer_expiry = 900;
     R->buyer[0] = 0xC3; R->burn_leg = 2; R->pay_leg = 3; R->reserve_expiry = 800;
     uint8_t cm[32]; memset(cm, 0x11, 32); sm_commit_add(s, cm, 7, 2, 1234);
-    uint8_t tg[32]; memset(tg, 0x22, 32); sm_vote_add(s, tg, 5, 1, 42);
     uint8_t mo[20]; memset(mo, 0x33, 20); sm_bump_mutation(s, mo, 99);
-    uint8_t tx[32]; memset(tx, 0x44, 32); uint8_t rec[4] = { 7, 1, 0, 0x55 }; sm_decor_add(s, tx, 3, rec, 4);
 
     uint8_t base[32]; sm_state_digest(s, base);
     R = sm_find_name(s, "x");
@@ -658,16 +629,8 @@ static void test_digest_sensitivity(void) {
     SENS(s->commits[0].commit_height++,    s->commits[0].commit_height--,    "commit_height");
     SENS(s->commits[0].tx_index++,         s->commits[0].tx_index--,         "commit_tx_index");
     SENS(s->commits[0].commit_time++,      s->commits[0].commit_time--,      "commit_time");
-    SENS(s->votes[0].target[0] ^= 1,       s->votes[0].target[0] ^= 1,       "vote_target");
-    SENS(s->votes[0].vout++,               s->votes[0].vout--,               "vote_vout");
-    SENS(s->votes[0].score++,              s->votes[0].score--,              "vote_score");
     SENS(s->muts[0].owner[0] ^= 1,         s->muts[0].owner[0] ^= 1,         "mut_owner");
     SENS(s->muts[0].height++,              s->muts[0].height--,              "mut_height");
-    SENS(s->decors[0].txid[0] ^= 1,        s->decors[0].txid[0] ^= 1,        "decor_txid");
-    SENS(s->decors[0].vout++,              s->decors[0].vout--,              "decor_vout");
-    SENS(s->decors[0].rec[0] ^= 1,         s->decors[0].rec[0] ^= 1,         "decor_rec");
-    SENS(s->decors[0].rec_len--,           s->decors[0].rec_len++,           "decor_rec_len");
-    SENS(s->overflow_flag = 1,             s->overflow_flag = 0,             "overflow_flag");
     #undef SENS
 
     // negative: owner_type is deliberately NOT digested (ownership is by bare hash160).
@@ -841,6 +804,55 @@ static void test_scenario_races2(void) {
       sm_free(s); }
 }
 
+// Outcome locks for the 2026-07 divergence fixes (mirror scenarios 55/55b/56/58).
+static void test_scenario_races3(void) {
+    uint8_t A[20], B[20]; mk_h160(A, 0xAA); mk_h160(B, 0xBB);
+
+    // 55: mint → same-block RELEASE → same-block re-CLAIM re-mints the name to A.
+    { SmState *s = sm_new(0);
+      sm_begin_block(s, 10, 1000, RATE_DAYS);
+      SmTx tc = {0}; tx1(&tc, 0xAA, 0); add_action(&tc, mk_commit("foo", A, 0x91), 0); sm_apply_tx(s, &tc);
+      sm_begin_block(s, 11, 1500, RATE_DAYS);
+      SmTx tk = {0}; tx1(&tk, 0xAA, 0); add_action(&tk, mk_claim("foo", 0x91), 10); sm_apply_tx(s, &tk);
+      uint8_t rel[1] = { 0x01 };
+      SmTx tr = {0}; tx1(&tr, 0xAA, 1); add_action(&tr, release_bits(11, rel, 1), 0); sm_apply_tx(s, &tr);
+      CHECK(sm_lookup(s, "foo") == NULL, "55: RELEASE removed foo mid-block");
+      SmTx tk2 = {0}; tx1(&tk2, 0xAA, 2); add_action(&tk2, mk_claim("foo", 0x91), 10); sm_apply_tx(s, &tk2);
+      CHECK(sm_owns(s, A, "foo"), "55: same-block CLAIM after RELEASE re-mints foo→A");
+      sm_free(s); }
+
+    // 55b: after A releases, a lower-priority B still mints the freed name.
+    { SmState *s = sm_new(0);
+      sm_begin_block(s, 10, 1000, RATE_DAYS);
+      SmTx t0 = {0}; tx1(&t0, 0xAA, 0); add_action(&t0, mk_commit("foo", A, 0x91), 0); sm_apply_tx(s, &t0);
+      SmTx t1 = {0}; tx1(&t1, 0xBB, 1); add_action(&t1, mk_commit("foo", B, 0x92), 0); sm_apply_tx(s, &t1);
+      sm_begin_block(s, 11, 1500, RATE_DAYS);
+      SmTx tk = {0}; tx1(&tk, 0xAA, 0); add_action(&tk, mk_claim("foo", 0x91), 10); sm_apply_tx(s, &tk);
+      uint8_t rel[1] = { 0x01 };
+      SmTx tr = {0}; tx1(&tr, 0xAA, 1); add_action(&tr, release_bits(11, rel, 1), 0); sm_apply_tx(s, &tr);
+      SmTx tk2 = {0}; tx1(&tk2, 0xBB, 2); add_action(&tk2, mk_claim("foo", 0x92), 10); sm_apply_tx(s, &tk2);
+      CHECK(sm_owns(s, B, "foo") && !sm_owns(s, A, "foo"), "55b: freed name mints to B regardless of A's old priority");
+      sm_free(s); }
+
+    // 56: self-transfer bumps the owner's set-mutation height (11 → 12).
+    { SmState *s = minted(0xAA, "bar", 10, 1500);
+      CHECK(sm_last_mutation(s, A) == 11, "56: pre-condition mut height 11 from claim");
+      sm_begin_block(s, 12, 1600, RATE_DAYS);
+      SmTx tt = {0}; tx1(&tt, 0xAA, 0); add_action(&tt, xfer_all(A), 0); sm_apply_tx(s, &tt);
+      CHECK(sm_last_mutation(s, A) == 12, "56: self-transfer bumps mut height to 12 (not a no-op)");
+      sm_free(s); }
+
+    // 58: burn near 2⁶⁴ at rate 1 clamps the lease to MAX_LEASE (365 days), no overflow.
+    { SmState *s = sm_new(0);
+      sm_begin_block(s, 10, 1000, 1);
+      SmTx tc = {0}; tx1(&tc, 0xAA, 0); add_action(&tc, mk_commit("foo", A, 0x95), 0); sm_apply_tx(s, &tc);
+      sm_begin_block(s, 11, 1500, 1);
+      SmTx tk = {0}; tx1(&tk, 0xAA, 0); add_action(&tk, mk_claim("foo", 0x95), 0xFFFFFFFFFFFFFFFFULL); sm_apply_tx(s, &tk);
+      const SmNameRow *r = sm_lookup(s, "foo");
+      CHECK(r && r->lease_expiry == 1500 + 365LL * 86400, "58: huge-burn lease clamps to MAX_LEASE (365 days)");
+      sm_free(s); }
+}
+
 static void test_secp(void) {
     // §4 Strategy B: the real secp256k1 (constants, 2G KAT, n·G=∞, decompress,
     // RFC-6979 sign/verify round-trips). secp_selftest returns the failure count.
@@ -899,15 +911,14 @@ static int selftest(void) {
     test_codec();
     test_digest_sensitivity();
     test_empty_digest_stable();
-    test_votes();
     test_activation_gate();
-    test_decorate_gate();
     test_fold_determinism();
     test_commit_claim();
     test_claim_drops();
     test_claim_priority();
     test_lease_lapse();
     test_renew();
+    test_wide_bitmap();
     test_transfer_release();
     test_market_open();
     test_market_reserve_guards();
@@ -919,6 +930,7 @@ static int selftest(void) {
     test_tx_bounds();
     test_scenario_races();
     test_scenario_races2();
+    test_scenario_races3();
 
     SmState *e = sm_new(0); uint8_t d[32]; char hx[65];
     sm_state_digest(e, d); hexout(d, 32, hx);
@@ -932,7 +944,7 @@ static int selftest(void) {
 static const char *EV_NAME[SM_EV_COUNT] = {
     "claim_mint", "claim_displace", "waterfill_cap", "waterfill_forfeit",
     "reserve_win", "reserve_clamp", "settle_ok", "pay_ok",
-    "trade_ok", "lapse", "release_name", "as_drop", "vote_overflow",
+    "trade_ok", "lapse", "release_name", "as_drop",
     "sell_ok", "sellto_ok",
 };
 
@@ -976,7 +988,7 @@ static int cmd_invariants(int argc, char **argv) {
 // ── directed conformance vectors (cross-language adversarial scenarios) ──────
 // Each builds a deterministic, named construction and emits `name <digest>`; the
 // rolling `combined` hash is the single-line cross-language check. These pin the
-// spec's named edge cases (§6) with auditable outcomes, and cover the rare
+// spec's named edge cases (§5) with auditable outcomes, and cover the rare
 // branches the random soak almost never hits (deep displacement, i128
 // accumulation past 2^64, the fee oracle).
 static void emit_state(SHA256_CTX *comb, const char *name, SmState *s) {
@@ -1129,21 +1141,6 @@ static int cmd_scenario(void) {
       SmTx t2 = {0}; tx2(&t2, 0xAA, 0xBB, 1); add_action(&t2, trade(0, 1, "aaa", "bbb"), 0); sm_apply_tx(s, &t2);   // anti-rug → drop
       emit_state(&comb, "25_trade_rug_before", s); sm_free(s); }
 
-    { SmState *s = minted(0xAA, "bob", 300, 1500); sm_begin_block(s, 12, 1600, RATE_DAYS);
-      SmTx t = {0}; tx1(&t, 0xAA, 0); add_action(&t, decorate(7, "reply"), 0); add_post(&t, 1); sm_apply_tx(s, &t);   // owner → binds
-      SmTx u = {0}; tx1(&u, 0xCC, 1); add_action(&u, decorate(7, "x"), 0); add_post(&u, 1); sm_apply_tx(s, &u);       // nameless → drop
-      SmTx v = {0}; tx1(&v, 0xAA, 2); add_action(&v, decorate(7, "orphan"), 0); sm_apply_tx(s, &v);                  // orphan → drop
-      emit_state(&comb, "26_decorate_gate", s); sm_free(s); }
-
-    { SmState *s = sm_new(0); sm_begin_block(s, 100, 1000, RATE_DAYS);
-      SmTx t = {0}; tx1(&t, 0xAA, 0); add_action(&t, vote(1, 0x11, 0), 5); add_action(&t, vote(0, 0x11, 0), 2); add_action(&t, vote(1, 0x11, 0), 0); sm_apply_tx(s, &t);
-      emit_state(&comb, "27_vote_score", s); sm_free(s); }
-
-    // i128 accumulation past 2^64: three max-weight up-votes sum > 2^64 (a u64 impl wraps).
-    { SmState *s = sm_new(0); sm_begin_block(s, 100, 1000, RATE_DAYS);
-      for (int i = 0; i < 3; i++) { SmTx t = {0}; tx1(&t, 0xAA, (uint32_t)i); add_action(&t, vote(1, 0x11, 0), UINT64_MAX); sm_apply_tx(s, &t); }
-      emit_state(&comb, "28_vote_past_u64", s); sm_free(s); }
-
     // fee oracle (§3.4): signed under-claim clamp + participant filter + MIN_FEE_SAMPLE
     // degrade + lower-median + REF_SIZE scale + clamp. 4 participants < MIN_FEE_SAMPLE
     // ⇒ this small window now degrades to DUST_FLOOR (the big-window vectors are 49–51).
@@ -1211,11 +1208,6 @@ static int cmd_scenario(void) {
     { SmState *s = minted(0xAA, "bob", 10, 1500); sm_begin_block(s, 12, 865499, RATE_DAYS); emit_state(&comb, "36a_mtp_below_owned", s); sm_free(s); }
     { SmState *s = minted(0xAA, "bob", 10, 1500); sm_begin_block(s, 12, 865500, RATE_DAYS); emit_state(&comb, "36b_mtp_at_lapsed", s); sm_free(s); }
 
-    // 37: i128 vote accumulator past −2⁶⁴ (three max down-votes; two's-complement LE).
-    { SmState *s = sm_new(0); sm_begin_block(s, 100, 1000, RATE_DAYS);
-      for (int i = 0; i < 3; i++) { SmTx t = {0}; tx1(&t, 0xAA, (uint32_t)i); add_action(&t, vote(0, 0x11, 0), UINT64_MAX); sm_apply_tx(s, &t); }
-      emit_state(&comb, "37_vote_neg_past_u64", s); sm_free(s); }
-
     // ── pre-block ordering & intra-block market races ──
     // 38: a same-block RENEW-vs-CLAIM race at the exact lapse tie. A owns `bob` (lapsing
     //     at this block's MTP) and `keep` (long lease). The pre-block lapse returns `bob`
@@ -1238,7 +1230,7 @@ static int cmd_scenario(void) {
       emit_state(&comb, "38_lapse_renew_vs_claim", s); sm_free(s); }
 
     // 39: a single pre-block tick that crosses reserve_expiry AND offer_expiry at once,
-    //     cascading RESERVED→LISTED→OWNED in one pass (§6 type-order reserve→offer→lease).
+    //     cascading RESERVED→LISTED→OWNED in one pass (§5 type-order reserve→offer→lease).
     //     Step 2 (offer) must see step 1's LISTED mutation; an impl that evaluates the legs
     //     against block-initial state, or runs offer before reserve, would skip step 2 and
     //     orphan a row past its offer_expiry. (35a stops after just the reserve leg.) The
@@ -1407,9 +1399,8 @@ static int cmd_scenario(void) {
       }
       emit_u64(&comb, "51_oracle_subsample_floor", sm_oracle_rate(cb51, sub51, by51, N51)); } // → 1
 
-    // 52: charset = a DNS label [a-z0-9-], 1..32 (re-pinned 2026-07-07, supersedes
-    // the 2026-07-02 dot rule): hyphen and a 32-byte name MINT; '.' and '_' now
-    // DROP (uppercase still drops), leaving exactly the two valid names.
+    // 52: charset = a DNS label [a-z0-9-], 1..32: hyphen and a 32-byte name MINT;
+    // '.' and '_' DROP (uppercase still drops), leaving exactly the two valid names.
     { SmState *s = sm_new(0);
       commit_then_claim(s, 0xAA, "shib-p2p",                         0x71, 10, 1000, 10, 1500, 11);
       commit_then_claim(s, 0xAA, "abcdefghijklmnopqrstuvwxyz0123ab", 0x72, 10, 2000, 12, 2500, 13);
@@ -1417,31 +1408,105 @@ static int cmd_scenario(void) {
       commit_then_claim(s, 0xAA, "shib_p2p",                         0x74, 10, 4000, 16, 4500, 17);
       emit_state(&comb, "52_charset", s); sm_free(s); }
 
-    // 53: §1 DECORATE pending-record cap (SM_MAX_PEND_DECOR = 64, pinned 2026-07-03).
-    // Owner posts 65 decoration records (26+26+13) then a body: exactly 64 bind, the
-    // 65th drops. An impl that buffers unbounded binds 65 → a different digest, so this
-    // vector is what forces every port to adopt the cap.
-    { SmState *s = minted(0xAA, "d", 10, 1500);
-      sm_begin_block(s, 12, 1600, RATE_DAYS);
-      SmTx t = {0}; tx1(&t, 0xAA, 0);
-      add_action(&t, decorate_n(26), 0);
-      add_action(&t, decorate_n(26), 0);
-      add_action(&t, decorate_n(13), 0);      // 65 records pending → 64 bind
-      add_post(&t, 100);                       // body binds them (owner-signed)
-      sm_apply_tx(s, &t); sm_tx_free(&t);
-      emit_state(&comb, "53_decor_pend_cap", s); sm_free(s); }
+    // 52b: structural name rejects — leading/trailing hyphen and xn-- ACE drop.
+    { SmState *s = sm_new(0);
+      commit_then_claim(s, 0xAA, "-lead", 0x81, 10, 1000, 10, 1500, 11);
+      commit_then_claim(s, 0xAA, "trail-", 0x82, 10, 2000, 12, 2500, 13);
+      commit_then_claim(s, 0xAA, "xn--x",  0x83, 10, 3000, 14, 3500, 15);
+      commit_then_claim(s, 0xAA, "ok-name",0x84, 10, 4000, 16, 4500, 17);
+      emit_state(&comb, "52b_structural", s); sm_free(s); }
 
-    // 54: NO per-tx count cap (§0). One tx carries 17 VOTE carriers — past the historical
-    // 16 — plus 17 payee outs; all fold (the SmTx spills to the heap). An impl that caps
-    // at 16 either drops the tx or the 17th carrier → a different vote score. Proves the
-    // reference agrees with an unbounded impl above the old bound.
+    // 54: NO per-tx count cap (§0). One tx carries 17 COMMIT carriers past the
+    // historical 16; all fold (SmTx spills to the heap).
     { SmState *s = sm_new(0);
       sm_begin_block(s, 10, 1000, RATE_DAYS);
       SmTx t = {0}; tx1(&t, 0xAA, 0);
-      for (int i = 0; i < 17; i++) add_action(&t, vote(1, 0x55, 7), 3);   // 17 up-votes ×3
-      for (int i = 0; i < 17; i++) add_out(&t, A, SM_P2PKH, 1);           // 17 payees
+      for (int i = 0; i < 17; i++) {
+          SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_COMMIT; a.commitment[0] = (uint8_t)i;
+          add_action(&t, a, 0);
+      }
+      for (int i = 0; i < 17; i++) add_out(&t, A, SM_P2PKH, 1);
       sm_apply_tx(s, &t); sm_tx_free(&t);
       emit_state(&comb, "54_no_txcap", s); sm_free(s); }
+
+    // 55: a name minted then RELEASEd earlier in the SAME block re-mints fresh on a
+    // later CLAIM in that block (§3.6 "immediately reclaimable"; row existence is
+    // authoritative, the block-local claim scratch never blocks a re-mint).
+    { SmState *s = sm_new(0);
+      sm_begin_block(s, 10, 1000, RATE_DAYS);
+      SmTx tc = {0}; tx1(&tc, 0xAA, 0); add_action(&tc, mk_commit("foo", A, 0x91), 0); sm_apply_tx(s, &tc);
+      sm_begin_block(s, 11, 1500, RATE_DAYS);
+      SmTx tk = {0}; tx1(&tk, 0xAA, 0); add_action(&tk, mk_claim("foo", 0x91), 10); sm_apply_tx(s, &tk);   // mint foo→A (A mut=11)
+      uint8_t rel[1] = { 0x01 };
+      SmTx tr = {0}; tx1(&tr, 0xAA, 1); add_action(&tr, release_bits(11, rel, 1), 0); sm_apply_tx(s, &tr); // release foo (row gone, scratch lingers)
+      SmTx tk2 = {0}; tx1(&tk2, 0xAA, 2); add_action(&tk2, mk_claim("foo", 0x91), 10); sm_apply_tx(s, &tk2); // MUST re-mint foo→A
+      emit_state(&comb, "55_claim_release_reclaim_sameblock", s); sm_free(s); }
+
+    // 55b: same, but the re-claim is by a DIFFERENT party B whose backing commit has
+    // LOWER priority than the departed A's — B still mints fresh (a released name's
+    // former owner priority is irrelevant once the row is gone).
+    { SmState *s = sm_new(0);
+      sm_begin_block(s, 10, 1000, RATE_DAYS);
+      SmTx t0 = {0}; tx1(&t0, 0xAA, 0); add_action(&t0, mk_commit("foo", A, 0x91), 0); sm_apply_tx(s, &t0);  // A commit (10, tx0) — higher priority
+      SmTx t1 = {0}; tx1(&t1, 0xBB, 1); add_action(&t1, mk_commit("foo", B, 0x92), 0); sm_apply_tx(s, &t1);  // B commit (10, tx1) — lower priority
+      sm_begin_block(s, 11, 1500, RATE_DAYS);
+      SmTx tk = {0}; tx1(&tk, 0xAA, 0); add_action(&tk, mk_claim("foo", 0x91), 10); sm_apply_tx(s, &tk);      // A mints
+      uint8_t rel[1] = { 0x01 };
+      SmTx tr = {0}; tx1(&tr, 0xAA, 1); add_action(&tr, release_bits(11, rel, 1), 0); sm_apply_tx(s, &tr);   // A releases
+      SmTx tk2 = {0}; tx1(&tk2, 0xBB, 2); add_action(&tk2, mk_claim("foo", 0x92), 10); sm_apply_tx(s, &tk2);  // B mints fresh (owns foo)
+      emit_state(&comb, "55b_reclaim_by_other", s); sm_free(s); }
+
+    // 56: a self-transfer (TRANSFER-all whose target == the current owner) is a real
+    // move — it bumps last_set_mutation_height (owner's mut goes 11 → 12), NOT a no-op.
+    { SmState *s = minted(0xAA, "bar", 10, 1500);
+      sm_begin_block(s, 12, 1600, RATE_DAYS);
+      SmTx tt = {0}; tx1(&tt, 0xAA, 0); add_action(&tt, xfer_all(A), 0); sm_apply_tx(s, &tt);
+      emit_state(&comb, "56_self_transfer_bumps_mut", s); sm_free(s); }
+
+    // 57: fee oracle with block_bytes == 0 — the /0 guard substitutes divisor 1 (NOT
+    // fee-per-byte 0), so the block still participates. 1000 blocks (== MIN_FEE_SAMPLE),
+    // each fee 5000 ⇒ per-byte 5000 ⇒ median 5000 × REF_SIZE 200 = 1_000_000.
+    { int64_t sub[1000], cb[1000], by[1000];
+      for (int i = 0; i < 1000; i++) { sub[i] = 1000000000000LL; cb[i] = 1000000005000LL; by[i] = 0; }
+      emit_u64(&comb, "57_oracle_zero_bytes", sm_oracle_rate(cb, sub, by, 1000)); }
+
+    // 58: CLAIM burn near 2⁶⁴ at rate = DUST_FLOOR (1) — the lease day-count T overflows
+    // 64 bits (computed in 128-bit / bignum, guarded so Go's bits.Div64 never panics)
+    // and clamps to MAX_LEASE (365 days): lease_expiry = 1500 + 365·86400.
+    { SmState *s = sm_new(0);
+      sm_begin_block(s, 10, 1000, 1);
+      SmTx tc = {0}; tx1(&tc, 0xAA, 0); add_action(&tc, mk_commit("foo", A, 0x95), 0); sm_apply_tx(s, &tc);
+      sm_begin_block(s, 11, 1500, 1);
+      SmTx tk = {0}; tx1(&tk, 0xAA, 0); add_action(&tk, mk_claim("foo", 0x95), 0xFFFFFFFFFFFFFFFFULL); sm_apply_tx(s, &tk);
+      emit_state(&comb, "58_lease_clamp_huge_burn", s); sm_free(s); }
+
+    // 59: RENEW_NAME (§3.5) — the by-name renew extends exactly the named lease
+    // (no anchor, no bump); the same op from a non-owner drops (state unchanged).
+    { SmState *s = minted(0xAA, "bar", 10, 1500);
+      sm_begin_block(s, 12, 1600, RATE_DAYS);
+      SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_RENEW_NAME;
+      memcpy(a.name, "bar", 4); a.name_len = 3;
+      SmTx t = {0}; tx1(&t, 0xAA, 0); add_action(&t, a, 7); sm_apply_tx(s, &t);    // +7 days
+      SmTx t2 = {0}; tx1(&t2, 0xBB, 1); add_action(&t2, a, 7); sm_apply_tx(s, &t2); // not B's → drop
+      emit_state(&comb, "59_renew_name", s); sm_free(s); }
+
+    // 60: TRANSFER_NAME (§3.5/§3.6) — gifts exactly the named name to the target,
+    // lease conveys, and the move bumps BOTH parties' last_set_mutation_height.
+    { SmState *s = minted(0xAA, "bar", 10, 1500);
+      sm_begin_block(s, 12, 1600, RATE_DAYS);
+      SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_TRANSFER_NAME;
+      memcpy(a.addr, B, 20); memcpy(a.name, "bar", 4); a.name_len = 3;
+      SmTx t = {0}; tx1(&t, 0xAA, 0); add_action(&t, a, 0); sm_apply_tx(s, &t);
+      emit_state(&comb, "60_transfer_name", s); sm_free(s); }
+
+    // 61: RELEASE_NAME (§3.5/§3.6) — returns exactly the named name to the pool
+    // (bump), and it is immediately reclaimable by a later CLAIM in the same block.
+    { SmState *s = minted(0xAA, "bar", 10, 1500);
+      sm_begin_block(s, 12, 1600, RATE_DAYS);
+      SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_RELEASE_NAME;
+      memcpy(a.name, "bar", 4); a.name_len = 3;
+      SmTx t = {0}; tx1(&t, 0xAA, 0); add_action(&t, a, 0); sm_apply_tx(s, &t);
+      emit_state(&comb, "61_release_name", s); sm_free(s); }
 
     uint8_t cd[32]; sha256_final(&comb, cd); char hx[65]; hexout(cd, 32, hx);
     printf("combined %s\n", hx);

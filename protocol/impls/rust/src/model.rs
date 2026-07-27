@@ -1,5 +1,5 @@
 //! Transaction / block model fed to the fold. The fold is fed already-resolved
-//! identities (§13: "the §6 fold is fed an already-resolved identity"); the §4
+//! identities (§13: "the §5 fold is fed an already-resolved identity"); the §4
 //! attribution byte-logic lives separately in attrib.rs.
 
 use crate::types::{Hash160, ScriptType};
@@ -31,7 +31,7 @@ pub struct Tx {
 pub struct Block {
     pub height: i64,
     /// The block's own timestamp. The fold evaluates boundaries against MTP (median of the
-    /// 11 prior blocks, §6), never this field directly — kept for model completeness.
+    /// 11 prior blocks, §5), never this field directly — kept for model completeness.
     #[allow(dead_code)]
     pub timestamp: i64,
     /// Rate (koinu per name·quantum) for this block. In the `random` generator this

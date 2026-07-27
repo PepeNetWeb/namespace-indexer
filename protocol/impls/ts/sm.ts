@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// shibpost protocol reference state machine — clean-room TypeScript implementation (CLI entry).
+// PepeNet namespace reference state machine — clean-room TypeScript implementation (CLI entry).
 // Run with Node ≥ 23.6 (native TS type-stripping):  node sm.ts <mode> [args]
 //
 // Modes:
@@ -25,7 +25,7 @@ const args = process.argv.slice(2);
 const mode = args[0] ?? "help";
 
 function digestDump(): void {
-  // A small, fully-deterministic hand scenario that exercises names/commits/votes/muts/decors,
+  // A small, fully-deterministic hand scenario that exercises names/commits/muts,
   // then dumps the §4-canonical digest. This is the required "state-digest dump".
   const f = new Fold(0n);
   const id1 = B.genId(1), id2 = B.genId(2);
@@ -40,14 +40,12 @@ function digestDump(): void {
   f.applyTx(B.tx([B.input(id1)], [B.claim(salt1, "alpha", 30n)]), 0);
   f.applyTx(B.tx([B.input(id2)], [B.claim(salt2, "beta", 60n)]), 1);
   console.log("after block2 (alpha→id1, beta→id2):", hex(f.digest()));
-  // block 3: a vote, a SELL, a decorated post
+  // block 3: SELL + TRANSFER (names-only surface)
   f.beginBlock(3n, 1200n, 28n);
-  f.applyTx(B.tx([B.input(id1)], [B.voteUp(new Uint8Array(32).fill(0xaa), 0, 42n)]), 0);
-  f.applyTx(B.tx([B.input(id2)], [B.sell(1000n, 18000n, "beta")]), 1);
-  f.applyTx(B.tx([B.input(id1)], [B.decorate(B.tlv(1, new TextEncoder().encode("reply")), 0), B.postCarrier("hi", 1n, 1)]), 2);
-  console.log("after block3 (vote/sell/decorate):", hex(f.digest()));
-  console.log("\nlive names:", f.names.size, "commits:", f.commits.length, "votes:", f.votes.size,
-    "muts:", f.muts.size, "decors:", f.decors.length, "overflow:", f.overflow);
+  f.applyTx(B.tx([B.input(id2)], [B.sell(1000n, 18000n, "beta")]), 0);
+  f.applyTx(B.tx([B.input(id1)], [B.transferAll(id2)]), 1);
+  console.log("after block3 (sell/transfer):", hex(f.digest()));
+  console.log("\nlive names:", f.names.size, "commits:", f.commits.length, "muts:", f.muts.size);
 }
 
 // ── consensus-fork differential vectors (TV-N from SPEC-RATIONALE.md + M9) ───────────────
@@ -235,7 +233,7 @@ switch (mode) {
     process.exit(Modes.fuzz(BigInt(args[1] ?? "42"), Number(args[2] ?? "30000")));
     break;
   default:
-    console.log(`shibpost clean-room SM. Usage: node sm.ts <mode>
+    console.log(`PepeNet clean-room SM. Usage: node sm.ts <mode>
   selftest                 hand-authored conformance battery (validation gate)
   digest                   canonical state-digest dump (fixed scenario)
   prng <seed> <count>      SplitMix64 outputs

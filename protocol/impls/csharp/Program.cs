@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 
-namespace Shibpost;
+namespace Pepenet;
 
 public static class Program
 {
@@ -63,7 +63,7 @@ public static class Program
 
     private static void Help()
     {
-        Console.WriteLine("shibpost clean-room reference (C#) — BCL only");
+        Console.WriteLine("PepeNet clean-room reference (C#) — BCL only");
         Console.WriteLine("Usage:  dotnet run --project impl -- <mode>");
         Console.WriteLine("        (or from impl/:  dotnet run -- <mode>)");
         Console.WriteLine();

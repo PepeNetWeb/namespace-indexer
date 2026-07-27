@@ -1,12 +1,13 @@
-// The §6 fold driver: begin_block + the per-tx carrier walk.
+// The §5 fold driver: begin_block + the per-tx carrier walk.
 //
 // apply_tx is a single forward pass over a tx's OP_RETURN carriers in vout
 // order. It tracks the acting identity (vin[0] by default; re-pointed by AS
-// markers, §3.10/Rule 1b) and a pending DECORATE buffer that binds to the next
-// body (§1). Votes, posts, COMMIT and DECORATE are handled inline here; the
-// heavier identity/market/trade ops dispatch to their modules.
+// markers, §3.9/Rule 1b). COMMIT is handled inline; heavier identity/market/
+// trade ops dispatch to their modules. Consensus classifies no content —
+// only name-action carriers mutate state.
 #include "sm.h"
 #include <string.h>
+#include <stdlib.h>
 
 // ── synthetic per-tx id (pinned): txid = height(8 LE) ‖ txindex(4 LE) ‖ 0… ────
 static void synth_txid(uint8_t out[32], int64_t height, uint32_t txindex) {
@@ -16,51 +17,10 @@ static void synth_txid(uint8_t out[32], int64_t height, uint32_t txindex) {
     for (int i = 0; i < 4; i++) out[8 + i] = (uint8_t)(txindex >> (8 * i));
 }
 
-// Does `who` control ≥1 name here? A listed/offered/reserved name is still the
-// seller's (§3.7), so it counts. Used by the DECORATE name-ownership gate (§1).
-static int owns_any(SmState *s, const uint8_t who[20]) {
-    for (int i = 0; i < s->n_names; i++) {
-        SmNameRow *r = &s->names[i];
-        if (r->st == SM_OWNED) { if (memcmp(r->owner, who, 20) == 0) return 1; }
-        else                   { if (memcmp(r->seller, who, 20) == 0) return 1; }
-    }
-    return 0;
-}
-
-// ── pending DECORATE records (bind to the next body, §1) ─────────────────────
-typedef struct { uint8_t bytes[SM_DEC_MAX]; uint8_t len; } PendRec;
-#define MAX_PEND SM_MAX_PEND_DECOR      // §1 pending-record cap (sm.h, pinned all 7 impls)
-typedef struct { PendRec recs[MAX_PEND]; int n; } Pending;
-
-// Parse one DECORATE carrier's TLV records (fail-closed on overrun) and append.
-static void decorate_buffer(Pending *p, const SmAction *a) {
-    size_t i = 0, len = a->dec_len;
-    while (i + 3 <= len) {
-        size_t rlen = (size_t)a->dec[i + 1] | ((size_t)a->dec[i + 2] << 8);
-        size_t total = 3 + rlen;
-        if (i + total > len) break;                 // len overruns payload → drop the rest
-        if (p->n < MAX_PEND && total <= SM_DEC_MAX) {
-            memcpy(p->recs[p->n].bytes, &a->dec[i], total);
-            p->recs[p->n].len = (uint8_t)total;
-            p->n++;
-        }
-        i += total;
-    }
-}
-
-// Bind buffered records to the post at (txid, vout) iff `author` controls a name.
-static void decorate_bind(SmState *s, Pending *p, const uint8_t txid[32], uint32_t vout,
-                          const uint8_t *author /* NULL = anonymous */) {
-    if (p->n && author && owns_any(s, author))
-        for (int i = 0; i < p->n; i++)
-            sm_decor_add(s, txid, vout, p->recs[i].bytes, p->recs[i].len);
-    p->n = 0;                                        // bound or dropped — always clear
-}
-
 // ── driver ────────────────────────────────────────────────────────────────────
 
 void sm_begin_block(SmState *s, int64_t height, int64_t mtp, uint64_t rate) {
-    sm_preblock(s, height, mtp);                     // transitions BEFORE the block's txs (§6)
+    sm_preblock(s, height, mtp);                     // transitions BEFORE the block's txs (§5)
     s->cur_height = height; s->cur_mtp = mtp; s->cur_rate = rate;
     s->n_claimsc = 0;                                // §3.2 claim scratch is per-block
 }
@@ -72,6 +32,18 @@ void sm_apply_tx(SmState *s, const SmTx *tx) {
     cx.txindex = tx->txindex;
     synth_txid(cx.txid, s->cur_height, tx->txindex);
 
+    // §3.5 consume-once flags: one per spendable output. A tx has no output cap
+    // (§0), so size to n_outs — a fixed buffer would corrupt state / read stale
+    // flags on a tx with >SM_INLINE_OUTS outputs. Inline for the common case.
+    uint8_t consumed_inline[SM_INLINE_OUTS];
+    if (tx->n_outs > SM_INLINE_OUTS) {
+        cx.out_consumed = calloc((size_t)tx->n_outs, 1);
+        if (!cx.out_consumed) abort();               // deterministic fail (cf. GROW assert)
+    } else {
+        cx.out_consumed = consumed_inline;
+        memset(consumed_inline, 0, sizeof(consumed_inline));
+    }
+
     // acting identity = vin[0] by default; valid iff it signs SIGHASH_ALL (Rule 3).
     if (tx->n_inputs > 0 && tx->in_sighash_all[0]) {
         memcpy(cx.actor, tx->inputs[0].h160, 20);
@@ -79,34 +51,20 @@ void sm_apply_tx(SmState *s, const SmTx *tx) {
         cx.actor_valid = 1;
     }
 
-    Pending pend; pend.n = 0;
-
     for (int c = 0; c < tx->n_carriers; c++) {
         const SmCarrier *car = &tx->carriers[c];
         cx.car_value = car->value; cx.car_vout = car->vout;
 
-        if (car->kind == SM_CAR_IGNORE) continue;
+        if (car->kind != SM_CAR_ACTION) continue;    // IGNORE (or anything non-action)
 
-        if (car->kind == SM_CAR_POST) {
-            if (car->value == 0) continue;           // zero-value → ignore (§1)
-            // A post is consensus-irrelevant display data (not folded); its only
-            // on-chain effect is to anchor co-located DECORATE records (§1). The
-            // author is the acting identity (or anonymous), gating the binding.
-            const uint8_t *author = cx.actor_valid ? cx.actor : NULL;
-            decorate_bind(s, &pend, cx.txid, car->vout, author);
-            continue;
-        }
-
-        // ACTION carrier.
         const SmAction *a = &car->act;
         const int op = a->op;
 
-        // forward-only activation gate (§3.0): a gated op below the height drops.
-        if (op >= SM_OP_FIRST_GATED && s->cur_height < (int64_t)s->activation_height)
+        // forward-only activation gate (§3.0): all ops gate at one height.
+        if (s->cur_height < (int64_t)s->activation_height)
             continue;
 
         if (op == SM_OP_AS) {                        // re-point acting identity (Rule 1b)
-            pend.n = 0;                              // AS flushes the pending DECORATE buffer
             uint8_t k = a->as_index;
             if (k < tx->n_inputs && tx->in_sighash_all[k]) {
                 memcpy(cx.actor, tx->inputs[k].h160, 20);
@@ -119,18 +77,8 @@ void sm_apply_tx(SmState *s, const SmTx *tx) {
             continue;
         }
 
-        if (op == SM_OP_DECORATE) { decorate_buffer(&pend, a); continue; }
-
-        if (op == SM_OP_VOTE_UP || op == SM_OP_VOTE_DOWN) {
-            if (!cx.actor_valid) continue;           // needs an attributable vin[0] (§3.8)
-            if (car->value < (uint64_t)SM_DUST_FLOOR) continue;   // zero-weight → drop
-            sm_vote_add(s, a->target_txid, a->target_vout,
-                        op == SM_OP_VOTE_UP, car->value);
-            continue;
-        }
-
         // TRADE is attributed to its OWN named inputs (idxA/idxB), not the acting
-        // identity, so it dispatches regardless of cx.actor_valid (§3.10).
+        // identity, so it dispatches regardless of cx.actor_valid (§3.9).
         if (op == SM_OP_TRADE) { sm_op_trade(s, &cx, a); continue; }
 
         if (!cx.actor_valid) continue;               // every other op acts as the acting identity
@@ -142,6 +90,9 @@ void sm_apply_tx(SmState *s, const SmTx *tx) {
         case SM_OP_CLAIM:    sm_op_claim(s, &cx, a);    break;
         case SM_OP_RENEW:    sm_op_renew(s, &cx, a);    break;
         case SM_OP_TRANSFER: sm_op_transfer(s, &cx, a); break;
+        case SM_OP_RENEW_NAME:    sm_op_renew_name(s, &cx, a);    break;
+        case SM_OP_TRANSFER_NAME: sm_op_transfer_name(s, &cx, a); break;
+        case SM_OP_RELEASE_NAME:  sm_op_release_name(s, &cx, a);  break;
         case SM_OP_SELL:     sm_op_sell(s, &cx, a);     break;
         case SM_OP_RESERVE:  sm_op_reserve(s, &cx, a);  break;
         case SM_OP_SETTLE:   sm_op_settle(s, &cx, a);   break;
@@ -151,5 +102,6 @@ void sm_apply_tx(SmState *s, const SmTx *tx) {
         default: break;                              // unknown opcode → ignore
         }
     }
-    // end of tx: any unbound DECORATE records are orphans (dropped).
+
+    if (cx.out_consumed != consumed_inline) free(cx.out_consumed);
 }

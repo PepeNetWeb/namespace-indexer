@@ -98,6 +98,8 @@ def parse_der_sig(sig):
         return None
     r_int = int.from_bytes(R, "big")
     s_int = int.from_bytes(S, "big")
+    if r_int >= (1 << 256) or s_int >= (1 << 256):
+        return None                    # R or S ≥ 2^256: reject (match C/Go), NOT truncate/raise in _r32
     if s_int > SECP_N_HALF:            # low-S
         return None
     return (r_int, s_int)

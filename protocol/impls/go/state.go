@@ -2,6 +2,7 @@ package main
 
 // Fold state. All collections are keyed deterministically; digest.go emits them
 // in the conformance-pinned sort order (never by Go map iteration).
+// Names-only: names + commits + muts (no votes / posts / decorations).
 
 type NameRow struct {
 	owner [20]byte
@@ -10,13 +11,13 @@ type NameRow struct {
 	leaseExpiry int64
 
 	// market fields — always digested; zeroed when not active for the current st.
-	seller       [20]byte
-	sellerType   byte
-	price        uint64
-	offerExpiry  int64
-	buyer        [20]byte // directed-offer buyer OR open-reserve reserver
-	burnLeg      uint64
-	payLeg       uint64
+	seller        [20]byte
+	sellerType    byte
+	price         uint64
+	offerExpiry   int64
+	buyer         [20]byte // directed-offer buyer OR open-reserve reserver
+	burnLeg       uint64
+	payLeg        uint64
 	reserveExpiry int64
 }
 
@@ -39,27 +40,10 @@ type CommitRow struct {
 	commitTime int64
 }
 
-type VoteRow struct {
-	target [32]byte
-	vout   uint32
-	score  i128
-}
-
-type DecorRow struct {
-	txid [32]byte
-	vout uint32
-	rec  []byte // FULL on-wire record [tag:1][len:2 LE][value]
-	seq  int    // insertion order within post (for stable sort)
-}
-
 type FoldState struct {
 	names   map[string]*NameRow // key = raw name bytes
 	commits []CommitRow
-	votes   map[string]*VoteRow // key = string(target)+"|"+vout
 	muts    map[[20]byte]int64
-	decors  []DecorRow
-
-	overflow bool
 
 	curHeight int64
 
@@ -76,7 +60,6 @@ type claimScratch struct {
 func newState() *FoldState {
 	return &FoldState{
 		names: map[string]*NameRow{},
-		votes: map[string]*VoteRow{},
 		muts:  map[[20]byte]int64{},
 	}
 }
@@ -89,26 +72,6 @@ func (s *FoldState) bumpMut(owner [20]byte, h int64) {
 	if cur, ok := s.muts[owner]; !ok || h > cur {
 		s.muts[owner] = h
 	}
-}
-
-// ownsAny reports whether owner has at least one name row (any live state).
-func (s *FoldState) ownsAny(owner [20]byte) bool {
-	for _, r := range s.names {
-		if r.owner == owner {
-			return true
-		}
-	}
-	return false
-}
-
-func voteKey(target [32]byte, vout uint32) string {
-	b := make([]byte, 36)
-	copy(b, target[:])
-	b[32] = byte(vout)
-	b[33] = byte(vout >> 8)
-	b[34] = byte(vout >> 16)
-	b[35] = byte(vout >> 24)
-	return string(b)
 }
 
 // makeSyntheticTxid: txid = u64_le(height) ‖ u32_le(txindex) ‖ 20 zero bytes (conformance §3).

@@ -1,4 +1,4 @@
-//! shibpost protocol reference state machine (clean-room Rust, zero external crates).
+//! PepeNet namespace reference state machine (clean-room Rust, zero external crates).
 //!
 //! Modes:
 //!   sm selftest                  — crypto KATs + decoder round-trips + fold vector battery + attrib KATs

@@ -1,4 +1,4 @@
-// shibpost reference state-machine — INDEPENDENT Java implementation.
+// PepeNet reference state-machine — INDEPENDENT Java implementation.
 //
 // Derived purely from docs/protocol-spec.md + protocol-sm/SPEC-conformance.md.
 // NOT a port of any impls/* implementation (the point is fresh eyes for
@@ -29,7 +29,7 @@ public class Sm {
             case "reorg" -> Modes.reorg(Long.parseLong(args[1]), Integer.parseInt(args[2]));
             case "fuzz" -> Modes.fuzz(Long.parseLong(args[1]), Integer.parseInt(args[2]));
             case "reorgfuzz" -> Modes.reorgfuzz(Long.parseLong(args[1]), Integer.parseInt(args[2]));
-            case "scenario" -> Scenario.run();   // the 52 named directed conformance vectors + rolling `combined` (mirrors impls/c)
+            case "scenario" -> Scenario.run();   // directed adversarial conformance vectors + rolling `combined` (mirrors impls/c)
             default -> { System.err.println("unknown mode: " + mode); System.exit(2); }
         }
     }

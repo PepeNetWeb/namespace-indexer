@@ -10,7 +10,8 @@ import hashlib
 import secp256k1 as secp
 
 ECMH_REC_TAG = b"ECMHv1"
-TAG_NAME, TAG_COMMIT, TAG_VOTE, TAG_MUT, TAG_DECOR = 0x01, 0x02, 0x03, 0x04, 0x05
+# domain tags — second-preimage separation between tables (names-only: no VOTE/DECOR).
+TAG_NAME, TAG_COMMIT, TAG_MUT = 0x01, 0x02, 0x04
 
 
 def _rec_pt(tag, body):
@@ -31,7 +32,7 @@ def run():
     h2c = [
         ("empty", b""),
         ("a", b"a"),
-        ("shib", b"shibpost"),
+        ("pepe", b"pepenet"),
         ("doge", b"doge"),
         ("ff32", b"\xff" * 32),
         ("z32", b"\x00" * 32),
@@ -47,12 +48,11 @@ def run():
     print("identity " + idp.hex())
     feed(idp)
 
-    # 3. tagged multiset sum
+    # 3. tagged multiset sum (NAME/COMMIT/MUT only — matches C ecmh_cmd)
     recs = [
         (TAG_NAME, b"\x03foo"),
         (TAG_NAME, b"\x03bar"),
         (TAG_COMMIT, b"commitment-blob-32-bytes-xxxxxx"),
-        (TAG_VOTE, b"vote-target-row"),
         (TAG_MUT, b"owner-mutation"),
     ]
     fwd = secp.ecmh_identity()

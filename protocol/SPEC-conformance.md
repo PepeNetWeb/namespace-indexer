@@ -1,8 +1,9 @@
 # protocol-sm — cross-language conformance contract
 
+
 This pins the parts of the reference state machine that **silently differ between
 languages**. The fold *semantics* live in [`docs/protocol-spec.md`](docs/protocol-spec.md)
-(§3, §6); this document pins the PRNG, the integer-width rules, the canonical
+(§3, §5); this document pins the PRNG, the integer-width rules, the canonical
 digests, and the generator draw-order so that **every implementation, fed the same
 `(seed, count)`, prints the same `input_digest` + `state_digest`.** That agreement
 is the entire conformance proof — there are no shipped corpus files.
@@ -26,7 +27,7 @@ across the whole matrix (`random` / `fuzz` / `bfuzz` / `properties` / `reorg` / 
 `scenario` / `attrib`). This is a **byte-for-byte** check — but it only works *because* the impl
 deliberately replicates the same generator and serialization, so it cannot certify an implementation
 built independently of `gen.c`. Tier 1 therefore *self-regresses* the C reference against its frozen
-goldens (scenario combined `4c84238f…`, attrib-scenario `9fb14077…`), the
+goldens (scenario combined `301ce369…`, attrib-scenario `9fb14077…`), the
 `properties`/`reorg`/`reorgfuzz`/`meta` violation==0 invariants, and the generator/decode coverage gate.
 The cross-language guarantee lives **entirely** in Tier 2.
 
@@ -72,7 +73,7 @@ cross-validates exactly that:
 
 **M9 (the value of Tier 2).** TRADE is attributed to its named parties `vin[idxA]`/`vin[idxB]`, not
 the transaction's acting identity — so a TRADE whose `vin[0]` is ⊥ still settles (`docs/protocol-spec.md`
-§3.10/§6). Two independent implementations had each read the prose the opposite way — gating TRADE behind
+§3.9/§5). Two independent implementations had each read the prose the opposite way — gating TRADE behind
 the acting-identity check and dropping the trade — while `impls/c` did not. Two independent readings
 diverging the same way is precisely what flags prose as under-specified; the spec was hardened to pin
 parties-only, and the implementations were corrected. The `M9` fork vector now guards this in every
@@ -104,7 +105,7 @@ Conformance check: `next()` from `seed=0` returns `0xE220A8397B1DCDAF` first.
 
 ## 2. Integer widths (the real edge cases)
 
-koinu / price / vote-weight are `uint64`. Two computations need **≥128-bit** and are
+koinu / price are `uint64`. Two computations need **≥128-bit** and are
 the load-bearing anti-fork rules:
 
 - **Reserve deposit leg** `= max(DUST_FLOOR, ⌊price · bps / 10000⌋)` — `price·bps`
@@ -115,13 +116,11 @@ the load-bearing anti-fork rules:
   water-fill clamps it to the total headroom (never storing the wide value), so
   `if T ≥ Σheadroom: every name caps, surplus forfeited` short-circuits before any
   64-bit store.
-- **Vote accumulator** is **signed 128-bit** (`Σ up − Σ down`); 128-bit overflow is
-  fail-loud (the digest's trailing `overflow` byte), astronomically unreachable.
 
 Per-language 128-bit: Python/JS native (`int`/`BigInt`), Rust `u128`/`i128`, Go
 `math/bits.Mul64`+`Div64` (the `price·bps` and `burn·LEASE_QUANTUM` numerators) plus a
-16-byte two's-complement `I128{hi,lo uint64}` helper (the signed vote accumulator + the §8
-Σ's), C `unsigned __int128`, C# `UInt128`/`Int128`. **Go (no native 128-bit) MUST guard
+16-byte two's-complement `I128{hi,lo uint64}` helper (the §8
+Σ lease/price/legs), C `unsigned __int128`, C# `UInt128`/`Int128`. **Go (no native 128-bit) MUST guard
 `bits.Div64`.** `Div64(hi,lo,den)` *panics* whenever the quotient would overflow 64 bits — i.e.
 exactly when `hi ≥ den` — so an impl MUST test `hi ≥ den` **before** calling it and take that as
 the "`T ≥ 2⁶⁴`" sentinel that feeds the water-fill clamp (the headroom Σ is far under `2⁶⁴`, so any
@@ -135,13 +134,13 @@ entirely in ≥128-bit and clamping the wide `T` to the headroom Σ — the `hi 
 Go-only spelling of that same clamp.)
 
 **Per-language value representation (pinned — this is where a 64-bit-lossy type silently
-forks).** koinu / price / vote-weight / lease numbers are **exact 64-bit integers end-to-end**;
+forks).** koinu / price / lease numbers are **exact 64-bit integers end-to-end**;
 no implementation may let one transit a type that rounds. The trap is JavaScript: a `number`
 is an IEEE-754 double, exact only to `2⁵³−1` (`Number.MAX_SAFE_INTEGER`), so a price near `2⁶⁴`
 — or even an *intermediate* like `price·50` for a price above `2⁵³/50` — silently rounds. The
 TS/JS port therefore carries **`BigInt` from the first byte of parse** (`rdLE → bigint`) through
 the fold to serialization (`le(v: bigint, …)`); `number` is permitted **only** for genuinely
-≤32-bit quantities (vout, txindex, array indices, counts, flag/dec bytes, UTF-8 code points),
+≤32-bit quantities (vout, txindex, array indices, counts, flag bytes),
 which a double holds exactly. Because every value-bearing field is `BigInt`, JS *throws* on a
 `BigInt + number` mix — a stray `number` crashes rather than silently corrupting, so there is no
 `number → BigInt` boundary at which a value could have already rounded. Go (no native 128-bit)
@@ -187,9 +186,6 @@ Beyond `protocol-spec.md`, these implementation choices are pinned (read `impls/
   owed)` output at the lowest unconsumed `vout` marks it consumed. A premature consume (matching
   before the precondition drop, or marking an output consumed on a failed match) removes an output a
   later op in the same tx needs and mis-assigns the §7 value-collision vector (41).
-- **Synthetic post id** (for votes/decorations, since the abstract model has no real
-  txids): `txid = u64_le(height) ‖ u32_le(txindex) ‖ 20 zero bytes` (8 + 4 + 20 = **32 bytes**,
-  exactly filling the `target[32]` / `txid[32]` digest field of §4).
 - **Bitmap bit order** is **LSB-first**: bit `i` = `(flags[i>>3] >> (i&7)) & 1`, meaningful
   for `i < K` (owned-set size); bits `≥ K` are ignored, never fatal.
 - **Claim same-block displacement** (§3.2 priority tuple in a single forward pass): a
@@ -213,7 +209,7 @@ Beyond `protocol-spec.md`, these implementation choices are pinned (read `impls/
 - **Pre-block transitions** are per-row `reserve → offer → lease` in that order, then
   `COMMIT_EXPIRY` pruning; the lease/offer/reserve bounds are **exclusive** (owned iff
   `MTP < lease_expiry`), while the **`COMMIT_EXPIRY` window is inclusive** — a commit is live through
-  `commit_time + COMMIT_EXPIRY` and pruned only once `MTP >` it (`docs/protocol-spec.md` §3.2/§6). A
+  `commit_time + COMMIT_EXPIRY` and pruned only once `MTP >` it (`docs/protocol-spec.md` §3.2/§5). A
   commit's **`commit_time` is the MTP of its confirmation block**, stored in the row and digested (§4).
 - **Time-triggered set mutations stamp the connecting height.** A **lapse** (a name leaving its
   owner's set in the pre-block phase at height `H`) bumps that owner's `last_set_mutation_height` to
@@ -224,7 +220,7 @@ Beyond `protocol-spec.md`, these implementation choices are pinned (read `impls/
 ## 4. Canonical state digest (byte-exact)
 
 Serialize into a buffer, then `SHA-256`. Multi-byte integers are **little-endian**;
-signed values are two's-complement LE; the i128 vote score is 16 bytes LE.
+signed values are two's-complement LE.
 
 ```
 "SMv1"
@@ -233,10 +229,7 @@ u32  n_names         ; rows sorted ascending by raw name bytes, each:
     ‖ seller[20] ‖ u8 seller_type ‖ u64 price ‖ i64 offer_expiry
     ‖ buyer[20] ‖ u64 burn_leg ‖ u64 pay_leg ‖ i64 reserve_expiry
 u32  n_commits       ; sorted by (commitment[32], commit_height, tx_index), each: commitment[32] ‖ i64 commit_height ‖ u32 tx_index ‖ i64 commit_time
-u32  n_votes         ; sorted by (target[32], vout), each: target[32] ‖ u32 vout ‖ i128 score[16]
 u32  n_muts          ; sorted by owner bytes, each: owner[20] ‖ i64 height
-u32  n_decors        ; sorted by (txid[32], vout) STABLE (insertion order within a post), each: txid[32] ‖ u32 vout ‖ u8 rec_len ‖ rec
-u8   overflow_flag
 ```
 
 (`st`: OWNED=0, LISTED=1, OFFERED=2, RESERVED=3.) State NOT digested: per-block claim
@@ -247,16 +240,16 @@ scratch, coverage counters.
 `st`**. For an `OWNED` (st=0) row — and for any field not active in the current `st` — those bytes
 are **all-zero** (`seller` / `buyer` = 20 zero bytes; `seller_type` / `price` / `offer_expiry` /
 `burn_leg` / `pay_leg` / `reserve_expiry` = 0). A row that **leaves** a state (an offer/reserve close
-or a reverted reserve, §6) **physically resets** the now-inactive fields to zero before the next
+or a reverted reserve, §5) **physically resets** the now-inactive fields to zero before the next
 digest, so two indexers that reached the same logical `st` always serialize identical bytes. (This is
-the fixed-width counterpart to the prose `names` table in `docs/protocol-spec.md` §6, whose per-`st`
+the fixed-width counterpart to the prose `names` table in `docs/protocol-spec.md` §5, whose per-`st`
 field list says which fields are *meaningful* — not which are *emitted*; the digest always emits all
 of them.)
 
 **The `buyer[20]` slot carries both market counterparties.** For an `OFFERED` (st=2) row it holds the
 **directed buyer** named by `SELL_TO`; for a `RESERVED` (st=3) row it holds the **reserver** — the
 exclusive buyer who alone may `SETTLE` (§3.7), written at `RESERVE` and matched at `SETTLE`. There is
-**no separate `reserver` field** in the digest: the `reserver` named in the `docs/protocol-spec.md` §6
+**no separate `reserver` field** in the digest: the `reserver` named in the `docs/protocol-spec.md` §5
 *Tables* reservation row *is* this `buyer` slot. An indexer that split them — a dedicated `reserver[20]`
 with `buyer` left zero on a `RESERVED` row — forks every reserved row's 20 bytes.
 
@@ -269,19 +262,9 @@ and **fork the digest**. The pinned key is therefore `(commitment[32], commit_he
 strict total order on distinct rows regardless of sort stability. (Implementations whose
 `n_commits` comparator stops at the commitment bytes MUST add this secondary key.)
 
-**`n_decors` `rec` is the FULL on-wire record.** `rec` = the verbatim record bytes
-`[tag:1][len:2 LE][value]` exactly as buffered from the `DECORATE` carrier (§1) — the inner 2-byte
-`len` **is** re-emitted, **not** stripped — and `rec_len` is that whole length (`3 + value-length`,
-always ≤ 76 within an ≤80-byte carrier). Emitting `[tag][value]` (dropping the inner `len`) or
-`[value]` alone produces different per-decoration bytes and a different digest. And **`n_decors`
-counts records, not posts**: each buffered TLV record is its own digest row, so a post that bound *k*
-records contributes *k* rows — all repeating that post's `(txid, vout)`, ordered by buffer insertion
-(the stable tiebreak above). An impl that emitted one concatenated row per post (with `n_decors` = the
-post count) forks both the `u32` count and the framing on any multi-record post.
-
 **`n_muts` is never pruned.** A `last_set_mutation_height` row, once stamped for an owner, persists
 for the life of the index — it is a monotonic high-water mark, **not** removed when that owner's
-live name set falls to empty (`docs/protocol-spec.md` §3.5/§3.9). An indexer that dropped the row
+live name set falls to empty (`docs/protocol-spec.md` §3.5/§3.8). An indexer that dropped the row
 for a now-empty owner would emit a smaller `n_muts` and fork the digest after any set-emptying lapse.
 The rule also covers a **same-block-displaced CLAIM**: the provisional mint already bumped the *losing*
 minter's height (§3 *Claim same-block displacement*) before a higher-priority claim displaced it, and
@@ -301,8 +284,9 @@ collections (whose order is not canonical). Pinned constants:
 N_IDS=16   NAME_POOL=400   BASE_TS=1_700_000_000   activation_height=0
 identity i: h160 = byte(i) ‖ 18 zero bytes ‖ byte(i);  type = P2SH if i%4==3 else P2PKH
 name_of(i): "n" + base36(i)            # digits 0-9a-z
-op weights [POST,VOTE,COMMIT,CLAIM,RENEW,TRANSFER,SELL,RESERVE,SETTLE,RELEASE,SELL_TO,PAY,TRADE]
-           = [12,12,14,13,5,5,8,7,7,3,6,5,4]
+op weights [COMMIT,CLAIM,RENEW,TRANSFER,SELL,RESERVE,SETTLE,RELEASE,SELL_TO,PAY,TRADE,
+            RENEW_NAME,TRANSFER_NAME,RELEASE_NAME]
+           = [14,13,5,5,8,7,7,3,6,5,4,4,3,2]
 rate = 28·(1+bounded(4)) ; ts step = 300+bounded(600) ; txs/block = 1+bounded(8)
 lease burn = (rate/28)·days        # so days are exact
 ```
@@ -328,17 +312,18 @@ CI-checked against the table below:
 
 | seed | count  | state_digest (first 16 hex) |
 |------|--------|------------------------------|
-| 1    | 100000 | `b808ad61b7818e17…` |
-| 42   | 100000 | `227f60905567f8df…` |
-| 1000 | 100000 | `6d34066cfdd5dd09…` |
+| 1    | 100000 | `c640599837be1ab0…` |
+| 42   | 100000 | `9dd51eab55597850…` |
+| 1000 | 100000 | `14a725b65746dcef…` |
 
 Run `./run-conformance.sh` for the full matrix across every present implementation.
 
 ## 7. Directed conformance vectors (`sm scenario`)
 
-Beyond the random soak, each impl ships a `scenario` mode: **54 named, hand-authored
-adversarial constructions** with auditable outcomes — the spec's §6 edge cases plus the
-branches the soak almost never hits. Each emits `name <digest>`; the final
+Beyond the random soak, each impl ships a `scenario` mode: **named, hand-authored
+adversarial constructions** with auditable outcomes — the spec's §5 edge cases plus the
+branches the soak almost never hits (battery renumbered + combined golden re-pinned during
+the impl update). Each emits `name <digest>`; the final
 `combined <sha256>` is the single-line cross-language + regression check.
 
 Coverage includes: commit→claim happy/naked/too-shallow, the **priority tuple** (lower
@@ -350,8 +335,7 @@ underfunding floor** (32) — one day each to the first `T` *headroom-having* na
 the full open-market cascade (reserve burn-short / pay-summed / **reserve_expiry clamp**),
 SELL price-floor + add-form window guard, directed SELL_TO/PAY (stranger-drop), the
 **2⁶⁴-1 deposit** (128-bit legs), AS attribution + OOB-drop, TRADE swap + same-block
-anti-rug, DECORATE gate/orphan, vote scoring + **i128 accumulation past ±2⁶⁴** (28/37),
-the **fee-oracle** (participant filter: even-|P| lower median at the inclusive
+anti-rug, the **fee-oracle** (participant filter: even-|P| lower median at the inclusive
 `MIN_FEE_SAMPLE` boundary with an in-window under-claim (49), odd-|P| middle (50), the
 999-participant degrade (51), plus the small-window degrade / floor (29/30)) + **MTP
 median**, and the **reorg edge
@@ -364,7 +348,7 @@ RENEW-vs-CLAIM at the exact lapse tie (the pre-block lapse runs *before* the blo
 so the old owner's RENEW skips the lapsed name and the hunter's CLAIM wins — a lazy
 "evaluate expiry on access" impl forks); **39** a single pre-block tick that crosses
 `reserve_expiry` then `offer_expiry` at once, cascading RESERVED→LISTED→OWNED in one pass
-in the rigid §6 type-order reserve→offer→lease (the *triple* tie with the lease is
+in the rigid §5 type-order reserve→offer→lease (the *triple* tie with the lease is
 unconstructible — the nesting invariant forces `offer_expiry + REORG_BUFFER ≤ lease_expiry`,
 so the lease leg is always ≥ `REORG_BUFFER` out); **40** intra-block RESERVE option theft
 (first reserver in chain order wins the exclusive option; a second reserve on the now-
@@ -388,7 +372,7 @@ over-funded burn still wins). **47** TRADE fail-closed edges (OOB index / one-pa
 38–48 with behavioral assertions in `selftest` (`test_scenario_races` / `test_scenario_races2`),
 not just the digest.
 
-**Frozen golden:** `combined = 4c84238fd39e407e394f1a00f40f31cfa5f754e3c5642053c101cd8b3b21778a` (re-frozen 2026-07-07: vector 52 rewritten `52_dotted_names`→`52_charset` for the charset re-pin `[a-z0-9-]`, 1..32 — hyphen + a 32-byte name mint, `.`/`_` drop; 059ac934… was the prior 54-vector golden [53_decor_pend_cap + 54_no_txcap]; db714fa4… the 52-vector charset golden, d7809634… the 51-vector one)
+**Frozen golden:** `combined = aca6749e79b7e6b582e1f5043693b7991fcc592f4df537461e09d6b9e451d347` (2026-07-26: added the by-name vectors — `59_renew_name` pins the anchor-free singleton renew + non-owner drop, §3.5; `60_transfer_name` pins the one-name gift with both-party mutation bump, §3.5/§3.6; `61_release_name` pins the one-name release-to-pool, §3.5/§3.6). Prior: 301ce369… (2026-07-09: divergence-fix vectors — `55_claim_release_reclaim_sameblock` + `55b_reclaim_by_other` pin same-block release→re-mint, §3.6; `56_self_transfer_bumps_mut` pins self-transfer as a mutation bump, §3.5; `57_oracle_zero_bytes` pins the `block_bytes==0` → divisor-1 oracle rule, §3.4; `58_lease_clamp_huge_burn` pins the near-2⁶⁴ burn lease clamp to MAX_LEASE), c6101c4c… (re-pin 2026-07-08: `52_charset` + `52b_structural` pin `[a-z0-9-]`, 1..32, lead/trail hyphen + `--`-at-3–4 rejects; `54_no_txcap` is 17 COMMITs), 4c84238f…, 059ac934…, db714fa4…, d7809634….)
 — since the 2026-07-02 re-pin this is a **full cross-language lock**: the numbered battery was
 ported from `impls/c` into all six other impls during the charset change (it had previously
 been C-only, with the promoted clean-rooms carrying port-private scenario/behav surfaces —
@@ -415,23 +399,21 @@ mtp + MAX_LEASE`; for any listed/offered/reserved row `offer_expiry + REORG_BUFF
 lease_expiry`; listed `price ≥ 3·DUST_FLOOR`; reserved `reserve_expiry ≤ offer_expiry`,
 `price ≥ burn_leg + pay_leg`, the **deposit-leg conservation recompute**
 `burn_leg == max(DUST_FLOOR, ⌊price·50/10000⌋)` and same for `pay_leg`, and `price −
-burn_leg − pay_leg ≥ DUST_FLOOR`; every mutation height `≤ cur_height`; `overflow == 0`.
+burn_leg − pay_leg ≥ DUST_FLOOR`; every mutation height `≤ cur_height`.
 
 **Property fingerprint (pinned field order, order-independent aggregates):**
 
 ```
 u32 n_names, n_owned, n_listed, n_offered, n_reserved
-u32 n_commits, n_votes, n_muts, n_decors
+u32 n_commits, n_muts
 i128 Σ lease_expiry            ; 16 bytes LE (wrapping)
 i128 Σ price   (listed+reserved)
 i128 Σ (burn_leg+pay_leg)      (reserved)
-i128 Σ vote.score              ; signed, wrapping i128, 16 bytes LE
-u8   overflow_flag
 ```
 
 **Frozen golden (seed 42, count 100000):**
-`property_digest = cd8b9351148e84d3df9bc60fdea9fc7f2fbac03d68682df30b8166a12cb2e4e9`
-(and `state_digest` equals §6's `227f6090…`).
+`property_digest = 0c16c1a324810078eed5e4ec46c878d54d760a9a834773cb8898d08ebec87b8a`
+(and `state_digest` equals §6's `9dd51eab…`).
 
 ---
 
@@ -443,25 +425,25 @@ agree byte-for-byte on validity"). The fuzzer feeds millions of **dumb-random + 
 aware-perturbed** OP_RETURN payloads through the decoder → fold → digest; any parser/bounds
 divergence between languages surfaces as a `state_digest` mismatch. Output: `input_digest=`
 (the raw fuzz byte stream) + `state_digest=` (the fold result); `--cov` prints decode
-coverage (ignore / post / per-opcode-action).
+coverage (ignore / per-opcode-action).
 
-**`sm_decode_payload(payload, len, value) → ACTION | POST | IGNORE` (pinned):**
-- ACTION iff `len ≥ 4` and `payload[0..3] == FF 50 4E` and opcode `payload[3]` decodes per
-  the per-opcode field layout below; any field/length mismatch ⇒ **IGNORE** (a 0xFF lead is
-  never valid UTF-8, so a malformed action is never a post).
-- POST iff (not an action prefix) and `value > 0` and `len ≥ 1` and the **whole payload** is
-  strict RFC-3629 UTF-8 (`sm_valid_utf8`: reject overlong, surrogates U+D800..U+DFFF,
-  > U+10FFFF). Else IGNORE. (Stored post bytes are capped at 80.)
+**`sm_decode_payload(payload, len, value) → ACTION | IGNORE` (pinned):**
+- ACTION iff `len ≥ 4` and `payload[0..3] == FF 53 50` and opcode `payload[3] ∈ 0x01..0x0F` decodes
+  per the per-opcode field layout below; any field/length mismatch ⇒ **IGNORE**.
+- Everything else (no action prefix, unknown opcode, or any field/length mismatch) ⇒ **IGNORE**.
 
 **Per-opcode action decode** (body `b = payload[4:]`, `bl = len−4`, all ints LE):
-`VOTE_*` bl==36 (txid32+vout4) · `COMMIT` bl==32 · `CLAIM` bl 33..64 (salt32+name1..32) ·
-`RENEW` bl∈{0(all),5(all-safe: anchor5)}∪[6,76](selective: anchor5+flags1..71) ·
-`TRANSFER` bl==20(all)∪[26,76](selective: 20+anchor5+flags1..51) ·
+`COMMIT` bl==32 · `CLAIM` bl 33..64 (salt32+name1..32) ·
+`RENEW` bl∈{0(all),5(all-safe: anchor5)}∪[6,9992](selective: anchor5+flags1..9987) ·
+`TRANSFER` bl==20(all)∪[26,9992](selective: 20+anchor5+flags1..9967) ·
+`RENEW_NAME/RELEASE_NAME` bl 1..32 (name) · `TRANSFER_NAME` bl 21..52 (target20+name1..32) ·
 `SELL` bl 13..44 (price8+window4+name1..32) · `RESERVE/SETTLE/PAY` bl 1..32 (name) ·
-`RELEASE` bl 6..76 (anchor5+flags1..71) · `DECORATE` bl 0..80 (`SM_DEC_MAX`; raw TLV, fold parses — a mined nonstandard carrier can push the record region past 76; the normative C decoder accepts ≤80, and the 2026-07-03 re-pin corrected all 6 ports from a latent 76 that would have forked on such a carrier, vector 53) ·
+`RELEASE` bl 6..9992 (anchor5+flags1..9987) ·
 `SELL_TO` bl 29..60 (price8+buyer20+name1..32) · `AS` bl==1 (index) ·
 `TRADE` bl≥5 (idxA1+idxB1+`nameA,nameB`, **exactly one** `0x2C`, both names §3.1). Names
-validate per §3.1 (`[a-z0-9-]`, 1..32; re-pinned 2026-07-07); a non-name byte ⇒ IGNORE. `sm_encode_action` is the
+validate per §3.1 (`[a-z0-9-]`, 1..32; re-pinned 2026-07-07; also reject a leading or trailing
+hyphen and `--` at positions 3-4 (`name[2]=='-' && name[3]=='-'`), so `xn--…`/all ACE shapes drop);
+a non-name byte ⇒ IGNORE. `sm_encode_action` is the
 canonical inverse (grammar-aware fuzz; round-trip-tested in the C selftest).
 
 **Fuzz draw order (pinned; no fold-state reads → byte stream identical across languages).**
@@ -469,15 +451,19 @@ Per block: `bnd(600)` ts-step → `bnd(4)` rate → `bnd(8)` txs. Per tx: `1+bnd
 each `bnd(16)` id + `bnd(8)!=0` SIGHASH_ALL; `1+bnd(4)` carriers, each = one **carrier-bytes**
 draw then **value** draw (`bnd(12)`: 0 / `2⁶⁴−bnd(1000)` / `1+bnd(1000)`); `bnd(4)` outputs,
 each `bnd(16)` id + `bnd(4)==3?P2SH:P2PKH` + value. **Carrier-bytes:** `bnd(10)<4` ⇒ dumb
-(`bnd(3)` prefix-flag, `bnd(81)` len, that-many `bnd(256)` bytes, `bnd(21)` opcode, then if
-flag==0 & len≥4 overwrite `FF 50 4E <op>`); else grammar (`1+bnd(15)` opcode → build a valid
+(`bnd(3)` prefix-flag, the tiered len draw (re-pin note below), that-many `bnd(256)` bytes, `bnd(21)` opcode, then if
+flag==0 & len≥4 overwrite `FF 53 50 <op>`); else grammar (`1+bnd(15)` opcode → build a valid
 action with pinned per-op field draws → encode → one of six `bnd(6)` twists: none/none/
-truncate/flip-byte/extend/charflip). `input_digest` streams `txindex,inputs,[raw_len‖raw‖
-value‖vout]*,outs`.
+truncate/flip-byte/extend/charflip). Re-pinned 2026-07-26 for the §6 carrier-ceiling widening
+(§6 of the spec): the dumb len draw is `bnd(8)==0 ? bnd(9997) : bnd(81)` (1-in-8 wide), the
+grammar flags draw is `bnd(32)`-tiered (`==0` ⇒ `1+bnd(cap)` full-range, `<4` ⇒ `1+bnd(200)`
+mid, else `1+bnd(3)` tiny; cap = 9987 renew/release · 9967 transfer), the extend twist caps at
+9996, and `raw_len` streams as **u32-LE** (raw carriers can exceed 255 bytes). `input_digest`
+streams `txindex,inputs,[raw_len‖raw‖value‖vout]*,outs`.
 
 **Frozen golden (seed 42, count 100000):**
-`input_digest = fa9c8a8561fd7fd6d3357e9726cd4775a90b2249a142bae35998c8487154d118`,
-`state_digest = 76c6267c091edf9c7bf23633f04cb7adc2ae1f0e2460e3f996d21bd0cc68198a`.
+`input_digest = 72a3edf5221526013778dc77ec83b1ba3b34873b29afdfddf13a0369545d57b7`,
+`state_digest = 487d2c2f1f10e9812c7239a5cc51b07e6490ee08d03ccb03039ad78f37f5e7c5`.
 
 **Boundary-cluster variant (`sm bfuzz`).** Identical to `fuzz` except a `boundary` flag
 snaps four numeric draws — `fz_value`, `fz_price`, the SELL `window`, and the per-block MTP
@@ -493,14 +479,14 @@ values as exact 64-bit integers, not floats — a `number`-path impl produces di
 here and diverges on `input_digest`). The SELL window is masked to 32 bits.
 `MTP_BND = {1,2,300,7200,18000,86400,604800,31536000,31536001}`.
 **Frozen golden (seed 42, count 100000):**
-`input_digest = 9f83707d3724280375c72bae7c087672ef6fc8d8c72524d4fbf223b551cf52a0`,
-`state_digest = 15ebb8332e9a01549f146f2103ffe4ec55f372fd89f60814840447089d1a95ff`.
+`input_digest = 24f1f89dd8383c4c31799a80a4d1676183b682667e31290c17d364d0a3dd8aad`,
+`state_digest = f42c33d1646e79fe6ff0d9bd22127426d50613a70bf52269bc36e7598f8b80a6`.
 
 ---
 
 ## 10. Reorg confluence (`sm reorg <seed> <count>`)
 
-Makes the §6 reorg story ("roll back the disconnected blocks and **replay** from the fork
+Makes the §5 reorg story ("roll back the disconnected blocks and **replay** from the fork
 point — exact") executable. `sm_record_chain` regenerates the **same chain as `random`**,
 recording each realized block (`height, mtp, rate, [tx_lo,tx_hi)`) + flat tx list (count
 capped at 20000 for RAM). The harness then re-folds slices into fresh states and asserts:
@@ -519,7 +505,7 @@ Output: `blocks= fork= checks= failures=` then `D_full=`, `S_fork=`, `D_alt=`, a
 matches `reorg_digest` across impls.
 
 **Frozen golden (seed 42, count 8000):**
-`reorg_digest = 05772e9a1d855b83308d82ae5a1638261f465ebc34aef5ce0ceb071f9bc5b1f7`.
+`reorg_digest = b62eb4fc1fdf1adb9c1854678d23b520b39009543858e7494e8f4f78c97608dc`.
 
 ---
 
@@ -533,16 +519,16 @@ twice), walks that divergent branch, then asserts **clear-rebuild to J reproduce
 and **replaying the canonical tail reproduces `D_full`**. `reorgfuzz_digest = SHA256(D_alt₀ ‖
 … ‖ D_alt₆₃ ‖ D_full)`; the runner asserts `failures == 0` and matches the digest.
 **Frozen golden (seed 42, count 8000):**
-`reorgfuzz_digest = f91d3e29251bb6a2d45d745d993fa9859cf45ba9765d799a956fcdc60b2a848b`.
+`reorgfuzz_digest = e884272c4bd548a33cf1e6d9d47e2b2a4bc78d69187b4fa2329eee2f40a2bdae`.
 
 **`sm meta <seed> <count>`** — the metamorphic property *an action the protocol IGNORES is
 provably inert*. After each block of the `random` chain it injects a fixed all-inert tx (a
-zero-weight VOTE, a malformed-decoded IGNORE carrier, an orphan DECORATE, a zero-value POST)
+malformed-decoded IGNORE carrier + an overlay-band carrier)
 and asserts the state digest is **byte-unchanged**. A decoder/fold bug that lets any
 "should-be-inert" carrier mutate state lights up as `failures>0` (and a divergent digest).
 Output: `failures=` + `state_digest=`; runner asserts `failures == 0` and matches the digest.
 **Frozen golden (seed 42, count 20000):**
-`state_digest = 360636c50d337b34a3d3b4c8898d851995113e5e7798fe15de5f492888ced03f`.
+`state_digest = 34d1782a685ce007e727425db18e1e70fcbf1af143d90a4c84f503afc5689fb6`.
 
 (Both modes cap `count` at 20000 — they keep the realized chain in RAM, like §10.)
 
@@ -553,13 +539,13 @@ Output: `failures=` + `state_digest=`; runner asserts `failures == 0` and matche
 Not cross-language digests, but the C harness's own correctness net:
 
 - **`make test` (`sm selftest`)** — **130** unit checks: PRNG; the **wire-codec round-trips**
-  (every opcode encode→decode→encode is a bijection) + UTF-8 demux/fail-closed drop cases; the
+  (every opcode encode→decode→encode is a bijection) + fail-closed drop cases; the
   **digest-sensitivity** sweep (every digested field moves the digest; `owner_type`, by design,
   does not — guards the canonical digest against accidental omission); the fold units; and
   `test_scenario_races` — behavioral assertions pinning the *outcomes* of scenario vectors
   38–41 (not just their digests), so a deterministic-but-wrong race construction can't slip through.
-- **`make cover` (`sm coverage`)** — asserts every generator branch (`SM_EV_*`, except the
-  unreachable `vote_overflow`) and every decode branch fires over a soak; a silently-blind
+- **`make cover` (`sm coverage`)** — asserts every generator branch (`SM_EV_*`) and every decode
+  branch fires over a soak; a silently-blind
   generator fails it. The generators are pinned identical across languages, so the one C run
   certifies all.
 - **`make sanitize`** — UBSan (`-fsanitize=undefined -fno-sanitize-recover`) over every mode:
@@ -571,7 +557,7 @@ Not cross-language digests, but the C harness's own correctness net:
 
 ## 13. §4 attribution shell (`sm attrib <seed> <count>`)
 
-The §6 fold is fed an already-resolved identity; **§4 Stateless Identity & Attribution** is the
+The §5 fold is fed an already-resolved identity; **§4 Stateless Identity & Attribution** is the
 *other* spec-mandated conformance surface — `raw tx hex → {Identity} | drop`. This is a **separate
 seed-driven layer** (its own `attrib` / `attrib-scenario` modes, its own digests) that runs the real
 attribution byte-logic over generated raw transactions. The realization that makes it fit the
@@ -664,12 +650,12 @@ parser/DER/template/FindAndDelete divergence between languages surfaces as a mis
 `state_digest = 06f43a2e3a6970c970d2ab842fcdaf41c58ca049a1c9c674ac5639ddbc261f08`.
 
 **`sm attrib-scenario`** ships the RIPEMD-160 KATs + 16 fixed-seed attribution vectors (auditable
-`status:identity` per input) + the 4 `find_and_delete` vectors above (`fad00`–`fad03`) + 6 **§3.10
+`status:identity` per input) + the 4 `find_and_delete` vectors above (`fad00`–`fad03`) + 6 **§3.9
 wallet-preview vectors** (`prev00`–`prev05`) + the 2 **A7 off-curve-P2PKH vectors** (`a7off_…`,
 `a7on_…`). The preview vectors render `raw tx → {per-input attribution; per-TRADE (give, get) per
 party}` for a `TRADE(idx_a=0, idx_b=1, nameA="alpha", nameB="beta")` — vin0's identity *gives* `alpha`
 / *gets* `beta`, vin1's *gives* `beta` / *gets* `alpha` — pinning the safety-relevant give/get
-**direction** a wallet must show before an irreversible swap (the §3.10-mandated "shipped
+**direction** a wallet must show before an irreversible swap (the §3.9-mandated "shipped
 preview-vector set"). The **A7 vectors** lock the rule above directly: two minimal P2PKH inputs share
 one valid (low-S, SIGHASH_ALL) DER sig, one carrying a canonical-encoding-but-**off-curve** compressed
 pubkey (must be `status` **1** on-curve-drop), one **on-curve** (must be `status` 2/3, never 1) —
@@ -756,9 +742,9 @@ byte.
 **State digest.** Per §4 table `T` with row bytes `row(r)` **byte-identical to §4's per-row fields**
 (including `owner_type` excluded from names, and §4's all-zero reset of inactive market fields), the
 point is `P(r) = H2C("ECMHv1" ‖ tag(T) ‖ row(r))` with one-byte domain tags `names=01 commits=02
-votes=03 muts=04 decors=05` (second-preimage separation between tables). Five sub-accumulators
-`A_T = Σ P(r)`; the combined digest is `SHA256("ECMHtop1" ‖ A_names ‖ A_commits ‖ A_votes ‖ A_muts ‖
-A_decors ‖ overflow_flag)` over the five 33-byte points. Because the row encoding is §4's, ECMH
+muts=03` (second-preimage separation between tables). Three sub-accumulators
+`A_T = Σ P(r)`; the combined digest is `SHA256("ECMHtop1" ‖ A_names ‖ A_commits ‖ A_muts)` over the
+three 33-byte points. Because the row encoding is §4's, ECMH
 induces the **identical equality relation** as the §4 digest — verified in the C selftest
 (`ecmh-equality ⟺ digest-equality`, plus order-independence and add/remove round-trip). The
 time-triggered determinism the digest relies on (a lapsed lease / closed reserve / expired offer
@@ -768,14 +754,14 @@ property the existing cross-impl soak already pins; ECMH inherits it unchanged.
 **`sm ecmh`** is the pinned, portable primitive vector set (H2C KATs over fixed preimages, the ∞
 identity, a tagged multiset sum proven commutative + invertible) folded into one `combined` digest,
 run against each impl's own secp256k1 and required to print **byte-identical** output (Tier-2 — all 7
-agree). **Frozen golden:** `combined = 2cdee6ada7cb8739a0a9478bd0d14c71568445f68fd3bbf9fb6fe4fc1d8b83b2`.
+agree). **Frozen golden:** `combined = bc68b952ffd98cfb6fe8ab1033a6a195995298b94130cf8a531e86bbd00b0b28` (re-pinned 2026-07-13: H2C KAT preimage renamed to "pepenet"; verified identical across C + Go).
 `run-conformance.sh` asserts it across all 7 impls. The state-level **`sm_state_ecmh`** (the per-table
 sum over actual fold state) is implemented in **all 7 impls**, each with an equality-tracking selftest
 (`ecmh-equality ⟺ digest-equality` over reordered/differing states). Its cross-impl agreement is pinned
-by a second anchor: `sm_state_ecmh(empty_state)` — all five sub-accumulators ∞, so a fixed value —
+by a second anchor: `sm_state_ecmh(empty_state)` — all three sub-accumulators ∞, so a fixed value —
 which every impl prints as `empty_state_ecmh=` in its selftest and `run-conformance.sh` asserts equal
 across all 7. **Frozen anchor:** `empty_state_ecmh =
-053f61e599084024c9acd6a3127057ea5de001829225590ea2b175c5506b5c55`.
+3ecfc3d7fa5be56fc513dde926bdf105c92accbf07088e702f85856fa69d10e0` (re-pinned 2026-07-08: names+commits+muts only).
 
 ## 14. Layers built on this namespace reference
 
@@ -783,9 +769,9 @@ This document covers the **namespace** — the consensus trust root. Separate **
 it** and keep their own conformance harnesses; the namespace reference deliberately knows nothing about
 them (so it stays reusable by any consumer). Current consumers:
 
-- **Virtual-posts social layer** — the `pepenet-social` repo (off-chain posts / labels / DMs keyed to names; a
-  canonical-feed function, not consensus). Its `vpost` harness *links* this tree's crypto primitives
-  (`secp256k1.c` / `sha256.c` / `ripemd160.c`) rather than re-vendoring them, so it depends on this
-  reference directly. Vectors + frozen golden: `pepenet-social/CONFORMANCE.md`.
+- **Off-chain overlay layers** (social feeds, DNS, and the like) — separate repos that key off-chain
+  data to names (canonical-feed functions, not consensus). An overlay harness may *link* this tree's
+  crypto primitives (`secp256k1.c` / `sha256.c` / `ripemd160.c`) rather than re-vendoring them; each
+  overlay keeps its own vectors + frozen goldens in its own repo.
 - **Headless indexer** — the `namespace-indexer` repo links the namespace fold as its consensus engine (see the
   `headless-indexer` note).

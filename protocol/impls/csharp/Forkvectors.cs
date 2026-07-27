@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
 /// forkvectors — the prose-pinned consensus-fork differential vectors (Tier 2).

@@ -1,4 +1,4 @@
-// Fee oracle (§3.4) + MTP (§6, conformance §2). Pure integer math, all bigint.
+// Fee oracle (§3.4) + MTP (§5, conformance §2). Pure integer math, all bigint.
 //
 // The §5 generator INJECTS `rate` per block (rate = 28·(1+bounded(4))), so the SM fold does not run
 // this oracle — it is the separate, spec-mandated stateless rate function, exercised by hand vectors
@@ -24,8 +24,10 @@ export function oracleRate(window: OracleBlock[]): bigint {
   for (const blk of window) {
     let fees = blk.coinbaseTotal - DOGE_SUBSIDY; // SIGNED — bigint never wraps
     if (fees < 0n) fees = 0n; // clamp under-claim to zero fees (else an unsigned wrap would spike it)
-    // AMBIGUITY: block_bytes is always ≥1 (a block has a coinbase tx); guard /0 → fee_per_byte 0.
-    const perByte = blk.blockBytes > 0n ? fees / blk.blockBytes : 0n; // FLOOR (bigint division)
+    // block_bytes is always ≥1 (a block has a coinbase tx); guard /0 with divisor 1
+    // — NOT fee_per_byte 0 — to match C/Go/Py (else this block's participation forks).
+    const b = blk.blockBytes > 0n ? blk.blockBytes : 1n;
+    const perByte = fees / b; // FLOOR (bigint division)
     if (perByte >= 1n) participants.push(perByte); // fee-bearing blocks only
   }
   if (participants.length < MIN_FEE_SAMPLE) return DUST_FLOOR; // degrade, don't extrapolate
@@ -34,10 +36,10 @@ export function oracleRate(window: OracleBlock[]): bigint {
   return clamp(median * REF_SIZE, DUST_FLOOR, RATE_CAP);
 }
 
-// §6 / conformance §2: MTP(H) = median (middle element, index ⌊k/2⌋ of sorted) of the timestamps of
+// §5 / conformance §2: MTP(H) = median (middle element, index ⌊k/2⌋ of sorted) of the timestamps of
 // the ≤11 blocks STRICTLY before H — i.e. blocks [H−11 .. H−1], H's own timestamp excluded.
 // blockTimestamps[i] = timestamp of block i. AMBIGUITY: for H=0 there are no predecessors; the prose
-// (§6) assumes ≥11 exist. We define MTP(0)=0 and MTP for 1..10 over the few that exist (index ⌊k/2⌋).
+// (§5) assumes ≥11 exist. We define MTP(0)=0 and MTP for 1..10 over the few that exist (index ⌊k/2⌋).
 export function computeMTP(blockTimestamps: bigint[], H: number): bigint {
   const lo = Math.max(0, H - 11);
   const window = blockTimestamps.slice(lo, H);

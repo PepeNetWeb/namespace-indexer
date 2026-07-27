@@ -3,7 +3,8 @@ import java.util.*;
 
 // Live indexer state — the only thing an indexer MUST keep (§3.9), and exactly
 // what the canonical digest (§4) serializes. Names keyed by their raw ASCII bytes
-// (charset [a-z0-9-], already lowercase = canonical key, §3.1).
+// (charset [a-z0-9-] + structural rules, already lowercase = canonical key, §3.1).
+// Names-only: votes / decorations / overflow flag removed from consensus state.
 final class State {
     static final byte[] ZERO20 = new byte[20];
     static final byte[] ZERO32 = new byte[32];
@@ -32,37 +33,18 @@ final class State {
         long commitTime;               // MTP at commit (COMMIT_EXPIRY window)
     }
 
-    static final class Vote {
-        byte[] target;                 // 32
-        long vout;
-        BigInteger score = BigInteger.ZERO; // signed i128 accumulator
-    }
-
-    static final class Decor {
-        byte[] txid;                   // 32 (synthetic post id)
-        long vout;
-        byte[] rec;                    // one TLV record, verbatim
-        int seq;                       // insertion order (stable tiebreak within a post)
-    }
-
     final Map<String, NameRow> names = new HashMap<>();
     final List<Commit> commits = new ArrayList<>();
-    final Map<String, Vote> votes = new LinkedHashMap<>();   // key = hex(target)+":"+vout
     final Map<String, Long> muts = new HashMap<>();           // key = hex(owner) -> last_set_mutation_height
-    final List<Decor> decors = new ArrayList<>();
-    boolean overflow = false;
-    private int decorSeq = 0;
 
     // per-block claim scratch (NOT digested): name -> {commit_height, owner, commit tx_index}
     static final class ClaimMark { long commitHeight; byte[] owner; long commitTxIndex; }
     final Map<String, ClaimMark> claimScratch = new HashMap<>();
 
     void clear() {
-        names.clear(); commits.clear(); votes.clear(); muts.clear(); decors.clear();
-        claimScratch.clear(); overflow = false; decorSeq = 0;
+        names.clear(); commits.clear(); muts.clear();
+        claimScratch.clear();
     }
-
-    int nextDecorSeq() { return decorSeq++; }
 
     // ---- helpers -----------------------------------------------------------
 

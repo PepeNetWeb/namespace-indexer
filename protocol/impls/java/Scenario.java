@@ -6,9 +6,9 @@ import java.util.*;
 // port of impls/c `scenario`. Each builds a deterministic, named construction and
 // emits `name <digest>` (canonical §4 state digest) or `name <u64>`; the rolling
 // `combined` hash is the single-line cross-language check. These pin the spec's
-// named edge cases (§6) with auditable outcomes, and cover the rare branches the
-// random soak almost never hits (deep displacement, i128 accumulation past 2^64,
-// the fee oracle).
+// named edge cases (§5) with auditable outcomes, and cover the rare branches the
+// random soak almost never hits (deep displacement, deposit 2^64, the fee oracle).
+// Names-only: vote / decorate / POST vectors removed (matches impls/c).
 final class Scenario {
     // rate = 28 makes the burn equal the number of days (see impls/c RATE_DAYS).
     static final BigInteger RATE = BigInteger.valueOf(28);
@@ -20,29 +20,23 @@ final class Scenario {
     // ---- identities & bytes (impls/c id_of: h160[0]=tag, h160[19]=tag) ------
     static byte[] genId(int tag) { byte[] h = new byte[20]; h[0] = (byte) tag; h[19] = (byte) tag; return h; }
     static byte[] salt(int b) { byte[] s = new byte[32]; Arrays.fill(s, (byte) b); return s; }
-    static byte[] tgt(int b) { byte[] t = new byte[32]; t[0] = (byte) b; return t; }
     static byte[] nm(String s) { return s.getBytes(java.nio.charset.StandardCharsets.US_ASCII); }
-    // A DECORATE payload of `nrec` empty (len-0) TLV records: 3 bytes each,
-    // [tag=i+1][len=0][len=0], i = 0-based index within this carrier (mirrors impls/c decorate_n).
-    static byte[] decorN(int nrec) {
-        byte[] out = new byte[nrec * 3];
-        for (int i = 0; i < nrec; i++) { out[i * 3] = (byte) (i + 1); out[i * 3 + 1] = 0; out[i * 3 + 2] = 0; }
-        return out;
-    }
 
     // ---- fold driver: begin_block + apply_tx with an EXPLICIT tx_index ------
     static final class S {
         final State st = new State();
         final Fold f = new Fold(st);
         long h, m;
-        void begin(long height, long mtp) {
-            h = height; m = mtp;
-            f.applyBlock(new Model.Block(height, mtp, RATE, new Model.Tx[0]));  // scratch reset + pre-block transitions
+        BigInteger r = RATE;
+        void begin(long height, long mtp) { begin(height, mtp, RATE); }
+        void begin(long height, long mtp, BigInteger rate) {
+            h = height; m = mtp; r = rate;
+            f.applyBlock(new Model.Block(height, mtp, rate, new Model.Tx[0]));  // scratch reset + pre-block transitions
         }
         void apply(T t, int txIndex) {
             Model.Tx tx = t.t();
             tx.txIndex = txIndex;
-            f.applyOneTx(h, m, RATE, tx);
+            f.applyOneTx(h, m, r, tx);
         }
     }
 
@@ -54,7 +48,6 @@ final class Scenario {
         T in(byte[] id, boolean sigAll) { ins.add(new Model.TxIn(id, Const.P2PKH, sigAll)); return this; }
         T act(long value, Action a) { return act(BigInteger.valueOf(value), a); }
         T act(BigInteger value, Action a) { outs.add(Model.TxOut.carrier(value, Wire.encode(a))); return this; }
-        T post(long value) { outs.add(Model.TxOut.carrier(BigInteger.valueOf(value), nm("hello"))); return this; }
         T out(byte[] dest, long value) { return out(dest, BigInteger.valueOf(value)); }
         T out(byte[] dest, BigInteger value) { outs.add(Model.TxOut.spend(value, dest, Const.P2PKH)); return this; }
         Model.Tx t() { return new Model.Tx(ins.toArray(new Model.TxIn[0]), outs.toArray(new Model.TxOut[0])); }
@@ -248,26 +241,10 @@ final class Scenario {
           s.apply(new T().in(A).in(B).act(0, Behav.trade(0, 1, nm("aaa"), nm("bbb"))), 1); // anti-rug → drop
           emitState("25_trade_rug_before", s); }
 
-        { S s = minted(0xAA, "bob", 300, 1500); s.begin(12, 1600);
-          s.apply(new T().in(A).act(0, Behav.decorate(Behav.tlv(7, nm("reply")))).post(1), 0);   // owner → binds
-          s.apply(new T().in(C).act(0, Behav.decorate(Behav.tlv(7, nm("x")))).post(1), 1);       // nameless → drop
-          s.apply(new T().in(A).act(0, Behav.decorate(Behav.tlv(7, nm("orphan")))), 2);          // orphan → drop
-          emitState("26_decorate_gate", s); }
-
-        { S s = new S(); s.begin(100, 1000);
-          s.apply(new T().in(A).act(5, Behav.voteUp(tgt(0x11), 0))
-                         .act(2, Behav.voteDown(tgt(0x11), 0))
-                         .act(0, Behav.voteUp(tgt(0x11), 0)), 0);
-          emitState("27_vote_score", s); }
-
-        // i128 accumulation past 2^64: three max-weight up-votes sum > 2^64 (a u64 impl wraps).
-        { S s = new S(); s.begin(100, 1000);
-          for (int i = 0; i < 3; i++) s.apply(new T().in(A).act(U64_MAX, Behav.voteUp(tgt(0x11), 0)), i);
-          emitState("28_vote_past_u64", s); }
-
         // fee oracle (§3.4): signed under-claim clamp + participant filter + MIN_FEE_SAMPLE
         // degrade + lower-median + REF_SIZE scale + clamp. 4 participants < MIN_FEE_SAMPLE
         // ⇒ this small window now degrades to DUST_FLOOR (the big-window vectors are 49–51).
+        // (vote/decorate vectors 26–28 removed — names-only consensus.)
         { long[] cb = { 1_000_000_200_000L, 1_000_000_400_000L, 999_999_999_950L, 1_000_001_000_000L, 1_000_000_600_000L };  // 3rd under-claims
           emitU64("29_oracle_rate", Oracle.rate(cb, fill(5, SUBSIDY), fill(5, 1000)).longValueExact()); }  // |P|=4 < 1000 → DUST_FLOOR = 1
         { long[] cb = { 0, 0, 0 };                                           // all under-claim → fees 0 → rate floor
@@ -332,10 +309,7 @@ final class Scenario {
         { S s = minted(0xAA, "bob", 10, 1500); s.begin(12, 865499); emitState("36a_mtp_below_owned", s); }
         { S s = minted(0xAA, "bob", 10, 1500); s.begin(12, 865500); emitState("36b_mtp_at_lapsed", s); }
 
-        // 37: i128 vote accumulator past −2⁶⁴ (three max down-votes; two's-complement LE).
-        { S s = new S(); s.begin(100, 1000);
-          for (int i = 0; i < 3; i++) s.apply(new T().in(A).act(U64_MAX, Behav.voteDown(tgt(0x11), 0)), i);
-          emitState("37_vote_neg_past_u64", s); }
+        // (37 vote-neg removed — names-only)
 
         // ── pre-block ordering & intra-block market races ──
         // 38: a same-block RENEW-vs-CLAIM race at the exact lapse tie. The pre-block lapse
@@ -356,7 +330,7 @@ final class Scenario {
           emitState("38_lapse_renew_vs_claim", s); }
 
         // 39: a single pre-block tick that crosses reserve_expiry AND offer_expiry at once,
-        //     cascading RESERVED→LISTED→OWNED in one pass (§6 type-order reserve→offer→lease).
+        //     cascading RESERVED→LISTED→OWNED in one pass (§5 type-order reserve→offer→lease).
         { S s = minted(0xAA, "w", 300, 1500);                                // lease_expiry = 25,921,500
           s.begin(12, 1600); s.apply(new T().in(A).act(0, Behav.sell(20000, 50000, nm("w"))), 0);  // offer_expiry = 51600
           s.begin(13, 1700); s.apply(new T().in(B).act(100, Behav.reserve(nm("w"))).out(A, 100), 0); // reserve_expiry = 19700 < 51600
@@ -508,26 +482,75 @@ final class Scenario {
           commitThenClaim(s, 0xAA, "shib_p2p",                         0x74, 10, 4000, 16, 4500, 17);
           emitState("52_charset", s); }
 
-        // 53: §1 DECORATE pending-record cap (PEND_DECOR_MAX = 64, pinned 2026-07-03).
-        // Owner posts 65 decoration records (26+26+13) then a body: exactly 64 bind, the
-        // 65th drops. An impl that buffers unbounded binds 65 → a different digest.
-        { S s = minted(0xAA, "d", 10, 1500);
-          s.begin(12, 1600);
-          s.apply(new T().in(A)
-                         .act(0, Behav.decorate(decorN(26)))
-                         .act(0, Behav.decorate(decorN(26)))
-                         .act(0, Behav.decorate(decorN(13)))   // 65 records pending → 64 bind
-                         .post(100), 0);                        // body binds them (owner-signed)
-          emitState("53_decor_pend_cap", s); }
+        // 52b: structural name rejects — leading/trailing hyphen and xn-- ACE drop.
+        { S s = new S();
+          commitThenClaim(s, 0xAA, "-lead",  0x81, 10, 1000, 10, 1500, 11);
+          commitThenClaim(s, 0xAA, "trail-", 0x82, 10, 2000, 12, 2500, 13);
+          commitThenClaim(s, 0xAA, "xn--x",  0x83, 10, 3000, 14, 3500, 15);
+          commitThenClaim(s, 0xAA, "ok-name",0x84, 10, 4000, 16, 4500, 17);
+          emitState("52b_structural", s); }
 
-        // 54: NO per-tx count cap (§0). One tx carries 17 VOTE carriers — past the historical
-        // 16 — plus 17 payee outs; all fold. Proves the reference agrees with an unbounded impl.
+        // 54: NO per-tx count cap (§0). One tx carries 17 COMMIT carriers — past the
+        // historical 16 — plus 17 payee outs; all fold. Proves the reference agrees with
+        // an unbounded impl. (Was VOTE pre names-only; now COMMIT.)
         { S s = new S(); s.begin(10, 1000);
           T t = new T().in(A);
-          for (int i = 0; i < 17; i++) t.act(3, Behav.voteUp(tgt(0x55), 7));   // 17 up-votes ×3 → score 51
-          for (int i = 0; i < 17; i++) t.out(A, 1);                            // 17 payees
+          for (int i = 0; i < 17; i++) {
+              Action a = new Action(); a.op = Const.COMMIT; a.commitment = new byte[32]; a.commitment[0] = (byte) i;
+              t.act(0, a);
+          }
+          for (int i = 0; i < 17; i++) t.out(A, 1);
           s.apply(t, 0);
           emitState("54_no_txcap", s); }
+
+        // 55: a name minted then RELEASEd earlier in the SAME block re-mints fresh on a
+        // later CLAIM in that block (§3.6 "immediately reclaimable"; row existence is
+        // authoritative, the block-local claim scratch never blocks a re-mint).
+        { S s = new S();
+          s.begin(10, 1000);
+          s.apply(new T().in(A).act(0, Behav.commitFor(salt(0x91), nm("foo"), A)), 0);
+          s.begin(11, 1500);
+          s.apply(new T().in(A).act(10, Behav.claim(salt(0x91), nm("foo"))), 0);       // mint foo→A
+          s.apply(new T().in(A).act(0, Behav.release(11, new byte[]{ 0x01 })), 1);     // release foo (row gone, scratch lingers)
+          s.apply(new T().in(A).act(10, Behav.claim(salt(0x91), nm("foo"))), 2);       // MUST re-mint foo→A
+          emitState("55_claim_release_reclaim_sameblock", s); }
+
+        // 55b: same, but the re-claim is by a DIFFERENT party B whose backing commit has
+        // LOWER priority than the departed A's — B still mints fresh (a released name's
+        // former owner priority is irrelevant once the row is gone).
+        { S s = new S();
+          s.begin(10, 1000);
+          s.apply(new T().in(A).act(0, Behav.commitFor(salt(0x91), nm("foo"), A)), 0); // A commit (10, tx0) — higher priority
+          s.apply(new T().in(B).act(0, Behav.commitFor(salt(0x92), nm("foo"), B)), 1); // B commit (10, tx1) — lower priority
+          s.begin(11, 1500);
+          s.apply(new T().in(A).act(10, Behav.claim(salt(0x91), nm("foo"))), 0);       // A mints
+          s.apply(new T().in(A).act(0, Behav.release(11, new byte[]{ 0x01 })), 1);     // A releases
+          s.apply(new T().in(B).act(10, Behav.claim(salt(0x92), nm("foo"))), 2);       // B mints fresh (owns foo)
+          emitState("55b_reclaim_by_other", s); }
+
+        // 56: a self-transfer (TRANSFER-all whose target == the current owner) is a real
+        // move — it bumps last_set_mutation_height (owner's mut goes 11 → 12), NOT a no-op.
+        { S s = minted(0xAA, "bar", 10, 1500);
+          s.begin(12, 1600);
+          s.apply(new T().in(A).act(0, Behav.transferAll(A)), 0);
+          emitState("56_self_transfer_bumps_mut", s); }
+
+        // 57: fee oracle with block_bytes == 0 — the /0 guard substitutes divisor 1 (NOT
+        // fee-per-byte 0), so the block still participates. 1000 blocks (== MIN_FEE_SAMPLE),
+        // each fee 5000 ⇒ per-byte 5000 ⇒ median 5000 × REF_SIZE 200 = 1_000_000.
+        { int n = 1000; long[] cb = new long[n], sub = new long[n], by = new long[n];
+          for (int i = 0; i < n; i++) { sub[i] = 1_000_000_000_000L; cb[i] = 1_000_000_005_000L; by[i] = 0; }
+          emitU64("57_oracle_zero_bytes", Oracle.rate(cb, sub, by).longValueExact()); }
+
+        // 58: CLAIM burn near 2⁶⁴ at rate = DUST_FLOOR (1) — the lease day-count T overflows
+        // 64 bits (computed in bignum) and clamps to MAX_LEASE (365 days):
+        // lease_expiry = 1500 + 365·86400.
+        { S s = new S();
+          s.begin(10, 1000, BigInteger.ONE);
+          s.apply(new T().in(A).act(0, Behav.commitFor(salt(0x95), nm("foo"), A)), 0);
+          s.begin(11, 1500, BigInteger.ONE);
+          s.apply(new T().in(A).act(U64_MAX, Behav.claim(salt(0x95), nm("foo"))), 0);
+          emitState("58_lease_clamp_huge_burn", s); }
 
         System.out.println("combined " + Hex.enc(comb.digest()));
     }

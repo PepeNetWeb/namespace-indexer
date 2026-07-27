@@ -9,18 +9,6 @@ fn hdr(op: u8) -> Vec<u8> {
 
 pub fn encode_action(a: &Action) -> Vec<u8> {
     match a {
-        Action::VoteUp { target, vout } => {
-            let mut v = hdr(OP_VOTE_UP);
-            v.extend_from_slice(target);
-            v.extend_from_slice(&vout.to_le_bytes());
-            v
-        }
-        Action::VoteDown { target, vout } => {
-            let mut v = hdr(OP_VOTE_DOWN);
-            v.extend_from_slice(target);
-            v.extend_from_slice(&vout.to_le_bytes());
-            v
-        }
         Action::Commit { commitment } => {
             let mut v = hdr(OP_COMMIT);
             v.extend_from_slice(commitment);
@@ -60,6 +48,22 @@ pub fn encode_action(a: &Action) -> Vec<u8> {
             v.extend_from_slice(name);
             v
         }
+        Action::RenewName { name } => {
+            let mut v = hdr(OP_RENEW_NAME);
+            v.extend_from_slice(name);
+            v
+        }
+        Action::TransferName { target, name } => {
+            let mut v = hdr(OP_TRANSFER_NAME);
+            v.extend_from_slice(target);
+            v.extend_from_slice(name);
+            v
+        }
+        Action::ReleaseName { name } => {
+            let mut v = hdr(OP_RELEASE_NAME);
+            v.extend_from_slice(name);
+            v
+        }
         Action::Reserve { name } => {
             let mut v = hdr(OP_RESERVE);
             v.extend_from_slice(name);
@@ -74,11 +78,6 @@ pub fn encode_action(a: &Action) -> Vec<u8> {
             let mut v = hdr(OP_RELEASE);
             v.extend_from_slice(&h5(*anchor));
             v.extend_from_slice(flags);
-            v
-        }
-        Action::Decorate { raw } => {
-            let mut v = hdr(OP_DECORATE);
-            v.extend_from_slice(raw);
             v
         }
         Action::SellTo { price, buyer, name } => {
@@ -119,12 +118,4 @@ fn h5(v: i64) -> [u8; 5] {
         ((u >> 24) & 0xff) as u8,
         ((u >> 32) & 0xff) as u8,
     ]
-}
-
-/// A DECORATE TLV record on the wire: [tag][len:2 LE][value].
-pub fn decor_record(tag: u8, value: &[u8]) -> Vec<u8> {
-    let mut v = vec![tag];
-    v.extend_from_slice(&(value.len() as u16).to_le_bytes());
-    v.extend_from_slice(value);
-    v
 }

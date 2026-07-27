@@ -1,4 +1,4 @@
-"""The fold state machine (protocol-spec.md §3, §6; SPEC-conformance.md §3,§4).
+"""The fold state machine (protocol-spec.md §3, §5; SPEC-conformance.md §3,§4).
 
 A deterministic fold over blocks in (height, tx_index, vout) order. Identities
 are already-resolved (§4 attribution lives in attrib.py); this layer consumes
@@ -7,7 +7,7 @@ are already-resolved (§4 attribution lives in attrib.py); this layer consumes
 Every judgment call forced by the prose is cross-referenced to SPEC-RATIONALE.md.
 """
 from const import *
-from wire import decode_payload, ACTION, POST, IGNORE
+from wire import decode_payload, ACTION, IGNORE
 from hashes import sha256
 
 
@@ -52,10 +52,7 @@ class State:
         self.activation_height = activation_height
         self.names = {}                 # name(bytes) -> NameRow
         self.commits = []               # list of dicts
-        self.votes = {}                 # (target32, vout) -> int (full precision)
         self.muts = {}                  # owner(20) -> i64 height
-        self.decors = {}                # (txid32, vout) -> [rec bytes]  (insertion ordered)
-        self.overflow = 0
         # per-block scratch (NOT digested)
         self._scratch = {}              # name -> (commit_height, commit_tx_index, owner)
 
@@ -76,7 +73,7 @@ class State:
         if cur is None or height > cur:
             self.muts[owner] = height
 
-    # ============ pre-block time-triggered transitions (§6) ============
+    # ============ pre-block time-triggered transitions (§5) ============
     def begin_block(self, height, mtp):
         self._scratch = {}
         # per-name reserve -> offer -> lease, then COMMIT_EXPIRY prune.
@@ -106,7 +103,7 @@ class State:
         self.commits = [c for c in self.commits
                         if not (mtp > c["commit_time"] + COMMIT_EXPIRY)]
 
-    # ============ per-tx processing (§6) ============
+    # ============ per-tx processing (§5) ============
     def process_tx(self, tx, height, mtp, rate):
         inputs = tx["inputs"]
         outputs = sorted(tx["outputs"], key=lambda o: o["vout"])
@@ -132,29 +129,19 @@ class State:
             return False
 
         actor = resolve(0)               # vin[0] default (Rule 1)
-        pending = []                     # buffered DECORATE records
 
         for o in outputs:
             if o["kind"] != "carrier":
                 continue
             payload = o["payload"]
             kind, info = decode_payload(payload, o["value"])
-            if kind == IGNORE:
-                continue
-            if kind == POST:
-                txid = synthetic_txid(height, tx["txindex"])
-                author = actor
-                if pending and author is not None and self.owns_any(author[0]):
-                    self.decors[(txid, o["vout"])] = list(pending)
-                pending = []             # body reached -> clear buffer (§1)
-                continue
-            # kind == ACTION
+            if kind != ACTION:
+                continue                 # IGNORE (or anything non-action)
             op = info["op"]
-            if op != OP_VOTE_UP and op != OP_VOTE_DOWN and height < self.activation_height:
-                # forward-only activation gate for 0x03..0x0F (genesis 0x01/0x02 live)
+            # forward-only activation gate (§3.0): all ops gate at one height.
+            if height < self.activation_height:
                 continue
             if op == OP_AS:
-                pending = []             # AS flushes pending DECORATE buffer (orphan)
                 actor = resolve(info["index"])
                 continue
             if op == OP_TRADE:
@@ -165,17 +152,12 @@ class State:
             if actor is None:
                 continue                 # ⊥ actor -> drop
             self._dispatch(op, info, actor, o, height, mtp, rate,
-                           match_output, pending, tx["txindex"])
-            # NOTE: VOTE/COMMIT/etc do NOT flush the DECORATE buffer (§1);
-            # only DECORATE appends to it (handled inside _dispatch).
-        # end of tx: orphan DECORATE records discarded (pending dropped)
+                           match_output, tx["txindex"])
 
     def _dispatch(self, op, info, actor, carrier, height, mtp, rate,
-                  match_output, pending, txindex):
+                  match_output, txindex):
         aid, atype = actor
-        if op in (OP_VOTE_UP, OP_VOTE_DOWN):
-            self._do_vote(op, info, carrier)
-        elif op == OP_COMMIT:
+        if op == OP_COMMIT:
             self.commits.append({"commitment": info["commitment"],
                                  "commit_height": height,
                                  "tx_index": txindex,
@@ -188,6 +170,12 @@ class State:
             self._do_transfer(info, aid, height)
         elif op == OP_RELEASE:
             self._do_release(info, aid, height)
+        elif op == OP_RENEW_NAME:
+            self._do_renew_name(info, aid, mtp, rate, carrier)
+        elif op == OP_TRANSFER_NAME:
+            self._do_transfer_name(info, aid, height)
+        elif op == OP_RELEASE_NAME:
+            self._do_release_name(info, aid, height)
         elif op == OP_SELL:
             self._do_sell(info, aid, atype, mtp)
         elif op == OP_RESERVE:
@@ -198,24 +186,6 @@ class State:
             self._do_sell_to(info, aid, atype, mtp)
         elif op == OP_PAY:
             self._do_pay(info, aid, mtp, match_output, height)
-        elif op == OP_DECORATE:
-            recs = parse_tlv(info["raw"])
-            for rec in recs:             # §1 pending-record cap: first PEND_DECOR_MAX buffer,
-                if len(pending) >= PEND_DECOR_MAX:   # further records silently drop (keep parsing)
-                    break
-                pending.append(rec)
-
-    # ---------------- votes (§3.8) ----------------
-    def _do_vote(self, op, info, carrier):
-        weight = carrier["value"]
-        if weight < DUST_FLOOR:
-            return                       # zero/sub-floor weight dropped
-        key = (info["target"], info["vout"])
-        cur = self.votes.get(key, 0)
-        cur = cur + weight if op == OP_VOTE_UP else cur - weight
-        if cur > I128_MAX or cur < I128_MIN:
-            self.overflow = 1            # fail-loud (§3.8 / conformance §2)
-        self.votes[key] = cur
 
     # ---------------- claim (§3.2) ----------------
     def _find_backing_commit(self, target, claim_height):
@@ -239,20 +209,22 @@ class State:
         if backing is None:
             return                       # no live >=1-deep commit -> drop
         bch, btx = backing
-        # ownership / same-block displacement (conformance §3)
-        if name in self.names and name not in self._scratch:
-            return                       # owned by a prior block -> drop
-        if name in self._scratch:
+        # Row existence is authoritative (matches Go/TS/C): a name removed earlier
+        # in THIS block (minted then RELEASEd) is absent here and re-mints fresh —
+        # the lingering scratch entry does NOT block it (§3.6 "a released name is
+        # immediately reclaimable"). Only a name still present can be displaced.
+        if name in self.names:
+            if name not in self._scratch:
+                return                   # owned from a prior block -> drop
             old = self._scratch[name]
-            existing = self.names.get(name)
-            # conformance §3: displace iff smaller (commit_height, commit_tx_index)
-            # AND the name is still that owner's fresh OWNED mint.
-            if ((bch, btx) < (old[0], old[1]) and existing is not None
-                    and existing.st == ST_OWNED and existing.owner == old[2]):
-                pass                     # fall through to (re)mint below
-            else:
+            existing = self.names[name]
+            # displace iff still that owner's fresh OWNED mint AND strictly smaller
+            # (commit_height, commit_tx_index) — §3.2's tuple, NOT claim chain order.
+            if not (existing.st == ST_OWNED and existing.owner == old[2]
+                    and (bch, btx) < (old[0], old[1])):
                 return                   # does not displace -> drop
-        # compute lease
+            # else: fall through to re-mint (displacement resets owner + lease)
+        # compute lease (fresh mint or displacement)
         days = lease_days(carrier["value"], rate)
         if days < 1:
             return                       # T==0 fail-closed
@@ -348,6 +320,50 @@ class State:
             return                       # no-op -> no bump
         for n in released:
             del self.names[n]
+        self._bump(owner, height)
+
+    # ---------------- the by-name forms (§3.5) ----------------
+    def _find_mine(self, info, actor):
+        """info['name'] iff `actor` controls it: the owned set includes listed/
+        offered/reserved names (owner stays the seller until settle/pay).
+        Absent or not the actor's -> None (drop)."""
+        name = info["name"]
+        row = self.names.get(name)
+        if row is None or row.owner != actor:
+            return None
+        return name
+
+    def _do_renew_name(self, info, owner, mtp, rate, carrier):
+        name = self._find_mine(info, owner)
+        if name is None:
+            return
+        alloc = water_fill(carrier["value"], rate, mtp,
+                           [self.names[name].lease_expiry], [name])
+        if alloc is None:
+            return                       # T==0 fail-closed
+        for n, add in alloc.items():
+            self.names[n].lease_expiry += add * BILLING_UNIT
+        # renewal is not a set mutation: no bump (§3.5)
+
+    def _do_transfer_name(self, info, owner, height):
+        name = self._find_mine(info, owner)
+        if name is None:
+            return
+        row = self.names[name]
+        if row.st != ST_OWNED:
+            return                       # locked (listed/offered) -> no-op, no bump
+        row.owner = info["target"]
+        row.owner_type = 0               # target type unknown (not digested)
+        self._bump(owner, height)        # a move bumps BOTH parties (§3.5)
+        self._bump(info["target"], height)
+
+    def _do_release_name(self, info, owner, height):
+        name = self._find_mine(info, owner)
+        if name is None:
+            return
+        if self.names[name].st != ST_OWNED:
+            return                       # locked -> no-op, no bump
+        del self.names[name]
         self._bump(owner, height)
 
     # ---------------- sell (§3.7) ----------------
@@ -536,23 +552,6 @@ def water_fill(burn, rate, now, expiries, names):
     return alloc
 
 
-def parse_tlv(raw):
-    """§1 DECORATE record framing: [tag:1][len:2 LE][value]. Fail-closed on
-    overrun or a trailing remnant < 3-byte header (drop the bad tail, keep the
-    records parsed before it). Returns list of verbatim record bytes."""
-    recs = []
-    i = 0
-    n = len(raw)
-    while i + 3 <= n:
-        length = int.from_bytes(raw[i + 1:i + 3], "little")
-        end = i + 3 + length
-        if end > n:
-            break                        # overrun -> drop rest
-        recs.append(bytes(raw[i:end]))
-        i = end
-    return recs
-
-
 # ---------------- canonical state digest (SPEC-conformance.md §4) ----------------
 def _u32le(x):
     return (x & 0xFFFFFFFF).to_bytes(4, "little")
@@ -566,11 +565,8 @@ def _i64le(x):
     return (x & MASK64).to_bytes(8, "little")        # two's complement LE
 
 
-def _i128le(x):
-    return (x & MASK128).to_bytes(16, "little")
-
-
 def serialize_state(state):
+    """Names + commits + muts ONLY. Magic SMv1. No votes/decors/overflow."""
     out = bytearray(b"SMv1")
     # names: sorted ascending by raw name bytes
     names = sorted(state.names.values(), key=lambda r: r.name)
@@ -586,25 +582,11 @@ def serialize_state(state):
     out += _u32le(len(commits))
     for c in commits:
         out += c["commitment"] + _i64le(c["commit_height"]) + _u32le(c["tx_index"]) + _i64le(c["commit_time"])
-    # votes: sorted by (target, vout)
-    votes = sorted(state.votes.items(), key=lambda kv: (kv[0][0], kv[0][1]))
-    out += _u32le(len(votes))
-    for (target, vout), score in votes:
-        out += target + _u32le(vout) + _i128le(score)
     # muts: sorted by owner bytes
     muts = sorted(state.muts.items(), key=lambda kv: kv[0])
     out += _u32le(len(muts))
     for owner, h in muts:
         out += owner + _i64le(h)
-    # decors: sorted by (txid, vout) STABLE; one entry per record, insertion order kept
-    n_dec = sum(len(v) for v in state.decors.values())
-    decor_keys = sorted(state.decors.keys(), key=lambda k: (k[0], k[1]))
-    out += _u32le(n_dec)
-    for key in decor_keys:
-        txid, vout = key
-        for rec in state.decors[key]:
-            out += txid + _u32le(vout) + bytes([len(rec) & 0xFF]) + rec
-    out += bytes([state.overflow & 0xFF])
     return bytes(out)
 
 
@@ -619,7 +601,7 @@ def state_digest(state):
 import secp256k1 as _secp
 
 _ECMH_REC_TAG = b"ECMHv1"
-_TAG_NAME, _TAG_COMMIT, _TAG_VOTE, _TAG_MUT, _TAG_DECOR = 0x01, 0x02, 0x03, 0x04, 0x05
+_TAG_NAME, _TAG_COMMIT, _TAG_MUT = 0x01, 0x02, 0x04
 
 
 def _name_row_bytes(r):
@@ -633,16 +615,8 @@ def _commit_row_bytes(c):
     return c["commitment"] + _i64le(c["commit_height"]) + _u32le(c["tx_index"]) + _i64le(c["commit_time"])
 
 
-def _vote_row_bytes(target, vout, score):
-    return target + _u32le(vout) + _i128le(score)
-
-
 def _mut_row_bytes(owner, h):
     return owner + _i64le(h)
-
-
-def _decor_row_bytes(txid, vout, rec):
-    return txid + _u32le(vout) + bytes([len(rec) & 0xFF]) + rec
 
 
 def _ecmh_fold(tag, row_bytes):
@@ -650,21 +624,16 @@ def _ecmh_fold(tag, row_bytes):
 
 
 def state_ecmh(state):
-    """Five per-table ECMH sub-accumulators combined into one 32-byte digest.
-    Mirrors sm_state_ecmh in impls/c/src/ecmh.c."""
-    an = ac = av = am = ad = _secp.ecmh_identity()
+    """Three per-table ECMH sub-accumulators combined into one 32-byte digest.
+    Mirrors sm_state_ecmh in impls/c/src/ecmh.c: SHA256("ECMHtop1" ‖ an ‖ ac ‖ am)."""
+    an = ac = am = _secp.ecmh_identity()
     for r in state.names.values():
         an = _secp.ecmh_add(an, _ecmh_fold(_TAG_NAME, _name_row_bytes(r)))
     for c in state.commits:
         ac = _secp.ecmh_add(ac, _ecmh_fold(_TAG_COMMIT, _commit_row_bytes(c)))
-    for (target, vout), score in state.votes.items():
-        av = _secp.ecmh_add(av, _ecmh_fold(_TAG_VOTE, _vote_row_bytes(target, vout, score)))
     for owner, h in state.muts.items():
         am = _secp.ecmh_add(am, _ecmh_fold(_TAG_MUT, _mut_row_bytes(owner, h)))
-    for (txid, vout), recs in state.decors.items():
-        for rec in recs:
-            ad = _secp.ecmh_add(ad, _ecmh_fold(_TAG_DECOR, _decor_row_bytes(txid, vout, rec)))
-    h = sha256(b"ECMHtop1" + an + ac + av + am + ad + bytes([state.overflow & 0xFF]))
+    h = sha256(b"ECMHtop1" + an + ac + am)
     return h.hex()
 
 
@@ -700,7 +669,7 @@ def oracle_rate(window_blocks):
 
 
 def compute_mtp(timestamps, H):
-    """§6 MTP: median of timestamps[H-11 .. H-1]; short window k=min(11,H);
+    """§5 MTP: median of timestamps[H-11 .. H-1]; short window k=min(11,H);
     sort and select index k//2 (upper-middle for even); MTP(0)=0.
     `timestamps` is the full list indexed by height (timestamps[h])."""
     if H == 0:

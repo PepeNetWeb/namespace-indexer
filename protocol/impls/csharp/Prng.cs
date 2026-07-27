@@ -1,6 +1,6 @@
 using System;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
 /// SplitMix64 (SPEC-conformance.md §1). 64-bit state, integer only.

@@ -1,10 +1,10 @@
 using System;
 using System.Collections.Generic;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
-/// The coinbase fee oracle (§3.4) and the MTP median (§6). Both are pure
+/// The coinbase fee oracle (§3.4) and the MTP median (§5). Both are pure
 /// functions tested directly; the random fold injects `rate` per block (the
 /// abstract SM does not recompute the oracle in the soak — see
 /// SPEC-RATIONALE.md).

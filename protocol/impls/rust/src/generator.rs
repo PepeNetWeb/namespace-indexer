@@ -1,6 +1,7 @@
 //! Own internally-consistent generator (`random` mode). This is NOT the reference
 //! generator (which is impl-pinned to a forbidden `impls/c/src/gen.c`); it WILL NOT
 //! reproduce the reference's frozen seed-goldens. Pin your own (seed,count)→digest.
+//! Names-only: market/identity ops only (no votes/posts/decorate).
 
 use crate::digest::state_digest;
 use crate::encode::encode_action;
@@ -79,23 +80,9 @@ pub fn record_chain(seed: u64, count: u64) -> (Vec<Block>, Vec<i64>) {
             inputs.push(Input { identity: Some(aid2), stype: atype2, sighash_all: true });
 
             let mut outputs: Vec<Output> = Vec::new();
-            let op = rng.bounded(13);
+            let op = rng.bounded(11); // names-only op set
             match op {
                 0 => {
-                    // VOTE
-                    let mut target = [0u8; 32];
-                    let th = rng.bounded(height.max(1) as u64);
-                    target[0..8].copy_from_slice(&th.to_le_bytes());
-                    let w = 1 + rng.bounded(1000);
-                    let up = rng.bounded(2) == 0;
-                    let act = if up {
-                        Action::VoteUp { target, vout: 0 }
-                    } else {
-                        Action::VoteDown { target, vout: 0 }
-                    };
-                    outputs.push(Output::Carrier { payload: encode_action(&act), value: w });
-                }
-                1 => {
                     // COMMIT
                     let ni = rng.bounded(400);
                     let name = name_of(ni);
@@ -113,7 +100,7 @@ pub fn record_chain(seed: u64, count: u64) -> (Vec<Block>, Vec<i64>) {
                         value: 0,
                     });
                 }
-                2 => {
+                1 => {
                     // CLAIM from an earlier commit by this author
                     if let Some(c) = committed.iter().find(|c| c.author == author) {
                         let burn = rate / 28 * (1 + rng.bounded(400)); // exact-day burn
@@ -126,7 +113,7 @@ pub fn record_chain(seed: u64, count: u64) -> (Vec<Block>, Vec<i64>) {
                         });
                     }
                 }
-                3 => {
+                2 => {
                     // RENEW all
                     let burn = rate / 28 * (1 + rng.bounded(100));
                     outputs.push(Output::Carrier {
@@ -134,7 +121,7 @@ pub fn record_chain(seed: u64, count: u64) -> (Vec<Block>, Vec<i64>) {
                         value: burn,
                     });
                 }
-                4 => {
+                3 => {
                     // TRANSFER all to another id
                     let (tgt, _) = identity(rng.bounded(N_IDS));
                     outputs.push(Output::Carrier {
@@ -142,7 +129,7 @@ pub fn record_chain(seed: u64, count: u64) -> (Vec<Block>, Vec<i64>) {
                         value: 0,
                     });
                 }
-                5 => {
+                4 => {
                     // SELL one owned name
                     let ni = rng.bounded(400);
                     let price = 3 + rng.bounded(1_000_000);
@@ -155,7 +142,7 @@ pub fn record_chain(seed: u64, count: u64) -> (Vec<Block>, Vec<i64>) {
                         value: 0,
                     });
                 }
-                6 => {
+                5 => {
                     // RESERVE (best-effort, with a pay_leg output guess)
                     let ni = rng.bounded(400);
                     outputs.push(Output::Carrier {
@@ -168,7 +155,7 @@ pub fn record_chain(seed: u64, count: u64) -> (Vec<Block>, Vec<i64>) {
                         value: 1 + rng.bounded(100),
                     });
                 }
-                7 => {
+                6 => {
                     // SETTLE best-effort
                     let ni = rng.bounded(400);
                     outputs.push(Output::Carrier {
@@ -181,15 +168,15 @@ pub fn record_chain(seed: u64, count: u64) -> (Vec<Block>, Vec<i64>) {
                         value: 1 + rng.bounded(1_000_000),
                     });
                 }
-                8 => {
-                    // RELEASE all-but-via-selective: release first owned (bitmap bit0)
+                7 => {
+                    // RELEASE selective: release first owned (bitmap bit0)
                     let anchor = (height - 1).max(0);
                     outputs.push(Output::Carrier {
                         payload: encode_action(&Action::Release { anchor, flags: vec![0x01] }),
                         value: 0,
                     });
                 }
-                9 => {
+                8 => {
                     // SELL_TO directed
                     let ni = rng.bounded(400);
                     let (buyer, _) = identity(rng.bounded(N_IDS));
@@ -203,7 +190,7 @@ pub fn record_chain(seed: u64, count: u64) -> (Vec<Block>, Vec<i64>) {
                         value: 0,
                     });
                 }
-                10 => {
+                9 => {
                     // PAY best-effort
                     let ni = rng.bounded(400);
                     outputs.push(Output::Carrier {
@@ -216,27 +203,31 @@ pub fn record_chain(seed: u64, count: u64) -> (Vec<Block>, Vec<i64>) {
                         value: 1 + rng.bounded(1_000_000),
                     });
                 }
-                11 => {
-                    // AS then a POST
-                    outputs.push(Output::Carrier {
-                        payload: encode_action(&Action::As { index: 1 }),
-                        value: 0,
-                    });
-                    outputs.push(Output::Carrier { payload: b"hello".to_vec(), value: 1 });
-                }
                 _ => {
-                    // TRADE between vin0 and vin1
-                    let na = name_of(rng.bounded(400));
-                    let nb = name_of(rng.bounded(400));
-                    outputs.push(Output::Carrier {
-                        payload: encode_action(&Action::Trade {
-                            idx_a: 0,
-                            idx_b: 1,
-                            name_a: na,
-                            name_b: nb,
-                        }),
-                        value: 0,
-                    });
+                    // AS then RENEW, or TRADE between vin0 and vin1
+                    if rng.bounded(2) == 0 {
+                        outputs.push(Output::Carrier {
+                            payload: encode_action(&Action::As { index: 1 }),
+                            value: 0,
+                        });
+                        let burn = rate / 28 * (1 + rng.bounded(50));
+                        outputs.push(Output::Carrier {
+                            payload: encode_action(&Action::Renew { mode: RenewMode::All }),
+                            value: burn,
+                        });
+                    } else {
+                        let na = name_of(rng.bounded(400));
+                        let nb = name_of(rng.bounded(400));
+                        outputs.push(Output::Carrier {
+                            payload: encode_action(&Action::Trade {
+                                idx_a: 0,
+                                idx_b: 1,
+                                name_a: na,
+                                name_b: nb,
+                            }),
+                            value: 0,
+                        });
+                    }
                 }
             }
 

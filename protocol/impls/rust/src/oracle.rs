@@ -1,17 +1,18 @@
-//! Fee oracle (§3.4) and MTP (§6) — pinned integer-deterministic math.
+//! Fee oracle (§3.4) and MTP (§5) — pinned integer-deterministic math.
 
 use crate::types::*;
 
 /// Per-block fee_per_byte = ⌊max(0, coinbase − subsidy)/bytes⌋ with the subtraction SIGNED.
 /// Computed in i128 to avoid any unsigned wrap on a miner under-claim.
 pub fn fee_per_byte(coinbase_total: u64, subsidy: u64, block_bytes: u64) -> u64 {
-    if block_bytes == 0 {
-        return 0;
-    }
+    // block_bytes is always ≥ 1 (every block has a coinbase tx); if a reading is 0, the
+    // divisor is pinned to 1 so the block still participates — NOT fee-per-byte 0, which
+    // would drop it from the participant set and fork against C/Go/Py/Java/C# (§3.4).
+    let div: i128 = if block_bytes == 0 { 1 } else { block_bytes as i128 };
     // signed clamp at 0 — a miner may under-claim (coinbase < subsidy)
     let fees: i128 = (coinbase_total as i128) - (subsidy as i128);
     let fees = if fees < 0 { 0 } else { fees };
-    (fees / (block_bytes as i128)) as u64
+    (fees / div) as u64
 }
 
 /// §3.4 participant median: P = the fee_per_byteᵢ ≥ 1 over the FEE_WINDOW blocks strictly

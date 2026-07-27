@@ -1,4 +1,4 @@
-// protocol-sm — the chain-abstracted §6 fold (C reference implementation).
+// protocol-sm — the chain-abstracted §5 fold (C reference implementation).
 //
 // This is the executable reference model for docs/protocol-spec.md: a
 // deterministic state machine that consumes ALREADY-DECODED, ALREADY-ATTRIBUTED
@@ -17,7 +17,7 @@
 // koinu are the base unit; 1 DOGE = 100,000,000 koinu.
 #define SM_KOINU_PER_DOGE     100000000LL
 
-#define SM_DUST_FLOOR         1LL            // koinu: rate floor, min vote weight, deposit floor
+#define SM_DUST_FLOOR         1LL            // koinu: rate floor, RESERVE deposit-leg floor, SELL floor basis
 #define SM_RATE_CAP           SM_KOINU_PER_DOGE   // 1 DOGE: rent-rate clamp ceiling (§3.4)
 #define SM_REF_SIZE           200LL          // bytes: fee-per-byte → per-name rent (§3.4)
 #define SM_FEE_WINDOW         10081LL        // blocks: window scanned for fee-bearing blocks (§3.4)
@@ -28,34 +28,35 @@
 #define SM_COMMIT_EXPIRY      18000LL        // s (~5 h): a commit's live window (§3.2)
 #define SM_RESERVE_WINDOW     18000LL        // s (~5 h): exclusive-buy window / SELL floor (§3.7)
 #define SM_DIRECT_WINDOW      7200LL         // s (~2 h): directed-sale offer window (§3.7)
-#define SM_REORG_BUFFER       7200LL         // s (~2 h): ordered-boundary margin (§3.7, §6)
+#define SM_REORG_BUFFER       7200LL         // s (~2 h): ordered-boundary margin (§3.7, §5)
 #define SM_RESERVE_DEPOSIT_BPS 100           // 1.00% total reserve deposit (§3.7)
 #define SM_RESERVE_BURN_BPS   50             // 0.50% burned leg (§3.7)
 #define SM_RESERVE_PAY_BPS    50             // 0.50% paid-to-seller leg (§3.7)
 #define SM_MAX_ANCHOR_AGE     1024LL         // blocks: max bitmap anchor staleness (§3.5)
 #define SM_SELL_PRICE_FLOOR   (3LL * SM_DUST_FLOOR)  // §3.7 SELL price floor
 
-#define SM_NAME_MAX           32             // [a-z0-9-] (a DNS label), 1..32 bytes (§3.1)
+#define SM_NAME_MAX           32             // [a-z0-9-] DNS label, 1..32 bytes + structural rules (§3.1)
 
-// ── §2 opcodes ──────────────────────────────────────────────────────────────
+// ── §2 opcodes (contiguous 0x01–0x0F; all gate at ACTIVATION_HEIGHT) ────────
 enum {
-    SM_OP_VOTE_UP   = 0x01,  // genesis (live from block 0)
-    SM_OP_VOTE_DOWN = 0x02,  // genesis
-    SM_OP_COMMIT    = 0x03,  // gated at ACTIVATION_HEIGHT ↓
-    SM_OP_CLAIM     = 0x04,
-    SM_OP_RENEW     = 0x05,
-    SM_OP_TRANSFER  = 0x06,
-    SM_OP_SELL      = 0x07,
-    SM_OP_RESERVE   = 0x08,
-    SM_OP_SETTLE    = 0x09,
-    SM_OP_RELEASE   = 0x0A,
-    SM_OP_DECORATE  = 0x0B,
-    SM_OP_SELL_TO   = 0x0C,
-    SM_OP_PAY       = 0x0D,
-    SM_OP_AS        = 0x0E,
-    SM_OP_TRADE     = 0x0F,
+    SM_OP_RENEW_NAME    = 0x01,   // by-name renew: name(1..32)          (§3.5)
+    SM_OP_TRANSFER_NAME = 0x02,   // by-name gift:  target(20)+name      (§3.5/§3.6)
+    SM_OP_COMMIT        = 0x03,
+    SM_OP_CLAIM         = 0x04,
+    SM_OP_RENEW         = 0x05,
+    SM_OP_TRANSFER      = 0x06,
+    SM_OP_SELL          = 0x07,
+    SM_OP_RESERVE       = 0x08,
+    SM_OP_SETTLE        = 0x09,
+    SM_OP_RELEASE       = 0x0A,
+    SM_OP_RELEASE_NAME  = 0x0B,   // by-name relinquish: name(1..32)     (§3.5/§3.6)
+    SM_OP_SELL_TO       = 0x0C,
+    SM_OP_PAY           = 0x0D,
+    SM_OP_AS            = 0x0E,
+    SM_OP_TRADE         = 0x0F,
 };
-#define SM_OP_FIRST_GATED SM_OP_COMMIT       // opcodes ≥ this need ACTIVATION_HEIGHT
+#define SM_OP_MIN  SM_OP_RENEW_NAME
+#define SM_OP_MAX  SM_OP_TRADE
 
 // Script types (§4 Rule 2). Identity keys on the bare hash160; the type is a
 // template selector recorded only where a script is later reconstructed.
@@ -65,15 +66,22 @@ enum { SM_P2PKH = 0, SM_P2SH = 1 };
 #define SM_MAX_INPUTS    8
 #define SM_MAX_CARRIERS  16
 #define SM_MAX_OUTS      16
-#define SM_DEC_MAX       80   // raw DECORATE TLV payload bytes
-#define SM_FLAGS_MAX     71   // RENEW/TRANSFER/RELEASE bitmap bytes (fits 80-byte OP_RETURN)
-#define SM_POST_MAX      80
-// §1 DECORATE pending-record cap: at most this many decoration records buffer for
-// binding to the next body; records past it are dropped (parsing continues). A
-// PROTOCOL constant (pinned 2026-07-03, all 7 impls) — decorations are advisory and
-// budget-bounded, so a hard cap keeps the pending buffer O(1) without a consensus
-// consequence for any honest post. Scenario vector pins the 64/65 boundary.
-#define SM_MAX_PEND_DECOR 64
+
+// ── the pinned carrier ceiling (§6) ─────────────────────────────────────────
+// A PROTOCOL constant, not an L1 rule: Pepecoin never size-checks an OP_RETURN
+// script (IsUnspendable() fires on the opcode; MAX_SCRIPT_SIZE and the 520-byte
+// element rule are execution-time, and an unspendable output never executes).
+// L1's only true bound is the ~1 MB serialized-tx limit. The pin is the payload
+// a MAX_SCRIPT_SIZE-sized script would carry — OP_RETURN(1) + OP_PUSHDATA2(1+2)
+// + one push — chosen so every impl keeps fixed-size, boundary-tested buffers;
+// raisable at an activation height if 79,896 names/carrier ever stops sufficing.
+// Relay policy (datacarriersize, default 83 script bytes → 80-byte payloads)
+// gates what nodes FORWARD, never what the fold ACCEPTS once mined.
+#define SM_L1_SCRIPT_MAX  10000
+#define SM_CARRIER_MAX    (SM_L1_SCRIPT_MAX - 4)   // 9996: max payload bytes
+#define SM_BODY_MAX       (SM_CARRIER_MAX - 4)     // 9992: after FF 'P' 'N' op
+#define SM_FLAGS_MAX      (SM_BODY_MAX - 5)        // 9987: RENEW/RELEASE bitmap bytes
+#define SM_FLAGS_XFER_MAX (SM_FLAGS_MAX - 20)      // 9967: TRANSFER (target eats 20)
 
 // A §4 identity, injected (never computed here).
 typedef struct { uint8_t h160[20]; uint8_t type; } SmId;
@@ -82,15 +90,13 @@ typedef struct { uint8_t h160[20]; uint8_t type; } SmId;
 typedef struct {
     uint8_t  op;
 
-    char     name[SM_NAME_MAX + 1];   uint8_t name_len;     // CLAIM/SELL/RESERVE/SETTLE/SELL_TO/PAY/TRADE
+    char     name[SM_NAME_MAX + 1];   uint8_t name_len;     // CLAIM/SELL/RESERVE/SETTLE/SELL_TO/PAY/TRADE + the by-name ops
     char     name_b[SM_NAME_MAX + 1]; uint8_t name_b_len;   // TRADE second name
 
     uint8_t  commitment[32];          // COMMIT
     uint8_t  salt[32];                // CLAIM
-    uint8_t  target_txid[32];         // VOTE_UP/DOWN target outpoint
-    uint32_t target_vout;
 
-    uint8_t  addr[20];                // TRANSFER target / SELL_TO buyer (hash160)
+    uint8_t  addr[20];                // TRANSFER/TRANSFER_NAME target / SELL_TO buyer (hash160)
     uint64_t price;                   // SELL / SELL_TO
     uint32_t window;                  // SELL (0 = default RESERVE_WINDOW)
 
@@ -99,23 +105,19 @@ typedef struct {
     // an anchor + flags.
     uint8_t  has_anchor;
     uint64_t anchor;                  // 5-byte absolute height anchor (fits u64)
-    uint8_t  flags[SM_FLAGS_MAX];     uint8_t flags_len;
+    uint8_t  flags[SM_FLAGS_MAX];     uint16_t flags_len;   // ≤ SM_FLAGS_MAX (> 255 possible)
 
     uint8_t  as_index;                // AS: vin[index] becomes acting identity
     uint8_t  idx_a, idx_b;            // TRADE: the two input indices
-
-    uint8_t  dec[SM_DEC_MAX];         uint8_t dec_len;       // DECORATE raw TLV records
 } SmAction;
 
-typedef enum { SM_CAR_ACTION, SM_CAR_POST, SM_CAR_IGNORE } SmCarKind;
+typedef enum { SM_CAR_ACTION, SM_CAR_IGNORE } SmCarKind;
 
 // One OP_RETURN output, in vout order.
 typedef struct {
     SmCarKind kind;
     SmAction  act;                    // when ACTION
-    uint8_t   post[SM_POST_MAX];      // when POST: the body bytes
-    uint8_t   post_len;
-    uint64_t  value;                  // OP_RETURN koinu (vote weight / post burn / reserve burn-leg)
+    uint64_t  value;                  // OP_RETURN koinu (rent / RESERVE burn-leg)
     uint32_t  vout;
 } SmCarrier;
 
@@ -124,14 +126,15 @@ typedef struct { uint8_t h160[20]; uint8_t type; uint64_t value; uint32_t vout; 
 
 // The abstract tx imposes NO per-tx count cap (spec §0: "any cap is relay, never
 // protocol"). Inputs/carriers/outs live behind pointers that default to embedded
-// inline storage and spill to the heap past it — so an honest tx never allocates,
+// inline storage and spill to the heap past it — so a typical tx allocates little,
 // yet a pathological large tx folds identically to an unbounded impl. SM_INLINE_*
-// are storage hints, NOT protocol limits (they equal the historical caps so every
-// pre-2026-07-03 tx keeps its exact byte layout). Build via sm_tx_input/carrier/out;
-// release with sm_tx_free (a no-op while inline). Never copy an SmTx by value — the
-// pointers would dangle; build in place.
+// are storage hints, NOT protocol limits. Carriers inline at ONE: an SmCarrier
+// embeds the full SM_FLAGS_MAX action, so each inline slot costs ~10 KB — one
+// covers the overwhelmingly common single-carrier tx and the rest spill.
+// Build via sm_tx_input/carrier/out; release with sm_tx_free (a no-op while
+// inline). Never copy an SmTx by value — the pointers would dangle; build in place.
 #define SM_INLINE_INPUTS    8
-#define SM_INLINE_CARRIERS  16
+#define SM_INLINE_CARRIERS  1
 #define SM_INLINE_OUTS      16
 // Synthetic-tx vout layout (test harnesses only: carriers occupy vout 0.., outs
 // start here). Digest-relevant, so pinned at the historical value; real chain txs
@@ -161,7 +164,7 @@ void      sm_tx_free(SmTx *t);                    // frees any heap spill (no-op
 
 // ── fold state ──────────────────────────────────────────────────────────────
 typedef enum {
-    SM_OWNED = 0,      // plain owned (handle/display is off-chain, §5)
+    SM_OWNED = 0,      // plain owned
     SM_LISTED,         // §3.7 open SELL listing
     SM_OFFERED,        // §3.7 directed SELL_TO offer
     SM_RESERVED,       // §3.7 reserved (an open listing with a winning reserver)
@@ -189,17 +192,7 @@ typedef struct {
     int64_t  commit_time;           // MTP at the commit's block (COMMIT_EXPIRY pruning)
 } SmCommit;
 
-typedef struct {
-    uint8_t  target[32]; uint32_t vout;
-    __int128 score;                 // Σ(up weight) − Σ(down weight); 128-bit, no silent wrap
-} SmVote;
-
 typedef struct { uint8_t owner[20]; int64_t height; } SmMut;
-
-typedef struct {
-    uint8_t  txid[32]; uint32_t vout;            // the body this rides on (synthetic id)
-    uint8_t  rec[SM_DEC_MAX]; uint8_t rec_len;   // verbatim TLV bytes (never interpreted)
-} SmDecor;
 
 // Per-BLOCK claim scratch (§3.2 priority tuple). Reset each begin_block. Records
 // names minted THIS block so a same-block claim with a smaller backing-commit
@@ -221,12 +214,9 @@ typedef struct {
 
     SmNameRow  *names;   int n_names,   cap_names;
     SmCommit   *commits; int n_commits, cap_commits;
-    SmVote     *votes;   int n_votes,   cap_votes;
     SmMut      *muts;    int n_muts,    cap_muts;
-    SmDecor    *decors;  int n_decors,  cap_decors;
     SmClaimWin *claimsc; int n_claimsc, cap_claimsc;   // per-block scratch (not digested)
 
-    int overflow_flag;              // set if a 128-bit accumulator would overflow (fail-loud)
     int64_t ev[16];                 // coverage event counters (NOT digested — see SM_EV_*)
 } SmState;
 
@@ -235,7 +225,7 @@ typedef struct {
 enum {
     SM_EV_CLAIM_MINT = 0, SM_EV_CLAIM_DISPLACE, SM_EV_WATERFILL_CAP, SM_EV_WATERFILL_FORFEIT,
     SM_EV_RESERVE_WIN, SM_EV_RESERVE_CLAMP, SM_EV_SETTLE_OK, SM_EV_PAY_OK,
-    SM_EV_TRADE_OK, SM_EV_LAPSE, SM_EV_RELEASE_NAME, SM_EV_AS_DROP, SM_EV_VOTE_OVERFLOW,
+    SM_EV_TRADE_OK, SM_EV_LAPSE, SM_EV_RELEASE_NAME, SM_EV_AS_DROP,
     SM_EV_SELL_OK, SM_EV_SELLTO_OK, SM_EV_COUNT
 };
 
@@ -266,12 +256,13 @@ void     sm_state_ecmh(SmState *s, uint8_t out[32]);
 // accumulator algebra + tagged multiset sum). Cross-language byte-identical.
 int      ecmh_cmd(void);
 
-// Queries (display / tests / invariants).
+// Queries (tests / invariants).
 const SmNameRow *sm_lookup(SmState *s, const char *name);
 int              sm_owns(SmState *s, const uint8_t h160[20], const char *name);
 
 // ── internal helpers shared across the fold .c files (not a stable API) ──────
-int      sm_name_valid(const char *name, size_t len);   // §3.1 [a-z0-9_.], 1..20 ('.' re-pinned 2026-07-02)
+// §3.1: [a-z0-9-], 1..32, no leading/trailing hyphen, no `--` at positions 3–4.
+int      sm_name_valid(const char *name, size_t len);
 int64_t  sm_last_mutation(SmState *s, const uint8_t owner[20]);
 void     sm_bump_mutation(SmState *s, const uint8_t owner[20], int64_t height);
 
@@ -279,13 +270,10 @@ SmNameRow *sm_find_name(SmState *s, const char *name);
 SmNameRow *sm_add_name(SmState *s, const char *name, size_t len);
 void       sm_remove_name(SmState *s, SmNameRow *row);
 
-void sm_vote_add(SmState *s, const uint8_t target[32], uint32_t vout, int up, uint64_t weight);
 void sm_commit_add(SmState *s, const uint8_t commitment[32], int64_t height,
                    uint32_t txidx, int64_t time);
-void sm_decor_add(SmState *s, const uint8_t txid[32], uint32_t vout,
-                  const uint8_t *rec, size_t rec_len);
 
-void sm_preblock(SmState *s, int64_t height, int64_t mtp);   // §6 transitions, used by begin_block
+void sm_preblock(SmState *s, int64_t height, int64_t mtp);   // §5 transitions, used by begin_block
 
 // Per-tx working context. fold.c builds it, updates the acting identity across
 // AS markers, and hands it to each op handler. Output consumption is per-tx
@@ -298,7 +286,10 @@ typedef struct SmTxCtx {
     uint8_t   txid[32];                 // synthetic per-tx id (pinned: height|txindex), §gen
     uint8_t   actor[20];  uint8_t actor_type;  int actor_valid;   // acting identity (⊥ ⇒ drop segment)
     uint64_t  car_value;  uint32_t car_vout;   // the current carrier's OP_RETURN value + vout
-    uint8_t   out_consumed[SM_MAX_OUTS];
+    // per-tx consume-once flags (§3.5), one per spendable output. Sized to the
+    // tx's actual n_outs by sm_apply_tx (a tx imposes NO output cap, §0), NOT a
+    // fixed 16 — else a tx with >16 outputs would read/write past this array.
+    uint8_t  *out_consumed;
 } SmTxCtx;
 
 // Match + consume the lowest-vout unconsumed output paying EXACTLY (dest,type,
@@ -313,6 +304,9 @@ void sm_op_claim   (SmState *s, SmTxCtx *cx, const SmAction *a);
 void sm_op_renew   (SmState *s, SmTxCtx *cx, const SmAction *a);
 void sm_op_transfer(SmState *s, SmTxCtx *cx, const SmAction *a);
 void sm_op_release (SmState *s, SmTxCtx *cx, const SmAction *a);
+void sm_op_renew_name   (SmState *s, SmTxCtx *cx, const SmAction *a);   // §3.5 by-name forms
+void sm_op_transfer_name(SmState *s, SmTxCtx *cx, const SmAction *a);
+void sm_op_release_name (SmState *s, SmTxCtx *cx, const SmAction *a);
 void sm_op_sell    (SmState *s, SmTxCtx *cx, const SmAction *a);
 void sm_op_reserve (SmState *s, SmTxCtx *cx, const SmAction *a);
 void sm_op_settle  (SmState *s, SmTxCtx *cx, const SmAction *a);
@@ -335,7 +329,7 @@ int  sm_lease_covers_day(uint64_t burn, uint64_t rate);
 // written to out[] (≤ max). Defined in bitmap.c.
 int  sm_collect_owned(SmState *s, const uint8_t who[20], SmNameRow **out, int max);
 
-// ── §3.4 / §6 oracle helpers (pure; the harness feeds their output into
+// ── §3.4 / §5 oracle helpers (pure; the harness feeds their output into
 // begin_block, keeping the fold chain-abstracted). Defined in oracle.c.
 //   sm_mtp        — median of the (up to 11) timestamps of the blocks before H.
 //   sm_oracle_rate— the §3.4 fee-rate over `n` blocks (signed under-claim clamp,
@@ -385,29 +379,22 @@ uint64_t sm_record_chain(uint64_t seed, uint64_t count,
 // the real indexer's strict, fail-closed parse ("indexers MUST agree byte-for-byte
 // on validity", §0) lives in, exercised by `sm fuzz`. Pinned in SPEC-conformance.md.
 
-// RFC 3629 strict UTF-8 (reject overlong, surrogates U+D800..U+DFFF, > U+10FFFF).
-int sm_valid_utf8(const uint8_t *p, size_t len);
-
 // Decode one OP_RETURN payload (the bytes of the single minimal push, §1) into a
-// carrier: ACTION (prefix 0xFF 'P' 'N' + opcode, fields parse per §2/§3), POST
-// (whole-payload strict UTF-8 with value > 0), or IGNORE (everything else —
-// malformed action, zero-value, non-UTF-8). `value` is read only for the POST
-// demux; the caller sets car->value/car->vout. Fail-closed: any field/length
-// mismatch ⇒ IGNORE. `len` ≤ 80 (the §0 payload bound; callers cap there).
+// carrier: ACTION (prefix 0xFF 'P' 'N' + opcode 0x01..0x0F, fields parse per §2/§3)
+// or IGNORE (everything else — unknown opcode, field/length mismatch, non-prefix).
+// `value` is unused by the demux (kept for call-site uniformity); the caller sets
+// car->value/car->vout. Fail-closed. `len` ≤ SM_CARRIER_MAX.
 void sm_decode_payload(const uint8_t *payload, size_t len, uint64_t value, SmCarrier *car);
 
 // Canonical wire encoding of a well-formed action (the inverse of the action path
-// of sm_decode_payload). Writes ≤ 80 bytes to out, returns the length, or 0 if `a`
-// is not encodable (bad opcode / field). Used by the grammar-aware fuzzer.
-size_t sm_encode_action(const SmAction *a, uint8_t out[80]);
+// of sm_decode_payload). Writes ≤ SM_CARRIER_MAX bytes to out, returns the length,
+// or 0 if `a` is not encodable (bad opcode / field). Used by the grammar-aware fuzzer.
+size_t sm_encode_action(const SmAction *a, uint8_t out[SM_CARRIER_MAX]);
 
 // ── property/reorg fingerprints (harness.c) ──────────────────────────────────
 // Per-block property fingerprint: hashes order-independent derived aggregates
-// (counts by state, Σlease, Σprice, Σdeposit-legs, Σvote-score, overflow flag)
-// into `h`, AND returns the count of property violations (no-double-ownership,
-// lease bound, market nesting, the bps deposit conservation recompute, the SELL
-// floor, mutation-height sanity). The aggregate hash is the cross-language
-// property_digest; the violation count is the hard assertion. Pinned in SPEC §8.
+// (counts by state, Σlease, Σprice, Σdeposit-legs) into `h`, AND returns the
+// count of property violations. Pinned in SPEC §8.
 int sm_block_fingerprint(SmState *s, int64_t mtp, SHA256_CTX *h);
 
 // CLI entry points for the harness modes (harness.c).

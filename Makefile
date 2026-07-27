@@ -75,3 +75,30 @@ clean:
 	rm -rf indexerd indexerd.san build
 
 .PHONY: all test clean
+
+# ── extra test suites (storage / sync / codec) ────────────────────────────────
+# Appended targets; `test` above is untouched and still runs ./indexerd selftest.
+# Each suite links the same objects as indexerd with src/main.c swapped out for
+# the suite's own main (test_chain.c stays in — sync.c's selftest path needs it).
+TEST_SRCS := $(filter-out src/main.c,$(ALL_SRCS))
+
+test_db: $(TEST_SRCS) src/test_db.c $(SECPLIB)
+	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(TEST_SRCS) src/test_db.c $(LIBS)
+
+test_sync: $(TEST_SRCS) src/test_sync.c $(SECPLIB)
+	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(TEST_SRCS) src/test_sync.c $(LIBS)
+
+test_codec: $(TEST_SRCS) src/test_codec.c $(SECPLIB)
+	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(TEST_SRCS) src/test_codec.c $(LIBS)
+
+# `make check` = the three suites. Run `make test` for the shipped selftest.
+# Every suite runs even if an earlier one fails; the target fails if any did.
+check: test_db test_sync test_codec
+	@rc=0; for t in ./test_db ./test_sync ./test_codec; do \
+	  echo "=== $$t ==="; $$t || rc=1; done; \
+	if [ $$rc -eq 0 ]; then echo "check: ALL PASSED"; else echo "check: FAILED"; fi; exit $$rc
+
+check-clean:
+	rm -f test_db test_sync test_codec
+
+.PHONY: check check-clean

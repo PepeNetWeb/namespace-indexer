@@ -10,3 +10,6 @@ impls/csharp/bin/
 impls/csharp/obj/
 impls/java/*.class
 impls/c/sm.san
+
+# macOS
+.DS_Store

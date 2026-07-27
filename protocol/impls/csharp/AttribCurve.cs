@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Security.Cryptography;
 using System.Text;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
 /// §4 Strategy B — the pinned ECDSA curve-vector set (`sm attrib-curve`).

@@ -1,6 +1,6 @@
-# pepenet protocol — C# reference implementation (Tier 2)
+# PepeNet namespace — C# reference implementation (Tier 2)
 
-An independent C# implementation of the pepenet protocol state machine, built from the
+An independent C# implementation of the PepeNet namespace state machine, built from the
 specification (`docs/protocol-spec.md` + `protocol-sm/SPEC-conformance.md`). It is part of the
 cross-language conformance suite: each implementation is written independently and they
 cross-validate the spec's consensus-critical outcomes. `impls/c` is the normative reference; the

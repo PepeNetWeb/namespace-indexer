@@ -472,7 +472,9 @@ static void ecmh_ser(const jac *p, uint8_t out33[33]) {   // point → 33 bytes 
 }
 static void ecmh_load(const uint8_t in33[33], jac *p) {   // 33 bytes → point
     if (in33[0] == 0) { jac_set_inf(p); return; }
-    fe x, y; pub_decode(in33, 33, &x, &y); jac_from_affine(p, &x, &y);
+    fe x, y;
+    if (!pub_decode(in33, 33, &x, &y)) { jac_set_inf(p); return; }  // non-decodable X → ∞ (no uninit read; matches Go/Py/TS)
+    jac_from_affine(p, &x, &y);
 }
 
 int secp_ecmh_hash(const uint8_t *pre, int len, uint8_t pt33[33]) {

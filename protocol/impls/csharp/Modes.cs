@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Buffers.Binary;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
 /// Generator-driven invariant battery (§8/§9/§10/§11). These modes use THIS impl's
@@ -11,7 +11,7 @@ namespace Shibpost;
 /// assertions: properties' violations==0 (the fold preserves every §8 invariant),
 /// meta/reorg/reorgfuzz's failures==0 (the fold is drop-closed and a pure, reorg-safe
 /// function of the block sequence), and fuzz's parser_crashes==0 (the decoder/fold is
-/// fail-closed over adversarial bytes).
+/// fail-closed over adversarial bytes). Names-only fingerprint: no votes/decors/overflow.
 /// </summary>
 public static class Modes
 {
@@ -61,31 +61,32 @@ public static class Modes
             }
         }
         foreach (var mh in f.Muts.Values) if (mh > height) v++; // mutation height <= cur height
-        if (f.OverflowFlag != 0) v++;
         return v;
     }
 
+    // Mirrors C sm_block_fingerprint: names-only aggregates, no votes/decors/overflow.
     private static void Fingerprint(HashBuf pd, Fold f)
     {
         int nOwned = 0, nListed = 0, nOffered = 0, nReserved = 0;
-        Int128 sumLease = 0, sumPrice = 0, sumLegs = 0, sumVote = 0;
+        Int128 sumLease = 0, sumPrice = 0, sumLegs = 0;
         foreach (var r in f.Names.Values)
         {
             switch (r.St)
             {
                 case K.ST_OWNED: nOwned++; break;
-                case K.ST_LISTED: nListed++; break;
-                case K.ST_OFFERED: nOffered++; break;
-                case K.ST_RESERVED: nReserved++; break;
+                case K.ST_LISTED: nListed++; sumPrice += (Int128)r.Price; break;
+                case K.ST_OFFERED: nOffered++; sumPrice += (Int128)r.Price; break;
+                case K.ST_RESERVED:
+                    nReserved++;
+                    sumPrice += (Int128)r.Price;
+                    sumLegs += (Int128)r.BurnLeg + (Int128)r.PayLeg;
+                    break;
             }
             sumLease += r.LeaseExpiry;
-            if (r.St == K.ST_LISTED || r.St == K.ST_RESERVED) sumPrice += (Int128)r.Price;
-            if (r.St == K.ST_RESERVED) sumLegs += (Int128)r.BurnLeg + (Int128)r.PayLeg;
         }
-        foreach (var s in f.VoteScore.Values) sumVote += s;
         pd.U32((uint)f.Names.Count).U32((uint)nOwned).U32((uint)nListed).U32((uint)nOffered).U32((uint)nReserved);
-        pd.U32((uint)f.Commits.Count).U32((uint)f.VoteScore.Count).U32((uint)f.Muts.Count).U32((uint)f.Decors.Count);
-        pd.I128(sumLease).I128(sumPrice).I128(sumLegs).I128(sumVote).U8(f.OverflowFlag);
+        pd.U32((uint)f.Commits.Count).U32((uint)f.Muts.Count);
+        pd.I128(sumLease).I128(sumPrice).I128(sumLegs);
     }
 
     // ---------------- §11 meta: an IGNORED action is provably inert ----------------
@@ -108,17 +109,18 @@ public static class Modes
 
     private static Tx InertTx()
     {
-        // zero-weight vote -> dropped; malformed RENEW (bl=3) -> IGNORE; orphan DECORATE
-        // -> discarded at tx end; zero-value "POST" -> IGNORE. None mutates digested state.
-        byte[] zv = B.Vote(true, Fold.SyntheticTxid(1, 0), 0);
-        byte[] malformed = new byte[] { 0xFF, 0x50, 0x4E, 0x05, 0x01, 0x02, 0x03 }; // RENEW bl=3 -> IGNORE
-        byte[] dec = B.Decorate(B.DecRecord(3, new byte[] { 9 }));
+        // truncated CLAIM → IGNORE; unknown opcode 0x20 → IGNORE; bare UTF-8 → IGNORE;
+        // overlay-band 0xD6 → IGNORE. None mutates digested state. (mirrors C build_inert_tx)
+        byte[] badClaim = new byte[] { 0xFF, 0x50, 0x4E, K.OP_CLAIM, 0, 0, 0, 0 };
+        byte[] unknown = new byte[] { 0xFF, 0x50, 0x4E, 0x20 };
+        byte[] hello = B.Name("hello");
+        byte[] overlay = new byte[] { 0xFF, 0x50, 0x4E, 0xD6, 0x00 };
         var outs = new List<Out>
         {
-            Out.Carrier(zv, 0),                                  // zero-weight vote -> dropped
-            Out.Carrier(malformed, 0),                           // decodes to IGNORE
-            Out.Carrier(dec, 0),                                 // orphan DECORATE -> discarded
-            Out.Carrier(B.Name("hi"), 0),                        // zero-value POST -> IGNORE
+            Out.Carrier(badClaim, 0),
+            Out.Carrier(unknown, 0),
+            Out.Carrier(hello, 1),
+            Out.Carrier(overlay, 0),
         };
         return new Tx
         {
@@ -246,7 +248,7 @@ public static class Modes
             int len = rng.Bnd(81);
             byte[] p = new byte[len];
             for (int i = 0; i < len; i++) p[i] = (byte)rng.Bnd(256);
-            if (rng.Bnd(3) == 0 && len >= 4) { p[0] = 0xFF; p[1] = 0x50; p[2] = 0x4E; p[3] = (byte)(1 + rng.Bnd(15)); }
+            if (rng.Bnd(3) == 0 && len >= 4) { p[0] = 0xFF; p[1] = 0x50; p[2] = 0x4E; p[3] = (byte)(1 + rng.Bnd(15)); } // 0x01..0x0F
             return p;
         }
         // grammar-aware: build a prefixed action-shaped payload, then maybe corrupt.
@@ -263,18 +265,18 @@ public static class Modes
 
     private static byte[] GrammarPayload(SplitMix64 rng)
     {
-        int op = 1 + rng.Bnd(15);
+        int op = 1 + rng.Bnd(15); // 0x01..0x0F
         int bodyLen = op switch
         {
-            K.OP_VOTE_UP or K.OP_VOTE_DOWN => 36,
             K.OP_COMMIT => 32,
             K.OP_CLAIM => 33 + rng.Bnd(32),
+            K.OP_RENEW_NAME or K.OP_RELEASE_NAME => 1 + rng.Bnd(32),
+            K.OP_TRANSFER_NAME => 21 + rng.Bnd(31),
             K.OP_RENEW => new[] { 0, 5, 6 + rng.Bnd(71) }[rng.Bnd(3)],
             K.OP_TRANSFER => rng.Bnd(2) == 0 ? 20 : 26 + rng.Bnd(51),
             K.OP_SELL => 13 + rng.Bnd(32),
             K.OP_RESERVE or K.OP_SETTLE or K.OP_PAY => 1 + rng.Bnd(32),
             K.OP_RELEASE => 6 + rng.Bnd(71),
-            K.OP_DECORATE => rng.Bnd(77),
             K.OP_SELL_TO => 29 + rng.Bnd(32),
             K.OP_AS => 1,
             K.OP_TRADE => 5 + rng.Bnd(30),

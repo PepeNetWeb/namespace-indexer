@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-namespace Shibpost;
+namespace Pepenet;
 
 public static class SelfTest
 {
@@ -31,8 +31,6 @@ public static class SelfTest
         Directed();
         Trade();
         DottedNames();
-        Decorate();
-        Votes();
         OracleTests();
         MtpTests();
         Attrib();
@@ -43,7 +41,8 @@ public static class SelfTest
         Console.WriteLine($"selftest: {_pass} passed, {_fail} failed");
         foreach (var f in _failures) Console.WriteLine($"  FAIL: {f}");
 
-        // empty-state ECMH anchor (cross-impl pinned, §13.2).
+        // empty-state anchors (cross-impl pinned).
+        Console.WriteLine($"empty_state_digest={Digest.ComputeHex(new Fold())}");
         Console.WriteLine($"empty_state_ecmh={StateEcmh.ComputeHex(new Fold())}");
         return _fail == 0 ? 0 : 1;
     }
@@ -71,23 +70,29 @@ public static class SelfTest
         Check("hash160-abc", Hashing.Hex(Hashing.Hash160(System.Text.Encoding.ASCII.GetBytes("abc"))).StartsWith("bb1be98c"));
     }
 
-    // ---- decoder ----
+    // ---- decoder (names-only: ACTION | IGNORE) ----
     private static void Decoder_()
     {
-        // valid VOTE
-        var v = B.Vote(true, new byte[32], 0);
-        Check("dec-vote", Decoder.Decode(v, 5).Kind == DecodeKind.Action);
-        // wrong-length VOTE → ignore
-        Check("dec-vote-short", Decoder.Decode(v[..^1], 5).Kind == DecodeKind.Ignore);
-        // text post (value>0, valid utf8)
-        Check("dec-post", Decoder.Decode(System.Text.Encoding.ASCII.GetBytes("hello"), 1).Kind == DecodeKind.Post);
-        // zero-value valid utf8 → ignore
-        Check("dec-post-zero", Decoder.Decode(System.Text.Encoding.ASCII.GetBytes("hello"), 0).Kind == DecodeKind.Ignore);
-        // invalid utf8 → ignore
-        Check("dec-bad-utf8", Decoder.Decode(new byte[] { 0xC0, 0x80 }, 1).Kind == DecodeKind.Ignore);
+        // bare UTF-8 (value>0) → IGNORE (no text-post demux)
+        Check("dec-bare-utf8-ignore", Decoder.Decode(System.Text.Encoding.ASCII.GetBytes("hello"), 1).Kind == DecodeKind.Ignore);
+        // zero-value bare → ignore
+        Check("dec-bare-zero-ignore", Decoder.Decode(System.Text.Encoding.ASCII.GetBytes("hello"), 0).Kind == DecodeKind.Ignore);
+        // overlay-band opcode → ignore
+        Check("dec-overlay-ignore", Decoder.Decode(new byte[] { 0xFF, 0x50, 0x4E, 0xD6, 0x00 }, 0).Kind == DecodeKind.Ignore);
+        // opcode 0x00 / 0x10 → ignore
+        Check("dec-op00-ignore", Decoder.Decode(new byte[] { 0xFF, 0x50, 0x4E, 0x00 }, 1).Kind == DecodeKind.Ignore);
+        Check("dec-op10-ignore", Decoder.Decode(new byte[] { 0xFF, 0x50, 0x4E, 0x10 }, 1).Kind == DecodeKind.Ignore);
+        // valid COMMIT
+        Check("dec-commit", Decoder.Decode(B.Commit(new byte[32]), 0).Kind == DecodeKind.Action);
+        // short COMMIT → ignore
+        Check("dec-commit-short", Decoder.Decode(B.Payload(K.OP_COMMIT, new byte[31]), 0).Kind == DecodeKind.Ignore);
         // uppercase name in CLAIM rejected (no fold)
         var badClaim = B.Payload(K.OP_CLAIM, B.Concat(B.Salt(1), B.Name("Alice")));
         Check("dec-claim-upper", Decoder.Decode(badClaim, 1).Kind == DecodeKind.Ignore);
+        // structural name rejects
+        Check("dec-claim-lead-hyphen", Decoder.Decode(B.Claim(B.Salt(1), "-a"), 1).Kind == DecodeKind.Ignore);
+        Check("dec-claim-trail-hyphen", Decoder.Decode(B.Claim(B.Salt(1), "a-"), 1).Kind == DecodeKind.Ignore);
+        Check("dec-claim-ace", Decoder.Decode(B.Claim(B.Salt(1), "xn--x"), 1).Kind == DecodeKind.Ignore);
         // TRADE exactly one comma
         Check("dec-trade-ok", Decoder.Decode(B.Trade(0, 1, "a", "b"), 0).Kind == DecodeKind.Action);
         var twoComma = B.Payload(K.OP_TRADE, B.Concat(new byte[] { 0, 1 }, B.Name("a"), new byte[] { 0x2C }, B.Name("b"), new byte[] { 0x2C }, B.Name("c")));
@@ -96,11 +101,16 @@ public static class SelfTest
         Check("dec-renew-all", Decoder.Decode(B.RenewAll(), 0).Kind == DecodeKind.Action);
         Check("dec-renew-bl1-invalid", Decoder.Decode(B.Payload(K.OP_RENEW, new byte[1]), 0).Kind == DecodeKind.Ignore);
         Check("dec-renew-safe", Decoder.Decode(B.RenewAllSafe(0), 0).Kind == DecodeKind.Action);
-        // strict UTF-8 overlong / surrogate
-        Check("dec-overlong", !Decoder.ValidUtf8(new byte[] { 0xE0, 0x80, 0x80 }));
-        Check("dec-surrogate", !Decoder.ValidUtf8(new byte[] { 0xED, 0xA0, 0x80 }));
-        Check("dec-max", !Decoder.ValidUtf8(new byte[] { 0xF4, 0x90, 0x80, 0x80 })); // > U+10FFFF
-        Check("dec-valid-2b", Decoder.ValidUtf8(new byte[] { 0xC3, 0xA9 })); // é
+
+        // §6 pinned carrier ceiling: flags at the exact consensus caps decode;
+        // one byte past the ceiling is IGNORE (fail-closed).
+        var wide = B.Payload(K.OP_RENEW, new byte[5 + K.FLAGS_MAX]);
+        Check("dec-renew-at-carrier-max", wide.Length == K.CARRIER_MAX
+              && Decoder.Decode(wide, 0).Kind == DecodeKind.Action);
+        Check("dec-renew-past-ceiling", Decoder.Decode(B.Payload(K.OP_RENEW, new byte[5 + K.FLAGS_MAX + 1]), 0).Kind == DecodeKind.Ignore);
+        Check("dec-transfer-at-xfer-max", Decoder.Decode(B.Payload(K.OP_TRANSFER, new byte[25 + K.FLAGS_XFER_MAX]), 0).Kind == DecodeKind.Action);
+        Check("dec-transfer-past-ceiling", Decoder.Decode(B.Payload(K.OP_TRANSFER, new byte[25 + K.FLAGS_XFER_MAX + 1]), 0).Kind == DecodeKind.Ignore);
+        Check("dec-release-at-flags-max", Decoder.Decode(B.Payload(K.OP_RELEASE, new byte[5 + K.FLAGS_MAX]), 0).Kind == DecodeKind.Action);
     }
 
     // ---- water-fill units ----
@@ -313,10 +323,8 @@ public static class SelfTest
         Check("trade-antirug", OwnedBy(f2, "ra", 9) && OwnedBy(f2, "rb", 1)); // trade dropped, rb stays Id1
     }
 
-    // ---- charset ----
-    // charset re-pin (2026-07-07): [a-z0-9-] — a DNS label, lowercased. '.'/'_' dropped, '-'
-    // added (supersedes the 2026-07-02 dot rule). No structural rules; hyphen and a 32-byte name
-    // are valid, '.'/'_'/uppercase/comma/33-byte are not. Pins the OUTCOME behind scenario 52.
+    // ---- charset + structural rules (§3.1) ----
+    // [a-z0-9-], 1..32; no leading/trailing hyphen; no `--` at positions 3–4.
     private static bool NameOk(string s)
     {
         byte[] b = B.Name(s);
@@ -332,6 +340,9 @@ public static class SelfTest
         Check("underscore-invalid", !NameOk("shib_p2p"));
         Check("upper-invalid", !NameOk("Shib-p2p"));
         Check("comma-invalid", !NameOk("a,b")); // TRADE pair split relies on it
+        Check("leading-hyphen-invalid", !NameOk("-a"));
+        Check("trailing-hyphen-invalid", !NameOk("a-"));
+        Check("ace-prefix-invalid", !NameOk("xn--x"));
 
         var f = new Fold();
         byte[] sLo = B.Salt(0x71), sUp = B.Salt(0x74);
@@ -343,63 +354,6 @@ public static class SelfTest
             Tx(new[] { B.In(0xAA) }, new[] { Out.Carrier(B.Claim(sUp, "shib.p2p"), 10) })));
         Check("hyphen-claim-mints", OwnedBy(f, "shib-p2p", 0xAA));
         Check("dotted-claim-drops", !f.Names.ContainsKey("shib.p2p") && f.Names.Count == 1);
-    }
-
-    // ---- decorate ----
-    private static void Decorate()
-    {
-        var f = ClaimName("deco", 0, 365, out long cm);
-        // DECORATE then POST, author owns ≥1 name → bound
-        var rec = B.DecRecord(0x01, B.Name("reply"));
-        var tx = Tx(new[] { B.In(0) }, new Out[]
-        {
-            Out.Carrier(B.Decorate(rec), 0),
-            Out.Carrier(System.Text.Encoding.ASCII.GetBytes("body"), 1), // text post, value>0
-        });
-        f.ApplyBlock(Blk(5, cm + 100, 28, tx));
-        Check("decorate-bound", f.Decors.Count == 1);
-
-        // orphan: DECORATE with no body
-        var f2 = ClaimName("deco2", 0, 365, out long cm2);
-        f2.ApplyBlock(Blk(5, cm2 + 100, 28, Tx(new[] { B.In(0) }, new[] { Out.Carrier(B.Decorate(rec), 0) })));
-        Check("decorate-orphan", f2.Decors.Count == 0);
-
-        // author owns no name → records dropped
-        var f3 = new Fold();
-        f3.ApplyBlock(Blk(5, 3000, 28, Tx(new[] { B.In(7) }, new Out[]
-        {
-            Out.Carrier(B.Decorate(rec), 0),
-            Out.Carrier(System.Text.Encoding.ASCII.GetBytes("body"), 1),
-        })));
-        Check("decorate-nameless-drop", f3.Decors.Count == 0);
-    }
-
-    // ---- votes ----
-    private static void Votes()
-    {
-        var f = new Fold();
-        byte[] tgt = Fold.SyntheticTxid(2, 0);
-        f.ApplyBlock(Blk(5, 3000, 28, Tx(new[] { B.In(0) }, new Out[]
-        {
-            Out.Carrier(B.Vote(true, tgt, 0), 100),
-            Out.Carrier(B.Vote(false, tgt, 0), 30),
-        })));
-        string key = Hashing.Hex(tgt) + "|0";
-        Check("vote-score", f.VoteScore[key] == (Int128)70);
-
-        // zero-weight vote dropped
-        var f2 = new Fold();
-        f2.ApplyBlock(Blk(5, 3000, 28, Tx(new[] { B.In(0) }, new[] { Out.Carrier(B.Vote(true, tgt, 0), 0) })));
-        Check("vote-zero-drop", f2.VoteScore.Count == 0);
-
-        // i128 accumulation beyond u64 without overflow flag
-        var f3 = new Fold();
-        f3.ApplyBlock(Blk(5, 3000, 28, Tx(new[] { B.In(0) }, new Out[]
-        {
-            Out.Carrier(B.Vote(true, tgt, 0), ulong.MaxValue),
-            Out.Carrier(B.Vote(true, tgt, 0), ulong.MaxValue),
-        })));
-        Check("vote-i128", f3.VoteScore[key] == (Int128)ulong.MaxValue * 2 && f3.OverflowFlag == 0);
     }
 
     // ---- oracle ----

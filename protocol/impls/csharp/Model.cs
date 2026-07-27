@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 
-namespace Shibpost;
+namespace Pepenet;
 
 // ---- Transaction input/output model (abstract; real §4 byte-logic is the attrib layer) ----
 
@@ -83,11 +83,4 @@ public sealed class CommitRow
     public long CommitHeight;
     public uint TxIndex;
     public long CommitTime;
-}
-
-public sealed class DecorRow
-{
-    public byte[] Txid = new byte[32];
-    public uint Vout;
-    public byte[] Rec = Array.Empty<byte>(); // verbatim [tag:1][len:2 LE][value]
 }

@@ -18,6 +18,8 @@
 #define TX_MAX_SIZE        100000      // 100 KB — the standard max-standard-tx size
 #define TX_MAX_SCRIPTSIG   1650        // per-input scriptSig cap (a 15-of-15 P2SH redeem)
 #define TX_DUST_LIMIT      1000000LL   // 0.01 coin (Dogecoin-1.14 threshold)
+#define TX_RELAY_CARRIER_MAX 80        // relay-standard payload (datacarriersize 83);
+                                       // the FOLD accepts up to SM_CARRIER_MAX (§6)
 // Doge-family money-range sanity bound (Dogecoin has no hard supply cap; Core
 // uses this as the CheckTransaction value range). = 1e10 coins in koinu.
 #define TX_MAX_MONEY       (10000000000LL * 100000000LL)

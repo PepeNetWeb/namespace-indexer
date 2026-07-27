@@ -1,7 +1,7 @@
 import java.math.BigInteger;
 import java.util.*;
 
-// The deterministic fold (§3 logic + §6 ordering). Mutates a State block-by-block.
+// The deterministic fold (§3 logic + §5 ordering). Mutates a State block-by-block.
 // Derived purely from prose; ambiguities are commented with FORK-RISK and resolved
 // by the most natural reading.
 final class Fold {
@@ -12,14 +12,14 @@ final class Fold {
 
     void applyBlock(Model.Block b) {
         st.claimScratch.clear();                 // per-block scratch, never digested (§3 conformance)
-        preBlock(b.height, b.mtp);               // time-triggered transitions BEFORE txs (§6)
+        preBlock(b.height, b.mtp);               // time-triggered transitions BEFORE txs (§5)
         for (int i = 0; i < b.txs.length; i++) {
             b.txs[i].txIndex = i;                // (tx index) order
             applyTx(b, b.txs[i]);
         }
     }
 
-    // Time-triggered transitions (no tx). Per §6: COMMIT_EXPIRY prune (independent),
+    // Time-triggered transitions (no tx). Per §5: COMMIT_EXPIRY prune (independent),
     // then per name in TYPE order reserve_expiry -> offer_expiry -> lease_expiry,
     // each guarded/idempotent. Bounds are EXCLUSIVE (owned iff MTP < lease_expiry),
     // so a transition fires when MTP >= boundary.
@@ -70,33 +70,20 @@ final class Fold {
         Model.TxIn actor = tx.ins.length > 0 ? tx.ins[0] : null;
         boolean actorValid = actor != null && actor.sigAll;   // abstract proxy for §4 success + Rule 3
 
-        List<State.Decor> pending = new ArrayList<>();   // DECORATE buffer
-
         for (int vout = 0; vout < tx.outs.length; vout++) {
             Model.TxOut o = tx.outs[vout];
             if (!o.isOpReturn()) continue;               // spendable handled by matcher
             Wire.Decoded d = Wire.decode(o.payload, o.value);
 
-            if (d.kind == Wire.Kind.IGNORE) continue;
-
-            if (d.kind == Wire.Kind.POST) {
-                // bind pending decorations iff author owns >=1 name (§1); else records drop
-                if (!pending.isEmpty()) {
-                    if (actorValid && ownsAny(actor.id)) {
-                        byte[] txid = Model.synthTxid(height, tx.txIndex);
-                        for (State.Decor rec : pending) { rec.txid = txid; rec.vout = vout; st.decors.add(rec); }
-                    }
-                    pending.clear();
-                }
-                continue;
-            }
+            if (d.kind != Wire.Kind.ACTION) continue;    // IGNORE (names-only: no POST)
 
             // ACTION
             Action a = d.action;
-            if (a.op >= 0x03 && height < Const.ACTIVATION_HEIGHT) continue;   // forward-only gate (§3.0)
+
+            // forward-only activation gate (§3.0): all ops gate at one height.
+            if (height < Const.ACTIVATION_HEIGHT) continue;
 
             if (a.op == Const.AS) {
-                pending.clear();                         // AS flushes the DECORATE buffer (orphan, §3.10)
                 int k = a.asIndex;
                 if (k < tx.ins.length && tx.ins[k].sigAll) { actor = tx.ins[k]; actorValid = true; }
                 else { actor = null; actorValid = false; }   // bottom: segment drops until next AS / tx-end
@@ -104,7 +91,7 @@ final class Fold {
             }
 
             // TRADE is attributed to its OWN named inputs vin[idxA]/vin[idxB], NOT the acting identity
-            // (§3.10/§6): it dispatches regardless of whether the acting identity verified, and never
+            // (§3.10/§5): it dispatches regardless of whether the acting identity verified, and never
             // consults `actor`, so it MUST run before the acting-identity drop gate below. (Requiring a
             // verified actor here would drop trades the spec settles — the M9 fork.)
             if (a.op == Const.TRADE) { trade(a, tx, height); continue; }
@@ -112,35 +99,26 @@ final class Fold {
             if (!actorValid) continue;                   // run §4 on actor; drop if bottom/unverified
 
             switch (a.op) {
-                case Const.VOTE_UP, Const.VOTE_DOWN -> vote(a, o.value);
                 case Const.COMMIT -> commit(a, height, mtp, tx.txIndex);
                 case Const.CLAIM -> claim(a, actor, o.value, height, mtp, rate);
                 case Const.RENEW -> renew(a, actor, o.value, height, mtp, rate);
                 case Const.TRANSFER -> transfer(a, actor, height);
+                case Const.RENEW_NAME -> renewName(a, actor, o.value, mtp, rate);
+                case Const.TRANSFER_NAME -> transferName(a, actor, height);
+                case Const.RELEASE_NAME -> releaseName(a, actor, height);
                 case Const.SELL -> sell(a, actor, mtp);
                 case Const.RESERVE -> reserve(a, actor, o.value, mtp, pool);
                 case Const.SETTLE -> settle(a, actor, mtp, pool, height);
                 case Const.RELEASE -> release(a, actor, height);
-                case Const.DECORATE -> decorate(a, pending);
                 case Const.SELL_TO -> sellTo(a, actor, mtp);
                 case Const.PAY -> pay(a, actor, mtp, pool, height);
                 // TRADE is intercepted above (before the acting-identity gate) — never reaches here.
-                default -> { /* unreachable */ }
+                default -> { /* unknown / unreachable */ }
             }
         }
-        // end of tx: pending decorations with no following body are orphans, discarded (§1)
     }
 
     // ---- per-op handlers --------------------------------------------------
-
-    private void vote(Action a, BigInteger weight) {
-        if (weight.compareTo(Const.DUST_FLOOR) < 0) return;          // zero-weight dropped (§3.8)
-        String key = Hex.enc(a.target) + ":" + a.vout;
-        State.Vote v = st.votes.get(key);
-        if (v == null) { v = new State.Vote(); v.target = a.target.clone(); v.vout = a.vout; st.votes.put(key, v); }
-        v.score = (a.op == Const.VOTE_UP) ? v.score.add(weight) : v.score.subtract(weight);
-        if (v.score.compareTo(Const.I128_MIN) < 0 || v.score.compareTo(Const.I128_MAX) > 0) st.overflow = true;
-    }
 
     private void commit(Action a, long height, long mtp, int txIndex) {
         State.Commit c = new State.Commit();
@@ -214,6 +192,40 @@ final class Fold {
             st.names.get(targets.get(i)).leaseExpiry = cur[i] + add[i] * Const.BILLING_UNIT;
     }
 
+    // ---- the by-name forms (§3.5): singleton siblings of the bitmap ops ----
+    // A name string is its own position-independent address into the owned set —
+    // no anchor, no anchor guard. The name MUST be the actor's (the owner stays
+    // the seller while LISTED/OFFERED/RESERVED); else drop.
+    private State.NameRow findMine(Action a, Model.TxIn actor) {
+        State.NameRow r = st.names.get(State.nameKey(a.name));
+        if (r == null || !Arrays.equals(r.owner, actor.id)) return null;
+        return r;
+    }
+
+    private void renewName(Action a, Model.TxIn actor, BigInteger value, long mtp, BigInteger rate) {
+        State.NameRow r = findMine(a, actor);
+        if (r == null) return;                                       // absent / not mine -> drop
+        long[] cur = new long[]{ r.leaseExpiry };
+        long[] add = Lease.waterfill(cur, mtp, value, rate);
+        if (add == null) return;                                     // T==0 fail-closed
+        r.leaseExpiry = cur[0] + add[0] * Const.BILLING_UNIT;
+        // renewal is not a set mutation -> no bump (listed/offered still renewable)
+    }
+
+    private void transferName(Action a, Model.TxIn actor, long height) {
+        State.NameRow r = findMine(a, actor);
+        if (r == null || r.st != Const.OWNED) return;                // absent / not mine / locked -> no-op
+        r.owner = a.tTarget.clone(); r.ownerType = Const.P2PKH;      // lease conveys (cosmetic type)
+        st.bumpMut(actor.id, height); st.bumpMut(a.tTarget, height); // a move bumps BOTH parties
+    }
+
+    private void releaseName(Action a, Model.TxIn actor, long height) {
+        State.NameRow r = findMine(a, actor);
+        if (r == null || r.st != Const.OWNED) return;                // absent / not mine / locked -> no-op
+        st.names.remove(State.nameKey(a.name));                      // -> pool, immediately reclaimable
+        st.bumpMut(actor.id, height);
+    }
+
     private void transfer(Action a, Model.TxIn actor, long height) {
         List<String> targets;
         if (!a.selective) {                                           // all: every OWNED (unlocked) name
@@ -284,23 +296,6 @@ final class Fold {
         if (any) st.bumpMut(actor.id, height);                       // RELEASE is a set mutation
     }
 
-    private void decorate(Action a, List<State.Decor> pending) {
-        // parse TLV records [tag:1][len:2 LE][value:len] left->right; overrun fail-closes the rest.
-        byte[] t = a.decTlv;
-        int i = 0;
-        while (i + 3 <= t.length) {
-            int len = (t[i+1] & 0xFF) | ((t[i+2] & 0xFF) << 8);
-            if (i + 3 + len > t.length) break;                       // overrun -> stop (fail-closed)
-            if (pending.size() < Const.PEND_DECOR_MAX) {             // §1 pending-record cap: past 64 drop, parse continues
-                State.Decor rec = new State.Decor();
-                rec.rec = Arrays.copyOfRange(t, i, i + 3 + len);     // FORK-RISK: store full [tag][len][value] verbatim
-                rec.seq = st.nextDecorSeq();
-                pending.add(rec);
-            }
-            i += 3 + len;
-        }
-    }
-
     private void sellTo(Action a, Model.TxIn actor, long mtp) {
         State.NameRow r = st.names.get(State.nameKey(a.name));
         if (r == null || !Arrays.equals(r.owner, actor.id) || r.st != Const.OWNED) return;
@@ -357,12 +352,6 @@ final class Fold {
         for (int i = 0; i < maxBits && i < K; i++)
             if (((flags[i >> 3] >> (i & 7)) & 1) != 0) out.add(set.get(i));
         return out;
-    }
-
-    private boolean ownsAny(byte[] id) {
-        String h = Hex.enc(id);
-        for (State.NameRow r : st.names.values()) if (Hex.enc(r.owner).equals(h)) return true;
-        return false;
     }
 
     static BigInteger depositLeg(BigInteger price, long bps) {

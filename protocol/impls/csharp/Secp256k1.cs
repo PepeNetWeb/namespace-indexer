@@ -2,7 +2,7 @@ using System;
 using System.Numerics;
 using System.Security.Cryptography;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
 /// §4 Strategy B — real secp256k1 (self-rolled, BCL-only). Mirrors impls/c/src/secp256k1.c:

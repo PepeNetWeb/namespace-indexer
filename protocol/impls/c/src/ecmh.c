@@ -28,11 +28,9 @@ static void ru8 (Row *b, uint8_t v)  { rput(b, &v, 1); }
 static void ru32(Row *b, uint32_t v) { uint8_t t[4];  for (int i=0;i<4;i++) t[i]=(uint8_t)(v>>(8*i)); rput(b,t,4); }
 static void ru64(Row *b, uint64_t v) { uint8_t t[8];  for (int i=0;i<8;i++) t[i]=(uint8_t)(v>>(8*i)); rput(b,t,8); }
 static void ri64(Row *b, int64_t v)  { ru64(b, (uint64_t)v); }
-static void ri128(Row *b, __int128 v){ unsigned __int128 u=(unsigned __int128)v; uint8_t t[16];
-                                       for (int i=0;i<16;i++) t[i]=(uint8_t)(u>>(8*i)); rput(b,t,16); }
 
 // domain tags — second-preimage separation between tables.
-enum { TAG_NAME = 0x01, TAG_COMMIT = 0x02, TAG_VOTE = 0x03, TAG_MUT = 0x04, TAG_DECOR = 0x05 };
+enum { TAG_NAME = 0x01, TAG_COMMIT = 0x02, TAG_MUT = 0x04 };
 static const uint8_t ECMH_REC_TAG[6] = { 'E','C','M','H','v','1' };
 
 // acc ← acc + H2C("ECMHv1" ‖ tag ‖ row_bytes).
@@ -45,9 +43,8 @@ static void ecmh_fold_row(uint8_t acc[33], uint8_t tag, const Row *r) {
 }
 
 void sm_state_ecmh(SmState *s, uint8_t out[32]) {
-    uint8_t an[33], ac[33], av[33], am[33], ad[33];
-    secp_ecmh_identity(an); secp_ecmh_identity(ac); secp_ecmh_identity(av);
-    secp_ecmh_identity(am); secp_ecmh_identity(ad);
+    uint8_t an[33], ac[33], am[33];
+    secp_ecmh_identity(an); secp_ecmh_identity(ac); secp_ecmh_identity(am);
 
     for (int i = 0; i < s->n_names; i++) {
         const SmNameRow *r = &s->names[i]; Row b = {{0},0};
@@ -66,29 +63,16 @@ void sm_state_ecmh(SmState *s, uint8_t out[32]) {
         ru32(&b, c->tx_index); ri64(&b, c->commit_time);
         ecmh_fold_row(ac, TAG_COMMIT, &b);
     }
-    for (int i = 0; i < s->n_votes; i++) {
-        const SmVote *v = &s->votes[i]; Row b = {{0},0};
-        rput(&b, v->target, 32); ru32(&b, v->vout); ri128(&b, v->score);
-        ecmh_fold_row(av, TAG_VOTE, &b);
-    }
     for (int i = 0; i < s->n_muts; i++) {
         const SmMut *m = &s->muts[i]; Row b = {{0},0};
         rput(&b, m->owner, 20); ri64(&b, m->height);
         ecmh_fold_row(am, TAG_MUT, &b);
     }
-    for (int i = 0; i < s->n_decors; i++) {
-        const SmDecor *d = &s->decors[i]; Row b = {{0},0};
-        rput(&b, d->txid, 32); ru32(&b, d->vout);
-        ru8(&b, d->rec_len); rput(&b, d->rec, d->rec_len);
-        ecmh_fold_row(ad, TAG_DECOR, &b);
-    }
 
-    // combined = SHA256("ECMHtop1" ‖ the five sub-accumulators ‖ overflow flag).
+    // combined = SHA256("ECMHtop1" ‖ the three sub-accumulators).
     SHA256_CTX h; sha256_init(&h);
     sha256_update(&h, (const uint8_t *)"ECMHtop1", 8);
-    sha256_update(&h, an, 33); sha256_update(&h, ac, 33); sha256_update(&h, av, 33);
-    sha256_update(&h, am, 33); sha256_update(&h, ad, 33);
-    uint8_t of = (uint8_t)(s->overflow_flag ? 1 : 0); sha256_update(&h, &of, 1);
+    sha256_update(&h, an, 33); sha256_update(&h, ac, 33); sha256_update(&h, am, 33);
     sha256_final(&h, out);
 }
 
@@ -104,7 +88,7 @@ int ecmh_cmd(void) {
     struct { const char *label; const uint8_t *pre; int len; } h2c[] = {
         { "empty",  (const uint8_t *)"",          0 },
         { "a",      (const uint8_t *)"a",          1 },
-        { "shib",   (const uint8_t *)"shibpost",   8 },
+        { "pepe",   (const uint8_t *)"pepenet",   7 },
         { "doge",   (const uint8_t *)"doge",       4 },
     };
     uint8_t ff[32]; memset(ff, 0xFF, 32);
@@ -131,7 +115,6 @@ int ecmh_cmd(void) {
         { TAG_NAME,   "\x03" "foo",                 4 },
         { TAG_NAME,   "\x03" "bar",                 4 },
         { TAG_COMMIT, "commitment-blob-32-bytes-xxxxxx", 31 },
-        { TAG_VOTE,   "vote-target-row",            15 },
         { TAG_MUT,    "owner-mutation",             14 },
     };
     int nr = (int)(sizeof recs / sizeof recs[0]);

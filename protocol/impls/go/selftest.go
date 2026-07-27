@@ -37,8 +37,9 @@ func runSelftest() {
 	testFoldScenarios() // the hand-authored fold battery's behavioral asserts
 	testDottedNames()   // §3.1 charset re-pin lock (2026-07-02)
 
-	// empty-state ECMH anchor (cross-impl pinned, §13.2).
+	// empty-state digests (cross-impl pinned, §4 / §13.2).
 	empty := newState()
+	fmt.Printf("empty_state_digest=%s\n", hexstr(must32(empty.stateDigest())))
 	fmt.Printf("empty_state_ecmh=%s\n", hexstr(must32(empty.stateEcmh())))
 
 	if failures == 0 {
@@ -297,8 +298,7 @@ func testFoldScenarios() {
 		scReleaseSkipLocked, scSellWindowAddform, scOpenMarketCascade,
 		scReserveValueCollision, scReserveOptionTheft, scDirectedSellToPay,
 		scDirectedStrangerDrop, scASAttribution, scTradeSwap, scTradeSameBlockAntirug,
-		scDecorateBind, scDecorateOrphan, scVoteI128, scLapseVsRenewSameBlock,
-		scMTPMedian,
+		scLapseVsRenewSameBlock, scMTPMedian,
 	} {
 		fn()
 	}
@@ -307,10 +307,8 @@ func testFoldScenarios() {
 	scOracleSubsampleFloor()
 }
 
-// testDottedNames locks the §3.1 charset re-pin (2026-07-07): [a-z0-9-] — a DNS
-// label, lowercased. '.'/'_' dropped, '-' added (supersedes the 2026-07-02 dot
-// rule). No structural rules; hyphen and a 32-byte name are valid, '.'/'_'/
-// uppercase/comma/33-byte are not.
+// testDottedNames locks §3.1: charset [a-z0-9-], 1..32 + structural rejects
+// (leading/trailing hyphen, `--` at positions 3–4 / xn--).
 func testDottedNames() {
 	A := idOf(0xAA, 0)
 	check(validName([]byte("shib-p2p")), "hyphen name valid")
@@ -320,6 +318,9 @@ func testDottedNames() {
 	check(!validName([]byte("shib_p2p")), "underscore now invalid")
 	check(!validName([]byte("Shib-p2p")), "uppercase still invalid")
 	check(!validName([]byte("a,b")), "comma still invalid (TRADE pair split relies on it)")
+	check(!validName([]byte("-a")), "leading hyphen invalid")
+	check(!validName([]byte("a-")), "trailing hyphen invalid")
+	check(!validName([]byte("xn--x")), "ACE prefix (xn--) invalid")
 
 	f := newScFold()
 	f.begin(10, 1000)

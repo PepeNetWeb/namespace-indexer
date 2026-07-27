@@ -8,8 +8,9 @@ import (
 
 // stateDigest serializes the live state into the canonical byte layout pinned by
 // SPEC-conformance.md §4 and returns its SHA-256. All multi-byte ints little-endian;
-// signed values two's-complement LE; the i128 vote score is 16 bytes LE. Collections
-// are emitted in the pinned sort order — NEVER Go map iteration order.
+// signed values two's-complement LE. Magic "SMv1". Tables: names, commits, muts
+// (names-only SM — votes/posts/decorations/overflow removed). Collections are
+// emitted in the pinned sort order — NEVER Go map iteration order.
 func (s *FoldState) stateDigest() [32]byte {
 	var b bytes.Buffer
 	b.WriteString("SMv1")
@@ -57,25 +58,6 @@ func (s *FoldState) stateDigest() [32]byte {
 		wI64(&b, c.commitTime)
 	}
 
-	// votes — sorted by (target[32], vout)
-	votes := make([]*VoteRow, 0, len(s.votes))
-	for _, v := range s.votes {
-		votes = append(votes, v)
-	}
-	sort.Slice(votes, func(i, j int) bool {
-		if c := bytes.Compare(votes[i].target[:], votes[j].target[:]); c != 0 {
-			return c < 0
-		}
-		return votes[i].vout < votes[j].vout
-	})
-	wU32(&b, uint32(len(votes)))
-	for _, v := range votes {
-		b.Write(v.target[:])
-		wU32(&b, v.vout)
-		sc := v.score.bytesLE()
-		b.Write(sc[:])
-	}
-
 	// muts — sorted by owner bytes
 	owners := make([][20]byte, 0, len(s.muts))
 	for o := range s.muts {
@@ -88,31 +70,6 @@ func (s *FoldState) stateDigest() [32]byte {
 	for _, o := range owners {
 		b.Write(o[:])
 		wI64(&b, s.muts[o])
-	}
-
-	// decors — sorted by (txid[32], vout) STABLE (insertion order within a post)
-	decors := append([]DecorRow(nil), s.decors...)
-	sort.SliceStable(decors, func(i, j int) bool {
-		if c := bytes.Compare(decors[i].txid[:], decors[j].txid[:]); c != 0 {
-			return c < 0
-		}
-		if decors[i].vout != decors[j].vout {
-			return decors[i].vout < decors[j].vout
-		}
-		return decors[i].seq < decors[j].seq
-	})
-	wU32(&b, uint32(len(decors)))
-	for _, d := range decors {
-		b.Write(d.txid[:])
-		wU32(&b, d.vout)
-		b.WriteByte(byte(len(d.rec)))
-		b.Write(d.rec)
-	}
-
-	if s.overflow {
-		b.WriteByte(1)
-	} else {
-		b.WriteByte(0)
 	}
 
 	return sha256.Sum256(b.Bytes())

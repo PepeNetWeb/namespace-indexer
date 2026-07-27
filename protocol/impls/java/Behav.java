@@ -2,7 +2,7 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
-// Behavioral vector suite — hand-authored constructions encoding the §6/§7
+// Behavioral vector suite — hand-authored constructions encoding the §5/§7
 // enumerated consensus behaviors. Generator-INDEPENDENT: tests the fold against
 // the spec's stated outcomes directly, so a failure means either a misreading
 // (fix) or a spec contradiction (finding). This is the from-prose consensus check.
@@ -23,9 +23,6 @@ final class Behav {
     static boolean has(State s, String nm) { return s.names.containsKey(nm); }
     static boolean ownedBy(State s, String nm, byte[] id) { byte[] o = owner(s, nm); return o != null && Arrays.equals(o, id); }
     static long mut(State s, byte[] id) { return s.lastMut(id); }
-    static BigInteger voteScore(State s, byte[] target, long vout) {
-        State.Vote v = s.votes.get(Hex.enc(target) + ":" + vout); return v == null ? BigInteger.ZERO : v.score;
-    }
 
     // ---- builders ----------------------------------------------------------
     static byte[] id(int i) { byte[] b = new byte[20]; Arrays.fill(b, (byte) i); return b; }
@@ -40,7 +37,6 @@ final class Behav {
         TxB in(byte[] id, int type, boolean sig) { ins.add(new Model.TxIn(id, type, sig)); return this; }
         TxB act(long value, Action a) { outs.add(Model.TxOut.carrier(bi(value), Wire.encode(a))); return this; }
         TxB raw(long value, byte[] payload) { outs.add(Model.TxOut.carrier(bi(value), payload)); return this; }
-        TxB post(long value, String body) { outs.add(Model.TxOut.carrier(bi(value), nm(body))); return this; }
         TxB spend(long value, byte[] hash) { outs.add(Model.TxOut.spend(bi(value), hash, Const.P2PKH)); return this; }
         TxB spend(long value, byte[] hash, int type) { outs.add(Model.TxOut.spend(bi(value), hash, type)); return this; }
         Model.Tx t() { return new Model.Tx(ins.toArray(new Model.TxIn[0]), outs.toArray(new Model.TxOut[0])); }
@@ -71,10 +67,6 @@ final class Behav {
     static Action pay(byte[] name) { Action a = new Action(); a.op = Const.PAY; a.name = name; return a; }
     static Action as(int idx) { Action a = new Action(); a.op = Const.AS; a.asIndex = idx; return a; }
     static Action trade(int ia, int ib, byte[] nameA, byte[] nameB) { Action a = new Action(); a.op = Const.TRADE; a.idxA = ia; a.idxB = ib; a.nameA = nameA; a.nameB = nameB; return a; }
-    static Action voteUp(byte[] target, long vout) { Action a = new Action(); a.op = Const.VOTE_UP; a.target = target; a.vout = vout; return a; }
-    static Action voteDown(byte[] target, long vout) { Action a = new Action(); a.op = Const.VOTE_DOWN; a.target = target; a.vout = vout; return a; }
-    static Action decorate(byte[] tlv) { Action a = new Action(); a.op = Const.DECORATE; a.decTlv = tlv; return a; }
-    static byte[] tlv(int tag, byte[] val) { Buf b = new Buf(); b.u8(tag).u8(val.length & 0xFF).u8((val.length >> 8) & 0xFF).bytes(val); return b.toBytes(); }
 
     // mtp helper
     static long mtp(long h) { return BASE + h * 1000; }
@@ -87,7 +79,6 @@ final class Behav {
         market();
         directed();
         multiIdentity();
-        decorAndVotes();
         timeTransitions();
         forkVectors();
         oracleVectors();
@@ -430,51 +421,6 @@ final class Behav {
         }
     }
 
-    // ===== decorations & votes =============================================
-    static void decorAndVotes() {
-        // DECORATE binds to next body iff author owns >=1 name
-        {
-            State s = owns("aa", id(1));   // id1 owns a name
-            fold(s, blk(10, mtp(10), R28, new TxB().in(id(1)).act(0, decorate(tlv(7, nm("hi")))).post(5, "hello world")));
-            chk("DECORATE binds to next body for a name-owner", s.decors.size() == 1);
-        }
-        // DECORATE by a nameless author -> records drop (plain post)
-        {
-            State s = new State();
-            fold(s, blk(10, mtp(10), R28, new TxB().in(id(8)).act(0, decorate(tlv(7, nm("hi")))).post(5, "hello")));
-            chk("DECORATE by nameless author dropped", s.decors.isEmpty());
-        }
-        // DECORATE orphan (no following body) -> discarded
-        {
-            State s = owns("aa", id(1));
-            fold(s, blk(10, mtp(10), R28, new TxB().in(id(1)).act(0, decorate(tlv(7, nm("hi"))))));
-            chk("DECORATE orphan (no body) discarded", s.decors.isEmpty());
-        }
-        // AS flushes the DECORATE buffer (orphan)
-        {
-            State s = owns("aa", id(1)); addOwned(s, "bb", id(1));
-            fold(s, blk(10, mtp(10), R28, new TxB().in(id(1)).in(id(1)).act(0, decorate(tlv(7, nm("x")))).act(0, as(1)).post(5, "body")));
-            chk("AS flushes pending DECORATE buffer (records orphaned)", s.decors.isEmpty());
-        }
-        // votes: net score = up - down, burn-weighted
-        {
-            State s = new State();
-            byte[] tgt = Model.synthTxid(3, 0);
-            fold(s, blk(10, mtp(10), R28,
-                    new TxB().in(id(1)).act(7, voteUp(tgt, 0)),
-                    new TxB().in(id(2)).act(3, voteDown(tgt, 0)),
-                    new TxB().in(id(3)).act(5, voteUp(tgt, 0))));
-            chk("vote net score = Σup - Σdown (7-3+5=9)", voteScore(s, tgt, 0).equals(bi(9)));
-        }
-        // zero-weight vote dropped
-        {
-            State s = new State();
-            byte[] tgt = Model.synthTxid(3, 1);
-            fold(s, blk(10, mtp(10), R28, new TxB().in(id(1)).act(0, voteUp(tgt, 0))));
-            chk("zero-weight vote dropped", voteScore(s, tgt, 0).equals(BigInteger.ZERO));
-        }
-    }
-
     // ===== time-triggered transitions ======================================
     static void timeTransitions() {
         // lapse: name lapses when MTP passes lease_expiry, reclaimable
@@ -619,14 +565,6 @@ final class Behav {
             fold(s, blk(8, mtp(8), R28, new TxB().in(id(1)).act(0, transferSel(id(7), 6, new byte[]{0x03}))));
             chk("TV-8 locked-name skip: aa moves to id7, bb (listed) skipped & stays with id1, cc untouched",
                 ownedBy(s, "aa", id(7)) && stOf(s, "bb") == Const.LISTED && ownedBy(s, "bb", id(1)) && ownedBy(s, "cc", id(1)));
-        }
-        // TV-9: DECORATE = one valid record + a sub-3-byte trailing remnant -> record KEPT, tail dropped.
-        {
-            State s = owns("aa", id(1));
-            byte[] payload = Fold.concat(tlv(1, new byte[]{(byte) 0xAA, (byte) 0xBB}),   // [tag=1][len=2][AA BB]=5B
-                                         new byte[]{(byte) 0xCC, (byte) 0xDD});           // +2 stray bytes
-            fold(s, blk(10, mtp(10), R28, new TxB().in(id(1)).act(0, decorate(payload)).post(5, "hello")));
-            chk("TV-9 DECORATE short remnant: prior record kept (1 decor), malformed tail dropped", s.decors.size() == 1);
         }
         // TV-10a: a row LEAVING a market state physically zeros its market fields (fixed-width digest stability).
         {

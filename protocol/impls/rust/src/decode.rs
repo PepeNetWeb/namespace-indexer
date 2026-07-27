@@ -1,21 +1,22 @@
 //! Strict, fail-closed wire decoder (§0/§1/§2 + conformance §9).
-//! A malformed action NEVER panics — it returns Ignore. ACTION | POST | IGNORE.
+//! A malformed action NEVER panics — it returns Ignore. ACTION | IGNORE only
+//! (names-only: posts/votes/decorations are overlay concerns, consensus-ignored).
 
 use crate::types::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    VoteUp { target: [u8; 32], vout: u32 },
-    VoteDown { target: [u8; 32], vout: u32 },
     Commit { commitment: [u8; 32] },
     Claim { salt: [u8; 32], name: Vec<u8> },
     Renew { mode: RenewMode },
     Transfer { target: Hash160, sel: Option<BitmapSel> },
+    RenewName { name: Vec<u8> },
+    TransferName { target: Hash160, name: Vec<u8> },
+    ReleaseName { name: Vec<u8> },
     Sell { price: u64, window: u32, name: Vec<u8> },
     Reserve { name: Vec<u8> },
     Settle { name: Vec<u8> },
     Release { anchor: i64, flags: Vec<u8> },
-    Decorate { raw: Vec<u8> },
     SellTo { price: u64, buyer: Hash160, name: Vec<u8> },
     Pay { name: Vec<u8> },
     As { index: u8 },
@@ -26,7 +27,7 @@ pub enum Action {
 pub enum RenewMode {
     All,                              // bl == 0
     AllSafe { anchor: i64 },          // bl == 5
-    Selective { anchor: i64, flags: Vec<u8> }, // bl 6..=76
+    Selective { anchor: i64, flags: Vec<u8> }, // bl 6..=BODY_MAX
 }
 
 /// A bitmap selection (anchor + flag bytes), used by TRANSFER selective.
@@ -39,7 +40,6 @@ pub struct BitmapSel {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decoded {
     Action(Action),
-    Post(Vec<u8>),
     Ignore,
 }
 
@@ -63,38 +63,26 @@ fn rd_h5_le(b: &[u8]) -> i64 {
         | ((b[4] as i64) << 32)
 }
 
-/// Top-level demux. `value` is the OP_RETURN output value (for the post burn gate).
-pub fn decode_payload(payload: &[u8], value: u64) -> Decoded {
-    // ACTION prefix test: len>=4 and FF 50 4E + opcode.
+/// Top-level demux. `value` is unused (kept for call-site uniformity); consensus
+/// recognizes only the 0xFF 'P' 'N' + opcode 0x01..0x0C name-action shape.
+pub fn decode_payload(payload: &[u8], _value: u64) -> Decoded {
+    // §1 action recognition: prefix 0xFF 'P' 'N' + opcode 0x01..0x0C.
     if payload.len() >= 4 && payload[0] == 0xFF && payload[1] == 0x50 && payload[2] == 0x4E {
-        return match decode_action(payload[3], &payload[4..]) {
-            Some(a) => Decoded::Action(a),
-            None => Decoded::Ignore, // 0xFF lead is never valid UTF-8 ⇒ never a post
-        };
+        let op = payload[3];
+        if op >= OP_MIN && op <= OP_MAX {
+            if let Some(a) = decode_action(op, &payload[4..]) {
+                return Decoded::Action(a);
+            }
+        }
+        return Decoded::Ignore; // malformed / unknown opcode / overlay band
     }
-    // POST: not action prefix, value>0, len>=1, whole payload strict UTF-8.
-    if value > 0 && !payload.is_empty() && valid_utf8(payload) {
-        return Decoded::Post(payload.to_vec());
-    }
+    // everything else (UTF-8 noise, overlay, empty) → IGNORE
     Decoded::Ignore
 }
 
 fn decode_action(opcode: u8, b: &[u8]) -> Option<Action> {
     let bl = b.len();
     match opcode {
-        OP_VOTE_UP | OP_VOTE_DOWN => {
-            if bl != 36 {
-                return None;
-            }
-            let mut target = [0u8; 32];
-            target.copy_from_slice(&b[..32]);
-            let vout = rd_u32_le(&b[32..36]);
-            Some(if opcode == OP_VOTE_UP {
-                Action::VoteUp { target, vout }
-            } else {
-                Action::VoteDown { target, vout }
-            })
-        }
         OP_COMMIT => {
             if bl != 32 {
                 return None;
@@ -121,7 +109,7 @@ fn decode_action(opcode: u8, b: &[u8]) -> Option<Action> {
             5 => Some(Action::Renew {
                 mode: RenewMode::AllSafe { anchor: rd_h5_le(&b[..5]) },
             }),
-            6..=76 => Some(Action::Renew {
+            6..=BODY_MAX => Some(Action::Renew {
                 mode: RenewMode::Selective {
                     anchor: rd_h5_le(&b[..5]),
                     flags: b[5..].to_vec(),
@@ -130,12 +118,12 @@ fn decode_action(opcode: u8, b: &[u8]) -> Option<Action> {
             _ => None, // bl 1..4 invalid
         },
         OP_TRANSFER => {
-            // all: bl==20 ; selective: 20+anchor5+flags1..51 → bl 26..=76
+            // all: bl==20 ; selective: 20+anchor5+flags1..FLAGS_XFER_MAX → bl 26..=BODY_MAX
             if bl == 20 {
                 let mut t = [0u8; 20];
                 t.copy_from_slice(&b[..20]);
                 Some(Action::Transfer { target: t, sel: None })
-            } else if (26..=76).contains(&bl) {
+            } else if (26..=BODY_MAX).contains(&bl) {
                 let mut t = [0u8; 20];
                 t.copy_from_slice(&b[..20]);
                 let anchor = rd_h5_le(&b[20..25]);
@@ -161,7 +149,7 @@ fn decode_action(opcode: u8, b: &[u8]) -> Option<Action> {
             let window = rd_u32_le(&b[8..12]);
             Some(Action::Sell { price, window, name: name.to_vec() })
         }
-        OP_RESERVE | OP_SETTLE | OP_PAY => {
+        OP_RENEW_NAME | OP_RELEASE_NAME | OP_RESERVE | OP_SETTLE | OP_PAY => {
             // name1..32 → bl 1..=32
             if bl < 1 || bl > 32 {
                 return None;
@@ -171,25 +159,33 @@ fn decode_action(opcode: u8, b: &[u8]) -> Option<Action> {
             }
             let name = b.to_vec();
             Some(match opcode {
+                OP_RENEW_NAME => Action::RenewName { name },
+                OP_RELEASE_NAME => Action::ReleaseName { name },
                 OP_RESERVE => Action::Reserve { name },
                 OP_SETTLE => Action::Settle { name },
                 _ => Action::Pay { name },
             })
         }
+        OP_TRANSFER_NAME => {
+            // target20 + name1..32 → bl 21..=52
+            if bl < 21 || bl > 52 {
+                return None;
+            }
+            let name = &b[20..];
+            if !valid_name(name) {
+                return None;
+            }
+            let mut t = [0u8; 20];
+            t.copy_from_slice(&b[..20]);
+            Some(Action::TransferName { target: t, name: name.to_vec() })
+        }
         OP_RELEASE => {
-            // anchor5 + flags1..71 → bl 6..=76
-            if bl < 6 || bl > 76 {
+            // anchor5 + flags1..FLAGS_MAX → bl 6..=BODY_MAX
+            if bl < 6 || bl > BODY_MAX {
                 return None;
             }
             let anchor = rd_h5_le(&b[..5]);
             Some(Action::Release { anchor, flags: b[5..].to_vec() })
-        }
-        OP_DECORATE => {
-            // bl 0..=80 raw TLV (SM_DEC_MAX); the fold parses records (fail-closed there).
-            if bl > 80 {
-                return None;
-            }
-            Some(Action::Decorate { raw: b.to_vec() })
         }
         OP_SELL_TO => {
             // price8 + buyer20 + name1..32 → bl 29..=60
@@ -237,63 +233,6 @@ fn decode_action(opcode: u8, b: &[u8]) -> Option<Action> {
                 name_b: name_b.to_vec(),
             })
         }
-        _ => None, // unknown opcode (incl. 0x00, 0x10..) → not an action
+        _ => None, // outside 0x01..0x0C
     }
-}
-
-/// Strict RFC-3629 UTF-8: reject overlong, surrogates U+D800..U+DFFF, > U+10FFFF.
-pub fn valid_utf8(b: &[u8]) -> bool {
-    let mut i = 0;
-    let n = b.len();
-    while i < n {
-        let c = b[i];
-        if c < 0x80 {
-            i += 1;
-        } else if c >> 5 == 0b110 {
-            // 2-byte: U+0080..U+07FF
-            if i + 1 >= n || (b[i + 1] & 0xC0) != 0x80 {
-                return false;
-            }
-            let cp = ((c as u32 & 0x1F) << 6) | (b[i + 1] as u32 & 0x3F);
-            if cp < 0x80 {
-                return false; // overlong
-            }
-            i += 2;
-        } else if c >> 4 == 0b1110 {
-            // 3-byte: U+0800..U+FFFF, excluding surrogates
-            if i + 2 >= n || (b[i + 1] & 0xC0) != 0x80 || (b[i + 2] & 0xC0) != 0x80 {
-                return false;
-            }
-            let cp = ((c as u32 & 0x0F) << 12)
-                | ((b[i + 1] as u32 & 0x3F) << 6)
-                | (b[i + 2] as u32 & 0x3F);
-            if cp < 0x800 {
-                return false; // overlong
-            }
-            if (0xD800..=0xDFFF).contains(&cp) {
-                return false; // surrogate
-            }
-            i += 3;
-        } else if c >> 3 == 0b11110 {
-            // 4-byte: U+10000..U+10FFFF
-            if i + 3 >= n
-                || (b[i + 1] & 0xC0) != 0x80
-                || (b[i + 2] & 0xC0) != 0x80
-                || (b[i + 3] & 0xC0) != 0x80
-            {
-                return false;
-            }
-            let cp = ((c as u32 & 0x07) << 18)
-                | ((b[i + 1] as u32 & 0x3F) << 12)
-                | ((b[i + 2] as u32 & 0x3F) << 6)
-                | (b[i + 3] as u32 & 0x3F);
-            if cp < 0x10000 || cp > 0x10FFFF {
-                return false; // overlong or out of range
-            }
-            i += 4;
-        } else {
-            return false; // 0xFF, 0x80-continuation lead, 0xF8+, etc.
-        }
-    }
-    true
 }

@@ -1,4 +1,4 @@
-//! Hand-authored vector battery. Asserts outcomes derived from the prose (§3/§4/§6).
+//! Hand-authored vector battery. Asserts outcomes derived from the prose (§3/§4/§5).
 //! Every boundary the SPEC-RATIONALE.md flags has a probe here.
 
 use crate::attrib::*;
@@ -39,9 +39,6 @@ fn pk_in(a: Hash160) -> Input {
 fn carrier(a: &Action, value: u64) -> Output {
     Output::Carrier { payload: encode_action(a), value }
 }
-fn raw_carrier(payload: Vec<u8>, value: u64) -> Output {
-    Output::Carrier { payload, value }
-}
 fn spend(h: Hash160, v: u64) -> Output {
     Output::Spend { hash160: h, stype: ScriptType::P2pkh, value: v }
 }
@@ -74,7 +71,7 @@ pub fn run() -> bool {
     let mut t = T { pass: 0, fail: 0 };
     crypto_kats(&mut t);
     roundtrips(&mut t);
-    utf8_cases(&mut t);
+    decode_cases(&mut t);
     fold_vectors(&mut t);
     dotted_names(&mut t);
     oracle_kats(&mut t);
@@ -100,7 +97,7 @@ fn ecmh_state_kats(t: &mut T) {
     t.check("ECMH empty-state stable", ea == eb);
     t.check(
         "ECMH empty-state cross-impl anchor",
-        hex32(&ea) == "053f61e599084024c9acd6a3127057ea5de001829225590ea2b175c5506b5c55",
+        hex32(&ea) == "3ecfc3d7fa5be56fc513dde926bdf105c92accbf07088e702f85856fa69d10e0",
     );
 
     // ECMH induces the SAME equality relation as state_digest. Build the same
@@ -154,6 +151,8 @@ fn oracle_kats(t: &mut T) {
     t.check("oracle under-claim → 0", fee_per_byte(SUBSIDY_FLAT - 5, SUBSIDY_FLAT, 100) == 0);
     // floor division per block
     t.check("oracle floor div", fee_per_byte(SUBSIDY_FLAT + 1000, SUBSIDY_FLAT, 9) == 111);
+    // block_bytes == 0 → divisor pinned to 1 (block still participates), NOT fee-per-byte 0
+    t.check("oracle zero bytes → divisor 1", fee_per_byte(SUBSIDY_FLAT + 5000, SUBSIDY_FLAT, 0) == 5000);
     // participant median × REF_SIZE: zeros are filtered (non-participants), median over P only
     let mut w = vec![2u64; 1_001];
     w.extend(std::iter::repeat(0u64).take(500)); // zero-fee blocks do not participate
@@ -214,7 +213,7 @@ fn oracle_kats(t: &mut T) {
 }
 
 fn replay_kats(t: &mut T) {
-    // The fold is a pure function of the block sequence (§6 reorg model): two independent
+    // The fold is a pure function of the block sequence (§5 reorg model): two independent
     // folds of the same chain produce the same digest; clear() leaves no residue.
     let a = ident(1);
     let s = [3u8; 32];
@@ -306,8 +305,6 @@ fn hex20(d: &[u8; 20]) -> String {
 
 fn roundtrips(t: &mut T) {
     let acts = vec![
-        Action::VoteUp { target: [7u8; 32], vout: 3 },
-        Action::VoteDown { target: [9u8; 32], vout: 0 },
         Action::Commit { commitment: [4u8; 32] },
         Action::Claim { salt: [1u8; 32], name: b"alice".to_vec() },
         Action::Renew { mode: RenewMode::All },
@@ -323,7 +320,6 @@ fn roundtrips(t: &mut T) {
         Action::Pay { name: b"car".to_vec() },
         Action::As { index: 2 },
         Action::Trade { idx_a: 0, idx_b: 1, name_a: b"a".to_vec(), name_b: b"bb".to_vec() },
-        Action::Decorate { raw: decor_record(0x01, b"hi") },
     ];
     for a in &acts {
         let enc = encode_action(a);
@@ -332,32 +328,70 @@ fn roundtrips(t: &mut T) {
     }
 }
 
-fn utf8_cases(t: &mut T) {
-    // valid post needs value>0
-    t.check("post valid utf8", matches!(decode_payload(b"hello world", 1), Decoded::Post(_)));
-    t.check("post zero value -> ignore", matches!(decode_payload(b"hello", 0), Decoded::Ignore));
-    // 0xFF lead never a post
+fn decode_cases(t: &mut T) {
+    // names-only demux: bare UTF-8 is IGNORE (no posts projection)
+    t.check("utf8 noise ignore", matches!(decode_payload(b"hello world", 1), Decoded::Ignore));
+    t.check("zero-value noise ignore", matches!(decode_payload(b"hello", 0), Decoded::Ignore));
+    // 0xFF lead with unknown opcode
     t.check("0xff lead ignore", matches!(decode_payload(&[0xFF, 0x50, 0x4E, 0xEE], 1), Decoded::Ignore));
-    // invalid utf8 tail
-    t.check("invalid utf8 tail", matches!(decode_payload(&[b'a', 0xC0, 0x00], 1), Decoded::Ignore));
-    // surrogate
-    t.check("surrogate reject", matches!(decode_payload(&[0xED, 0xA0, 0x80], 1), Decoded::Ignore));
-    // overlong 2-byte
-    t.check("overlong reject", matches!(decode_payload(&[0xC0, 0x80], 1), Decoded::Ignore));
+    // overlay band opcode
+    t.check("overlay band ignore", matches!(decode_payload(&[0xFF, 0x50, 0x4E, 0xD6, 0x00], 1), Decoded::Ignore));
     // uppercase name in CLAIM -> ignore (reject, never fold)
     let mut bad = vec![0xFF, 0x50, 0x4E, OP_CLAIM];
     bad.extend_from_slice(&[0u8; 32]);
     bad.extend_from_slice(b"Alice");
     t.check("uppercase name reject", matches!(decode_payload(&bad, 0), Decoded::Ignore));
+    // structural name rejects
+    let mut lead = vec![0xFF, 0x50, 0x4E, OP_CLAIM];
+    lead.extend_from_slice(&[0u8; 32]);
+    lead.extend_from_slice(b"-a");
+    t.check("leading hyphen reject", matches!(decode_payload(&lead, 0), Decoded::Ignore));
+    let mut ace = vec![0xFF, 0x50, 0x4E, OP_CLAIM];
+    ace.extend_from_slice(&[0u8; 32]);
+    ace.extend_from_slice(b"xn--x");
+    t.check("ACE prefix reject", matches!(decode_payload(&ace, 0), Decoded::Ignore));
     // RENEW length 5..8 (bl 1..4) invalid
     let r7 = vec![0xFF, 0x50, 0x4E, OP_RENEW, 0x00, 0x00, 0x00]; // bl=3
     t.check("renew bl3 invalid", matches!(decode_payload(&r7, 0), Decoded::Ignore));
+
+    // §6 pinned carrier ceiling: flags at the exact consensus caps decode;
+    // one byte past the ceiling is IGNORE (fail-closed).
+    let mut wide = vec![0xFF, 0x50, 0x4E, OP_RENEW];
+    wide.extend_from_slice(&[7, 0, 0, 0, 0]); // anchor5
+    wide.extend((0..FLAGS_MAX).map(|i| (i * 7 + 1) as u8));
+    t.check("renew at cap is exactly CARRIER_MAX bytes", wide.len() == CARRIER_MAX);
+    t.check(
+        "renew-selective decodes with all 9987 flag bytes",
+        matches!(&decode_payload(&wide, 0),
+                 Decoded::Action(Action::Renew { mode: RenewMode::Selective { flags, .. } })
+                 if flags.len() == FLAGS_MAX),
+    );
+    wide.push(0x00);
+    t.check("one byte past the L1 ceiling ignore", matches!(decode_payload(&wide, 0), Decoded::Ignore));
+    let mut xfer = vec![0xFF, 0x50, 0x4E, OP_TRANSFER];
+    xfer.extend_from_slice(&[0xBB; 20]);
+    xfer.extend_from_slice(&[7, 0, 0, 0, 0]);
+    xfer.extend(std::iter::repeat(0x01).take(FLAGS_XFER_MAX));
+    t.check(
+        "transfer-selective decodes at FLAGS_XFER_MAX",
+        matches!(&decode_payload(&xfer, 0),
+                 Decoded::Action(Action::Transfer { sel: Some(BitmapSel { flags, .. }), .. })
+                 if flags.len() == FLAGS_XFER_MAX),
+    );
+    xfer.push(0x00);
+    t.check("transfer flags past the cap ignore", matches!(decode_payload(&xfer, 0), Decoded::Ignore));
+    let mut rel = vec![0xFF, 0x50, 0x4E, OP_RELEASE];
+    rel.extend_from_slice(&[3, 0, 0, 0, 0]);
+    rel.extend(std::iter::repeat(0xFF).take(FLAGS_MAX));
+    t.check(
+        "release decodes at FLAGS_MAX",
+        matches!(&decode_payload(&rel, 0),
+                 Decoded::Action(Action::Release { flags, .. }) if flags.len() == FLAGS_MAX),
+    );
     // TRADE two commas -> ignore
     let mut tr = vec![0xFF, 0x50, 0x4E, OP_TRADE, 0, 1];
     tr.extend_from_slice(b"a,b,c");
     t.check("trade two commas", matches!(decode_payload(&tr, 0), Decoded::Ignore));
-    // multi-push is not the decoder's concern (single payload), but a trailing-opcode style
-    // payload that's just bytes is handled by caller; we only see the lone push here.
 }
 
 fn fold_vectors(t: &mut T) {
@@ -526,10 +560,8 @@ fn fold_vectors(t: &mut T) {
         t.check("T13 buyer pay conveys", c.st.names.get(b"dir".as_slice()).map(|r| r.owner == b && r.st == St::Owned).unwrap_or(false));
     }
 
-    // T14: AS repoint + OOB drop
+    // T14: AS repoint + OOB drop — AS 1 then CLAIM mints to vin[1]=b
     {
-        // tx with vin0=a, vin1=b. AS 1 -> VOTE attributed to b. (votes have no identity in state,
-        // but a POST decoration gate depends on author owning a name.) Use AS to author a CLAIM as b.
         let mut c = Chain::new();
         let cm = commitment_of(&s, b"asn", &b);
         c.block(0, 100, 28, vec![Tx { inputs: vec![pk_in(a), pk_in(b)], outputs: vec![carrier(&Action::Commit { commitment: cm }, 0)] }]);
@@ -595,35 +627,21 @@ fn fold_vectors(t: &mut T) {
         t.check("T15 same-block anti-rug drops trade", rug_closed);
     }
 
-    // T16: DECORATE gate (owner -> stored; orphan -> dropped)
-    {
-        let mut c = mint_chain(a, b"deco", &s);
-        let rec = decor_record(0x01, b"reply");
-        // DECORATE then POST by a (owns a name) -> records bound
-        c.block(2, 300, 28, vec![Tx {
-            inputs: vec![pk_in(a)],
-            outputs: vec![raw_carrier(encode_action(&Action::Decorate { raw: rec.clone() }), 0), raw_carrier(b"body".to_vec(), 1)],
-        }]);
-        t.check("T16 decoration bound", c.st.decors.iter().any(|d| !d.records.is_empty()));
-        // orphan DECORATE (no body) -> dropped
-        let before = c.st.decors.len();
-        c.block(3, 400, 28, vec![Tx { inputs: vec![pk_in(a)], outputs: vec![raw_carrier(encode_action(&Action::Decorate { raw: rec.clone() }), 0)] }]);
-        t.check("T16 orphan decorate dropped", c.st.decors.len() == before);
-    }
-
-    // T17: votes accumulate, zero-weight dropped
+    // T16: no per-tx count cap — 17 COMMIT carriers all record
     {
         let mut c = Chain::new();
-        let target = [55u8; 32];
-        c.block(0, 100, 28, vec![
-            Tx { inputs: vec![pk_in(a)], outputs: vec![carrier(&Action::VoteUp { target, vout: 0 }, 100)] },
-            Tx { inputs: vec![pk_in(b)], outputs: vec![carrier(&Action::VoteDown { target, vout: 0 }, 30)] },
-            Tx { inputs: vec![pk_in(a)], outputs: vec![carrier(&Action::VoteUp { target, vout: 0 }, 0)] }, // dropped
-        ]);
-        t.check("T17 vote net score", c.st.votes.get(&(target, 0u32)).copied() == Some(70));
+        let outs: Vec<Output> = (0..17)
+            .map(|i| {
+                let mut commitment = [0u8; 32];
+                commitment[0] = i as u8;
+                carrier(&Action::Commit { commitment }, 0)
+            })
+            .collect();
+        c.block(0, 100, 28, vec![Tx { inputs: vec![pk_in(a)], outputs: outs }]);
+        t.check("T16 17 COMMITs all record", c.st.commits.len() == 17);
     }
 
-    // T18: out-of-bounds bitmap bit ignored, not fatal (RENEW with extra bits)
+    // T17: out-of-bounds bitmap bit ignored, not fatal (RENEW with extra bits)
     {
         let mut c = mint_long(a, b"bit", &s, 50);
         // RENEW selective with flags addressing bit0 (the one owned name) + bit7 (OOB) set
@@ -633,14 +651,12 @@ fn fold_vectors(t: &mut T) {
             outputs: vec![carrier(&Action::Renew { mode: RenewMode::Selective { anchor: 1, flags: vec![0x81] } }, 10)],
         }]);
         let after = c.st.names.get(b"bit".as_slice()).unwrap().lease_expiry;
-        t.check("T18 OOB bit ignored, renew applied", after > before);
+        t.check("T17 OOB bit ignored, renew applied", after > before);
     }
 }
 
-/// Charset re-pin (2026-07-07): [a-z0-9-] — a DNS label, lowercased. '.' and '_' dropped, '-'
-/// added (supersedes the 2026-07-02 dot rule). No structural rules; hyphen and a 32-byte name are
-/// valid, '.'/'_'/uppercase/comma/33-byte are not. Pins the OUTCOME behind scenario 52 (its digest
-/// only proves agreement). Mirrors impls/c test_dotted_names.
+/// Charset + structural rules (§3.1): [a-z0-9-], 1..32; no leading/trailing hyphen;
+/// no `--` at positions 3–4. Pins the OUTCOME behind scenario 52 / 52b.
 fn dotted_names(t: &mut T) {
     t.check("hyphen name valid", valid_name(b"shib-p2p"));
     t.check("32-byte name valid", valid_name(b"abcdefghijklmnopqrstuvwxyz0123ab"));
@@ -649,6 +665,9 @@ fn dotted_names(t: &mut T) {
     t.check("underscore now invalid", !valid_name(b"shib_p2p"));
     t.check("uppercase still invalid", !valid_name(b"Shib-p2p"));
     t.check("comma still invalid (TRADE pair split relies on it)", !valid_name(b"a,b"));
+    t.check("leading hyphen invalid", !valid_name(b"-a"));
+    t.check("trailing hyphen invalid", !valid_name(b"a-"));
+    t.check("ACE prefix (xn--) invalid", !valid_name(b"xn--x"));
 
     // Fold outcome: commit+claim 'shib-p2p' (salt 0x71) and 'shib.p2p' (salt 0x74) from the
     // same author — the hyphen claim mints, the dotted claim drops (exactly 1 name total).

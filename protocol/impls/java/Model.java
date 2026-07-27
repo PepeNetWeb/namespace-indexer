@@ -1,6 +1,6 @@
 import java.math.BigInteger;
 
-// Abstract transaction / block model for the fold modes. Per §5/§6 the fold
+// Abstract transaction / block model for the fold modes. Per §5/§5 the fold
 // consumes already-resolved identities (the raw-tx §4 attribution lives in
 // Attrib.java, a separate layer). Identities are bare hash160 + a script type.
 final class Model {
@@ -34,7 +34,7 @@ final class Model {
 
     static final class Block {
         final long height;
-        final long mtp;        // MTP(height) = median(timestamp[H-11..H-1]) (driver-computed, §6)
+        final long mtp;        // MTP(height) = median(timestamp[H-11..H-1]) (driver-computed, §5)
         final BigInteger rate; // koinu per name per LEASE_QUANTUM (drawn in soak; oracle-computed in §3.4 scenario)
         final Tx[] txs;
         Block(long height, long mtp, BigInteger rate, Tx[] txs) {

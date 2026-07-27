@@ -1,6 +1,6 @@
-# pepenet protocol — TypeScript reference SM
+# PepeNet namespace — TypeScript reference SM
 
-An independent TypeScript implementation of the pepenet protocol state machine, built from the
+An independent TypeScript implementation of the PepeNet namespace state machine, built from the
 specification (`docs/protocol-spec.md` + `protocol-sm/SPEC-conformance.md`). It is part of the
 cross-language conformance suite: each implementation is written independently and they
 cross-validate the spec's consensus-critical outcomes. `impls/c` is the normative reference; the
@@ -14,29 +14,30 @@ No external dependencies. SHA-256, RIPEMD-160, and SplitMix64 are self-rolled.
 Requires **Node ≥ 23.6** (native TypeScript type-stripping — no build step, no `tsc`, no `ts-node`):
 
 ```sh
-node sm.ts selftest              # the 178-assertion hand-authored conformance battery (the gate)
+node sm.ts selftest              # hand-authored conformance battery (the gate)
 node sm.ts digest                # canonical §4 state-digest dump for a fixed scenario
 node sm.ts prng 0 5              # SplitMix64 (pinned: seed=0 → 0xE220A8397B1DCDAF)
 node sm.ts random 42 1000        # this impl's OWN generator (NON-GOLDEN — see below) → input+state digests
+node sm.ts forkvectors           # consensus-fork differential vectors
 ```
 
-`selftest` exits non-zero on any failure. Current status: **178 passed, 0 failed.**
+`selftest` exits non-zero on any failure. Names-only state machine (opcodes 0x01–0x0C; no votes/decorate/posts in consensus).
 
 ## What's implemented (the whole consensus surface)
 
 | file | surface | spec |
 |------|---------|------|
 | `src/sha256.ts`, `src/ripemd160.ts`, `src/prng.ts`, `src/utf8.ts` | self-rolled primitives (KAT-checked) | conf §1/§13 |
-| `src/decode.ts` | strict fail-closed wire decoder; single-push carrier; per-opcode parse → ACTION/POST/IGNORE | §1/§2/§9 |
+| `src/decode.ts` | strict fail-closed wire decoder; single-push carrier; ACTION/IGNORE demux (names-only) | §1/§2/§9 |
 | `src/attribution.ts` | strict-DER+low-S, pubkey canonical, P2PKH + P2SH-multisig templates, in-order scan, legacy sighash **incl. FindAndDelete**, RIPEMD-160 identity; **injected** curve stubs | §4/§13 |
-| `src/oracle.ts` | stateless fee oracle (signed clamp, floor div, odd-window median) + MTP | §3.4/§6 |
-| `src/fold.ts` | the fold: commit→claim priority, water-fill, open + directed market cascade, anchor-guarded bitmaps, AS/TRADE, DECORATE, votes, pre-block transitions, **canonical SHA-256 digest** | §3/§6, conf §4 |
+| `src/oracle.ts` | stateless fee oracle (signed clamp, floor div, odd-window median) + MTP | §3.4/§5 |
+| `src/fold.ts` | the fold: commit→claim priority, water-fill, open + directed market cascade, anchor-guarded bitmaps, AS/TRADE, pre-block transitions, **canonical SHA-256 digest** (names+commits+muts) | §3/§6, conf §4 |
 | `src/selftest.ts` | exhaustive hand-authored battery (every rule + boundary) | — |
 | `src/gen.ts`, `sm.ts` | own (non-golden) generator + CLI | conf §5 |
 
 ## Value-path policy (TypeScript-specific, consensus-critical)
 
-Every koinu / price / vote-weight / lease / time / height value is **`bigint`** from the first parsed
+Every koinu / price / lease / time / height value is **`bigint`** from the first parsed
 byte (`rdLE → bigint`) through the fold to serialization. `number` is used **only** for genuinely
 ≤32-bit, non-value quantities (`vout`, `tx_index`, array indices, counts, single bytes, UTF-8 code
 points). A stray `number` on the value path makes JS **throw** on a `BigInt + number` mix — fail-loud,

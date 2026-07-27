@@ -1,6 +1,6 @@
-// The deterministic fold state machine (protocol-spec.md §3/§6) + canonical state digest
+// The deterministic fold state machine (protocol-spec.md §3/§5) + canonical state digest
 // (SPEC-conformance.md §4). This is the consensus heart. It consumes an ABSTRACT tx model with
-// already-resolved identities (the §6 fold "is fed an already-resolved identity"; the real §4
+// already-resolved identities (the §5 fold "is fed an already-resolved identity"; the real §4
 // byte-logic lives in attribution.ts). Carrier bytes are interpreted via decode.ts.
 //
 // VALUE-PATH POLICY (TS specific, brief + conformance §2): every koinu/price/weight/time/lease
@@ -10,7 +10,7 @@
 // `number` on the value path makes JS THROW on a BigInt+number mix — fail-loud, never silent round.
 import type { Bytes } from "./bytes.ts";
 import {
-  concat, u8, u32le, u64le, i64le, i128le, leBytes, cmpBytes, eqBytes, hex,
+  concat, u8, u32le, u64le, i64le, leBytes, cmpBytes, eqBytes, hex,
 } from "./bytes.ts";
 import { sha256 } from "./sha256.ts";
 import { ecmhIdentity, ecmhHash, ecmhAdd } from "./secp256k1.ts";
@@ -53,9 +53,6 @@ type NameRow = {
   reserveExpiry: bigint;
 };
 type Commit = { commitment: Bytes; commitHeight: bigint; txIndex: number; commitTime: bigint };
-type Decor = { txid: Bytes; vout: number; rec: Bytes };
-
-const PEND_DECOR_MAX = 64; // §1 pending-record cap (SM_MAX_PEND_DECOR, pinned all 7 impls)
 
 const nk = (name: Bytes): string => hex(name); // names are [a-z0-9-] so raw bytes are the canon key
 const ik = (id: Bytes): string => hex(id);
@@ -69,10 +66,7 @@ export class Fold {
   names = new Map<string, NameRow>();
   ownerNames = new Map<string, Set<string>>(); // ownerHex → set of nameKeys (live reverse index)
   commits: Commit[] = [];
-  votes = new Map<string, { target: Bytes; vout: number; score: bigint }>();
   muts = new Map<string, { owner: Bytes; height: bigint }>();
-  decors: Decor[] = [];
-  overflow = 0;
 
   blockTimestamps: bigint[] = []; // height → timestamp (for reference; MTP injected per block)
   activationHeight: bigint;
@@ -89,7 +83,7 @@ export class Fold {
 
   clear(): void {
     this.names.clear(); this.ownerNames.clear(); this.commits = [];
-    this.votes.clear(); this.muts.clear(); this.decors = []; this.overflow = 0;
+    this.muts.clear();
     this.claimScratch.clear();
   }
 
@@ -120,10 +114,6 @@ export class Fold {
     // mut height stamped to the connecting/confirm height (curHeight) — monotonic high-water mark.
     this.muts.set(ik(id), { owner: id, height: this.curHeight });
   }
-  private _ownsAName(id: Bytes): boolean {
-    const s = this.ownerNames.get(ik(id));
-    return !!s && s.size > 0;
-  }
   private _ownedListSorted(id: Bytes): NameRow[] {
     const s = this.ownerNames.get(ik(id));
     if (!s) return [];
@@ -142,7 +132,7 @@ export class Fold {
     this.preBlock();
   }
 
-  // §6 time-triggered transitions, BEFORE the block's txs, in reserve→offer→lease type order,
+  // §5 time-triggered transitions, BEFORE the block's txs, in reserve→offer→lease type order,
   // then COMMIT_EXPIRY pruning. Bounds are EXCLUSIVE (owned iff MTP < lease_expiry); the commit
   // window is INCLUSIVE (pruned only once MTP > commit_time + COMMIT_EXPIRY).
   private preBlock(): void {
@@ -173,33 +163,26 @@ export class Fold {
     this.commits = this.commits.filter((c) => !(mtp > c.commitTime + COMMIT_EXPIRY));
   }
 
-  // ─── tx processing (§6 inner loop) ───────────────────────────────────────────────────────────
+  // ─── tx processing (§5 inner loop) ───────────────────────────────────────────────────────────
   applyTx(tx: FoldTx, txIndex: number): void {
     let actor: Actor = resolve(tx.inputs[0]); // default acting identity = vin[0] (Rule 1)
-    let pending: Bytes[] = []; // pending DECORATE records buffer
     const consumed = new Set<number>(); // spendable outputs consumed by market ops (per-tx)
 
     for (const o of tx.carriers) {
       const dec = decodePayload(o.payload, o.value);
-      if (dec.kind === "IGNORE") continue; // ⊥ / malformed / non-UTF8 zero-value → ignore
-      if (dec.kind === "POST") {
-        this.handlePost(actor, txIndex, o.vout, pending);
-        pending = [];
-        continue;
-      }
+      if (dec.kind !== "ACTION") continue; // IGNORE (bare UTF-8, overlay, malformed) → skip
       const act = dec.action;
-      // §3.0 forward-only gate: gated opcodes (0x03..0x0F) below activation are dropped.
-      if (act.op >= OP.COMMIT && this.curHeight < this.activationHeight) continue;
+      // §3.0 forward-only gate: ALL ops gate at one ACTIVATION_HEIGHT.
+      if (this.curHeight < this.activationHeight) continue;
 
       if (act.op === OP.AS) {
-        pending = []; // AS flushes the pending DECORATE buffer (orphan, §3.10)
         const k = (act as { index: number }).index;
         actor = resolve(tx.inputs[k]); // ⊥ if OOB or fails §4/SIGHASH_ALL → segment drops
         continue;
       }
 
       // TRADE is attributed to its OWN named inputs vin[idxA]/vin[idxB], NOT the acting identity
-      // (§3.10/§6): it dispatches regardless of whether the acting identity verified, and never
+      // (§3.10/§5): it dispatches regardless of whether the acting identity verified, and never
       // consults `actor`, so it MUST run before the acting-identity drop gate below. (Requiring a
       // verified `actor` here would drop trades the spec settles — the M9 fork.)
       if (act.op === OP.TRADE) { this.doTrade(act, tx); continue; }
@@ -207,42 +190,15 @@ export class Fold {
       // run §4 verification on the acting identity (memoized trivially here)
       if (actor === null) continue; // ⊥ actor → drop this action
 
-      this.dispatch(act, actor, tx, o, txIndex, consumed, pending);
+      this.dispatch(act, actor, tx, o, txIndex, consumed);
     }
-    // end of tx: any pending DECORATE records with no following body are orphaned & discarded (§1)
-  }
-
-  private handlePost(actor: Actor, txIndex: number, vout: number, pending: Bytes[]): void {
-    // author = §4(actor) or ANONYMOUS. Bind buffered decorations iff author owns ≥1 name (§1).
-    if (actor !== null && pending.length > 0 && this._ownsAName(actor.id)) {
-      const txid = this.syntheticTxid(txIndex);
-      for (const rec of pending) this.decors.push({ txid, vout, rec });
-    }
-    // buffer is cleared by the caller after every body (bound or not)
-  }
-
-  private syntheticTxid(txIndex: number): Bytes {
-    // conformance §3: u64_le(height) ‖ u32_le(txindex) ‖ 20 zero bytes = 32 bytes
-    return concat(u64le(this.curHeight), u32le(txIndex), Z20);
   }
 
   private dispatch(
     act: Action, actor: { id: Bytes; type: number }, tx: FoldTx, o: FoldCarrier,
-    txIndex: number, consumed: Set<number>, pending: Bytes[],
+    txIndex: number, consumed: Set<number>,
   ): void {
     switch (act.op) {
-      case OP.VOTE_UP:
-      case OP.VOTE_DOWN: {
-        if (o.value < DUST_FLOOR) return; // zero/under-floor weight carries no signal → drop
-        const key = hex(act.target) + ":" + act.vout;
-        let v = this.votes.get(key);
-        if (!v) { v = { target: act.target.slice(), vout: act.vout, score: 0n }; this.votes.set(key, v); }
-        v.score += act.op === OP.VOTE_UP ? o.value : -o.value;
-        // i128 fail-loud overflow guard (bigint never wraps; flag if out of signed-128 range)
-        const LIM = 1n << 127n;
-        if (v.score >= LIM || v.score < -LIM) this.overflow = 1;
-        return;
-      }
       case OP.COMMIT: {
         this.commits.push({
           commitment: act.commitment.slice(), commitHeight: this.curHeight,
@@ -258,6 +214,12 @@ export class Fold {
         return this.doTransfer(act, actor);
       case OP.RELEASE:
         return this.doRelease(act, actor);
+      case OP.RENEW_NAME:
+        return this.doRenewName(act, actor, o);
+      case OP.TRANSFER_NAME:
+        return this.doTransferName(act, actor);
+      case OP.RELEASE_NAME:
+        return this.doReleaseName(act, actor);
       case OP.SELL:
         return this.doSell(act, actor);
       case OP.SELL_TO:
@@ -269,8 +231,6 @@ export class Fold {
       case OP.PAY:
         return this.doPay(act, actor, tx, consumed);
       // OP.TRADE is intercepted in applyTx (before the acting-identity gate) — it never reaches here.
-      case OP.DECORATE:
-        return this.doDecorate(act, pending);
     }
   }
 
@@ -416,6 +376,41 @@ export class Fold {
     // RENEW does NOT bump last_set_mutation_height (no set/ordering change, §3.5)
   }
 
+  // ─── the by-name forms (§3.5): singleton siblings of the bitmap ops ─────────────────────────
+  // A name string is its own position-independent address into the owned set — no anchor, no
+  // anchor guard. The name MUST be the actor's (the owner stays the seller while
+  // LISTED/OFFERED/RESERVED); else drop.
+  private _findMine(name: Bytes, actorId: Bytes): NameRow | null {
+    const r = this.names.get(nk(name));
+    if (!r || !eqBytes(r.owner, actorId)) return null;
+    return r;
+  }
+
+  private doRenewName(act: Extract<Action, { op: typeof OP.RENEW_NAME }>, actor: { id: Bytes; type: number }, o: FoldCarrier): void {
+    const r = this._findMine(act.name, actor.id);
+    if (!r) return;
+    const T = this.leaseDaysTotal(o.value);
+    if (T < 1n) return; // fail-closed at T=0 (listed/offered names still renewable)
+    const adds = this.waterfill([r], T);
+    r.leaseExpiry += (adds.get(nk(r.name)) ?? 0n) * BILLING_UNIT;
+    // renewal is not a set mutation → no bump
+  }
+
+  private doTransferName(act: Extract<Action, { op: typeof OP.TRANSFER_NAME }>, actor: { id: Bytes; type: number }): void {
+    const r = this._findMine(act.name, actor.id);
+    if (!r || r.st !== ST.OWNED) return; // absent / not mine / locked → no-op, no bump
+    this._chown(nk(r.name), act.target.slice()); // lease conveys
+    this._bump(actor.id); // a move bumps BOTH parties (self-target included)
+    this._bump(act.target);
+  }
+
+  private doReleaseName(act: Extract<Action, { op: typeof OP.RELEASE_NAME }>, actor: { id: Bytes; type: number }): void {
+    const r = this._findMine(act.name, actor.id);
+    if (!r || r.st !== ST.OWNED) return; // absent / not mine / locked → no-op, no bump
+    this._remove(nk(r.name)); // → pool, immediately reclaimable
+    this._bump(actor.id);
+  }
+
   // ─── TRANSFER (§3.5/§3.6) ────────────────────────────────────────────────────────────────────
   private doTransfer(act: Extract<Action, { op: typeof OP.TRANSFER }>, actor: { id: Bytes; type: number }): void {
     const owned = this._ownedListSorted(actor.id);
@@ -429,7 +424,9 @@ export class Fold {
     let moved = false;
     for (const r of targeted) {
       if (r.st !== ST.OWNED) continue; // locked (LISTED/OFFERED/RESERVED) → SKIP, not fatal (§3.5)
-      if (eqBytes(r.owner, act.target)) continue; // self-transfer no-op
+      // A self-transfer (target == current owner) is still a real move: C/Go/Py
+      // chown-to-self and count it, bumping last_set_mutation_height. Do NOT skip
+      // it here — skipping forks the mut table against the other three impls.
       this._chown(nk(r.name), act.target.slice());
       // lease conveys (lease_expiry unchanged)
       moved = true;
@@ -565,24 +562,8 @@ export class Fold {
     this._bump(A.id); this._bump(B.id); // bump BOTH parties' mutation heights (§3.10)
   }
 
-  // ─── DECORATE (§1) ────────────────────────────────────────────────────────────────────────
-  private doDecorate(act: Extract<Action, { op: typeof OP.DECORATE }>, pending: Bytes[]): void {
-    // parse TLV records left→right, fail-closed: a len overrun OR a trailing remnant < 3-byte
-    // header drops the malformed tail; every fully-parsed record before it is kept & buffered.
-    const body = act.body;
-    let i = 0;
-    while (i < body.length) {
-      if (i + 3 > body.length) break; // remnant shorter than [tag:1][len:2] header → stop
-      const len = body[i + 1] | (body[i + 2] << 8); // len:2 LE
-      const end = i + 3 + len;
-      if (end > body.length) break; // value overruns → stop (drop tail)
-      // §1 pending-record cap: buffer only the first PEND_DECOR_MAX records; drop further, keep parsing.
-      if (pending.length < PEND_DECOR_MAX) pending.push(body.subarray(i, end).slice()); // FULL record [tag][len:2][value] verbatim
-      i = end;
-    }
-  }
-
   // ─── canonical state digest (SPEC-conformance.md §4) ─────────────────────────────────────────
+  // Magic "SMv1". Tables: names + commits + muts only (votes/decors/overflow removed).
   serialize(): Bytes {
     const parts: Bytes[] = [];
     parts.push(new TextEncoder().encode("SMv1"));
@@ -606,8 +587,7 @@ export class Fold {
       parts.push(i64le(r.reserveExpiry));
     }
 
-    // commits — sorted by commitment bytes (then height,tx_index,time for total order; LOG: spec
-    // pins only "by commitment bytes", so identical commitments need a documented tiebreak)
+    // commits — sorted by (commitment, commit_height, tx_index) total order (H7)
     const commitRows = this.commits.slice().sort((a, b) => {
       const c = cmpBytes(a.commitment, b.commitment);
       if (c !== 0) return c;
@@ -623,18 +603,6 @@ export class Fold {
       parts.push(i64le(c.commitTime));
     }
 
-    // votes — sorted by (target[32], vout)
-    const voteRows = [...this.votes.values()].sort((a, b) => {
-      const c = cmpBytes(a.target, b.target);
-      return c !== 0 ? c : a.vout - b.vout;
-    });
-    parts.push(u32le(voteRows.length));
-    for (const v of voteRows) {
-      parts.push(pad(v.target, 32));
-      parts.push(u32le(v.vout));
-      parts.push(i128le(v.score));
-    }
-
     // muts — sorted by owner bytes
     const mutRows = [...this.muts.values()].sort((a, b) => cmpBytes(a.owner, b.owner));
     parts.push(u32le(mutRows.length));
@@ -643,23 +611,6 @@ export class Fold {
       parts.push(i64le(m.height));
     }
 
-    // decors — sorted by (txid[32], vout) STABLE (insertion order within a post)
-    const idx = this.decors.map((d, i) => ({ d, i }));
-    idx.sort((x, y) => {
-      const c = cmpBytes(x.d.txid, y.d.txid);
-      if (c !== 0) return c;
-      if (x.d.vout !== y.d.vout) return x.d.vout - y.d.vout;
-      return x.i - y.i; // stable: preserve insertion order within equal (txid,vout)
-    });
-    parts.push(u32le(idx.length));
-    for (const { d } of idx) {
-      parts.push(pad(d.txid, 32));
-      parts.push(u32le(d.vout));
-      parts.push(u8(d.rec.length & 0xff));
-      parts.push(d.rec);
-    }
-
-    parts.push(u8(this.overflow));
     return concat(...parts);
   }
 
@@ -671,6 +622,7 @@ export class Fold {
   // The order-independent / invertible twin of digest(): a per-table elliptic-curve multiset hash
   // over the SAME per-row encoding serialize() uses (so the two induce the identical equality
   // relation), folded into one combined SHA-256. Mirrors impls/c/src/ecmh.c sm_state_ecmh.
+  // 3 tags (name/commit/mut); top = SHA256("ECMHtop1" ‖ an ‖ ac ‖ am).
   stateEcmh(): Bytes {
     // P(row) = ECMH_H2C("ECMHv1" ‖ tag ‖ row_bytes); A_T = Σ P(row); start from ∞.
     const REC = new TextEncoder().encode("ECMHv1");
@@ -688,19 +640,13 @@ export class Fold {
     const ac = fold(0x02, this.commits.map((c) => concat(
       pad(c.commitment, 32), i64le(c.commitHeight), u32le(c.txIndex), i64le(c.commitTime),
     )));
-    const av = fold(0x03, [...this.votes.values()].map((v) => concat(
-      pad(v.target, 32), u32le(v.vout), i128le(v.score),
-    )));
     const am = fold(0x04, [...this.muts.values()].map((m) => concat(
       pad20(m.owner), i64le(m.height),
     )));
-    const ad = fold(0x05, this.decors.map((d) => concat(
-      pad(d.txid, 32), u32le(d.vout), u8(d.rec.length & 0xff), d.rec,
-    )));
 
-    // combined = SHA256("ECMHtop1" ‖ A_names ‖ A_commits ‖ A_votes ‖ A_muts ‖ A_decors ‖ overflow).
+    // combined = SHA256("ECMHtop1" ‖ A_names ‖ A_commits ‖ A_muts).
     return sha256(concat(
-      new TextEncoder().encode("ECMHtop1"), an, ac, av, am, ad, u8(this.overflow),
+      new TextEncoder().encode("ECMHtop1"), an, ac, am,
     ));
   }
 }

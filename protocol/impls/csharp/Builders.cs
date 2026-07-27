@@ -2,7 +2,7 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>Convenience builders for hand-authored vectors (selftest / scenario).</summary>
 public static class B
@@ -45,7 +45,6 @@ public static class B
     // ---- payload builders ----
     public static byte[] Commit(byte[] commitment) => Payload(K.OP_COMMIT, commitment);
     public static byte[] Claim(byte[] salt, string name) => Payload(K.OP_CLAIM, Concat(salt, Name(name)));
-    public static byte[] Vote(bool up, byte[] txid, uint vout) => Payload(up ? K.OP_VOTE_UP : K.OP_VOTE_DOWN, Concat(txid, U32(vout)));
     public static byte[] RenewAll() => Payload(K.OP_RENEW, Array.Empty<byte>());
     public static byte[] RenewAllSafe(long anchor) => Payload(K.OP_RENEW, U40(anchor));
     public static byte[] RenewSel(long anchor, byte[] flags) => Payload(K.OP_RENEW, Concat(U40(anchor), flags));
@@ -60,6 +59,4 @@ public static class B
     public static byte[] As(byte index) => Payload(K.OP_AS, new[] { index });
     public static byte[] Trade(byte idxA, byte idxB, string nameA, string nameB)
         => Payload(K.OP_TRADE, Concat(new[] { idxA, idxB }, Name(nameA), new byte[] { 0x2C }, Name(nameB)));
-    public static byte[] Decorate(byte[] body) => Payload(K.OP_DECORATE, body);
-    public static byte[] DecRecord(byte tag, byte[] value) => Concat(new[] { tag }, U32((uint)value.Length)[..2], value);
 }

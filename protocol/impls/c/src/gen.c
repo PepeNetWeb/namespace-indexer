@@ -25,17 +25,14 @@
 #define NAME_POOL    400       // candidate-name vocabulary
 #define BASE_TS      1700000000LL
 #define CLOG_CAP     4096      // commit ring (for CLAIM)
-#define PLOG_CAP     4096      // post ring (for VOTE/DECORATE targets)
 #define NMLOG_CAP    1024      // recently-active name ring (connects the market chains)
 
 typedef struct { uint8_t salt[32]; char name[SM_NAME_MAX + 1]; uint8_t nlen; int author; int64_t height; } Commit;
-typedef struct { uint8_t txid[32]; uint32_t vout; } Post;
 
 typedef struct {
     SmRng    rng;
     SmState *st;
     Commit  *clog; int clog_n, clog_head;
-    Post    *plog; int plog_n, plog_head;
     char   (*nmlog)[SM_NAME_MAX + 1]; int nmlog_n, nmlog_head;
     int64_t  ts_ring[16]; int64_t last_ts;
     int64_t  height; uint64_t rate;
@@ -94,15 +91,18 @@ static void tx_out(SmTx *t, const uint8_t dest[20], uint8_t type, uint64_t value
     SmOut *o = sm_tx_out(t);
     memcpy(o->h160, dest, 20); o->type = type; o->value = value; o->vout = (uint32_t)(SM_SYNTH_VOUT_BASE + t->n_outs - 1);
 }
-static void synth_txid(uint8_t out[32], int64_t height, uint32_t txindex) {   // pinned, mirrors fold.c
-    memset(out, 0, 32);
-    uint64_t h = (uint64_t)height;
-    for (int i = 0; i < 8; i++) out[i]     = (uint8_t)(h >> (8 * i));
-    for (int i = 0; i < 4; i++) out[8 + i] = (uint8_t)(txindex >> (8 * i));
-}
-
 // Lease/rent burn that buys ~`days` (rate is a multiple of 28 in the generator).
 static uint64_t lease_burn(Gen *g, int days) { return (g->rate / 28) * (uint64_t)days; }
+
+// Flags-length draw: mostly the tiny historical 1..3 (dense owned sets are
+// rare), ~1/8 mid-range (past the old 80-byte carrier boundary), ~1/32 from
+// the full consensus range up to `cap` (wide-carrier coverage, §6).
+static uint16_t gen_flags_len(Gen *g, int cap) {
+    uint64_t m = gbnd(g, 32);
+    if (m == 0) return (uint16_t)(1 + gbnd(g, (uint64_t)cap));
+    if (m < 4)  return (uint16_t)(1 + gbnd(g, 200));
+    return (uint16_t)(1 + gbnd(g, 3));
+}
 
 // ── input digest: stream a FIXED-WIDTH serialization of the tx (pinned) ──────
 static void put32(SHA256_CTX *h, uint32_t v) { uint8_t t[4]; for (int i=0;i<4;i++) t[i]=(uint8_t)(v>>(8*i)); sha256_update(h,t,4); }
@@ -113,12 +113,12 @@ static void hash_action(SHA256_CTX *h, const SmAction *a) {
     sha256_update(h, (const uint8_t*)a->name, SM_NAME_MAX + 1);   put8(h, a->name_len);
     sha256_update(h, (const uint8_t*)a->name_b, SM_NAME_MAX + 1); put8(h, a->name_b_len);
     sha256_update(h, a->commitment, 32); sha256_update(h, a->salt, 32);
-    sha256_update(h, a->target_txid, 32); put32(h, a->target_vout);
     sha256_update(h, a->addr, 20); put64(h, a->price); put32(h, a->window);
     put8(h, a->has_anchor); put64(h, a->anchor);
-    sha256_update(h, a->flags, SM_FLAGS_MAX); put8(h, a->flags_len);
+    // flags hash length-scoped (hashing the full SM_FLAGS_MAX array would burn
+    // ~40 SHA blocks of zero padding per action at the §6 ceiling size)
+    sha256_update(h, a->flags, a->flags_len); put32(h, a->flags_len);
     put8(h, a->as_index); put8(h, a->idx_a); put8(h, a->idx_b);
-    sha256_update(h, a->dec, SM_DEC_MAX); put8(h, a->dec_len);
 }
 static void hash_tx(Gen *g, const SmTx *t) {
     SHA256_CTX *h = &g->ih;
@@ -129,21 +129,21 @@ static void hash_tx(Gen *g, const SmTx *t) {
         const SmCarrier *cr = &t->carriers[c];
         put8(h, (uint8_t)cr->kind); put64(h, cr->value); put32(h, cr->vout);
         if (cr->kind == SM_CAR_ACTION) hash_action(h, &cr->act);
-        else { put8(h, cr->post_len); sha256_update(h, cr->post, cr->post_len); }
     }
     put8(h, (uint8_t)t->n_outs);
     for (int o = 0; o < t->n_outs; o++) { sha256_update(h, t->outs[o].h160, 20); put8(h, t->outs[o].type); put64(h, t->outs[o].value); put32(h, t->outs[o].vout); }
 }
 
-// ── op weights (pinned) ──────────────────────────────────────────────────────
-enum { OP_POST, OP_VOTE, OP_COMMIT, OP_CLAIM, OP_RENEW, OP_TRANSFER, OP_SELL,
-       OP_RESERVE, OP_SETTLE, OP_RELEASE, OP_SELLTO, OP_PAY, OP_TRADE, OP_KINDS };
-static const int WEIGHT[OP_KINDS] = { 12, 12, 14, 13, 5, 5, 8, 7, 7, 3, 6, 5, 4 };
+// ── op weights (pinned) — names/market only ──────────────────────────────────
+enum { OP_COMMIT, OP_CLAIM, OP_RENEW, OP_TRANSFER, OP_SELL,
+       OP_RESERVE, OP_SETTLE, OP_RELEASE, OP_SELLTO, OP_PAY, OP_TRADE,
+       OP_RENEW1, OP_TRANSFER1, OP_RELEASE1, OP_KINDS };
+static const int WEIGHT[OP_KINDS] = { 14, 13, 5, 5, 8, 7, 7, 3, 6, 5, 4, 4, 3, 2 };
 static int pick_op(Gen *g) {
     int total = 0; for (int i = 0; i < OP_KINDS; i++) total += WEIGHT[i];
     int r = (int)gbnd(g, (uint64_t)total), acc = 0;
     for (int i = 0; i < OP_KINDS; i++) { acc += WEIGHT[i]; if (r < acc) return i; }
-    return OP_POST;
+    return OP_COMMIT;
 }
 
 // price for a SELL/SELL_TO: mostly modest, occasionally near 2^64 (overflow edge).
@@ -159,47 +159,6 @@ static void build_tx(Gen *g, int k, uint32_t txindex, SmTx *t) {
     char nm[SM_NAME_MAX + 1]; uint8_t nl;
 
     switch (k) {
-    case OP_POST: {
-        int signer = (int)gbnd(g, N_IDS);
-        tx_in(t, signer);
-        if (gbnd(g, 3) == 0) {                                       // ~1/3 carry a decoration
-            SmAction d; memset(&d, 0, sizeof d); d.op = SM_OP_DECORATE;
-            uint8_t vlen = (uint8_t)(1 + gbnd(g, 6));
-            d.dec[0] = (uint8_t)gbnd(g, 256); d.dec[1] = vlen; d.dec[2] = 0;
-            for (int i = 0; i < vlen; i++) d.dec[3 + i] = (uint8_t)gbnd(g, 256);
-            d.dec_len = (uint8_t)(3 + vlen);
-            tx_act(t, d, 0);
-        }
-        SmCarrier *c = sm_tx_carrier(t);
-        c->kind = SM_CAR_POST; c->vout = (uint32_t)(t->n_carriers - 1);
-        c->value = (gbnd(g, 10) == 0) ? 0 : (1 + gbnd(g, 100));      // ~1/10 zero-value → ignored
-        c->post_len = 5; memcpy(c->post, "hello", 5);
-        if (c->value > 0) {                                          // record the post for later votes
-            Post p; synth_txid(p.txid, g->height, txindex); p.vout = c->vout;
-            g->plog[g->plog_head] = p; g->plog_head = (g->plog_head + 1) % PLOG_CAP;
-            if (g->plog_n < PLOG_CAP) g->plog_n++;
-        }
-        break;
-    }
-    case OP_VOTE: {
-        int signer = (int)gbnd(g, N_IDS);
-        SmAction a; memset(&a, 0, sizeof a);
-        a.op = (gbnd(g, 2) == 0) ? SM_OP_VOTE_UP : SM_OP_VOTE_DOWN;
-        if (g->plog_n && gbnd(g, 3) != 0) {                          // mostly vote a known post
-            Post *p = &g->plog[gbnd(g, (uint64_t)g->plog_n)];
-            memcpy(a.target_txid, p->txid, 32); a.target_vout = p->vout;
-        } else { for (int i = 0; i < 32; i++) a.target_txid[i] = (uint8_t)gbnd(g, 256); a.target_vout = (uint32_t)gbnd(g, 4); }
-        uint64_t weight = (gbnd(g, 12) == 0) ? 0 : (1 + gbnd(g, 50));  // ~1/12 zero → dropped
-        if (gbnd(g, 8) == 0) {                                         // ~1/8 AS-attributed (exercise AS)
-            int other = (int)gbnd(g, N_IDS);
-            uint8_t idx = (gbnd(g, 4) == 0) ? (uint8_t)(2 + gbnd(g, 8)) : 1;   // sometimes OOB → segment drops
-            SmAction asx; memset(&asx, 0, sizeof asx); asx.op = SM_OP_AS; asx.as_index = idx;
-            tx_in(t, other); tx_in(t, signer); tx_act(t, asx, 0); tx_act(t, a, weight);
-        } else {
-            tx_in(t, signer); tx_act(t, a, weight);
-        }
-        break;
-    }
     case OP_COMMIT: {
         int signer = (int)gbnd(g, N_IDS);
         name_of((int)gbnd(g, NAME_POOL), nm, &nl);
@@ -241,10 +200,18 @@ static void build_tx(Gen *g, int k, uint32_t txindex, SmTx *t) {
             int64_t low = sm_last_mutation(s, sid.h160);
             int64_t span = g->height - low; if (span < 0) span = 0;
             a.has_anchor = 1; a.anchor = (uint64_t)(low + (int64_t)gbnd(g, (uint64_t)span + 1));
-            a.flags_len = (uint8_t)(1 + gbnd(g, 3));
+            a.flags_len = gen_flags_len(g, SM_FLAGS_MAX);
             for (int i = 0; i < a.flags_len; i++) a.flags[i] = (uint8_t)gbnd(g, 256);
         }
-        tx_in(t, signer); tx_act(t, a, lease_burn(g, 1 + (int)gbnd(g, 200)));
+        uint64_t burn = lease_burn(g, 1 + (int)gbnd(g, 200));
+        if (gbnd(g, 8) == 0) {                                       // ~1/8 AS-attributed (exercise AS)
+            int other = (int)gbnd(g, N_IDS);
+            uint8_t idx = (gbnd(g, 4) == 0) ? (uint8_t)(2 + gbnd(g, 8)) : 1;  // sometimes OOB → segment drops
+            SmAction asx; memset(&asx, 0, sizeof asx); asx.op = SM_OP_AS; asx.as_index = idx;
+            tx_in(t, other); tx_in(t, signer); tx_act(t, asx, 0); tx_act(t, a, burn);
+        } else {
+            tx_in(t, signer); tx_act(t, a, burn);
+        }
         break;
     }
     case OP_TRANSFER: {
@@ -258,7 +225,7 @@ static void build_tx(Gen *g, int k, uint32_t txindex, SmTx *t) {
         pick_name(g, nm, &nl);
         const SmNameRow *r = sm_find_name(s, nm);
         int oi = (r && r->st == SM_OWNED) ? owner_idx(r->owner) : -1;
-        if (oi < 0) { build_tx(g, OP_POST, txindex, t); return; }     // can't sell → fall back
+        if (oi < 0) { build_tx(g, OP_COMMIT, txindex, t); return; }   // can't sell → fall back
         SmAction a; memset(&a, 0, sizeof a);
         if (k == OP_SELL) {
             a.op = SM_OP_SELL; a.price = gen_price(g);
@@ -275,7 +242,7 @@ static void build_tx(Gen *g, int k, uint32_t txindex, SmTx *t) {
     case OP_RESERVE: {
         pick_name(g, nm, &nl);
         const SmNameRow *r = sm_find_name(s, nm);
-        if (!r || r->st != SM_LISTED) { build_tx(g, OP_POST, txindex, t); return; }
+        if (!r || r->st != SM_LISTED) { build_tx(g, OP_COMMIT, txindex, t); return; }
         int buyer = (int)gbnd(g, N_IDS);
         uint64_t burn_leg = (uint64_t)((unsigned __int128)r->price * SM_RESERVE_BURN_BPS / 10000u);
         if (burn_leg < (uint64_t)SM_DUST_FLOOR) burn_leg = SM_DUST_FLOOR;
@@ -291,7 +258,7 @@ static void build_tx(Gen *g, int k, uint32_t txindex, SmTx *t) {
         pick_name(g, nm, &nl);
         const SmNameRow *r = sm_find_name(s, nm);
         int bi = (r && r->st == SM_RESERVED) ? owner_idx(r->buyer) : -1;
-        if (bi < 0) { build_tx(g, OP_POST, txindex, t); return; }
+        if (bi < 0) { build_tx(g, OP_COMMIT, txindex, t); return; }
         uint64_t remainder = r->price - r->burn_leg - r->pay_leg;
         SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_SETTLE; memcpy(a.name, nm, nl + 1); a.name_len = nl;
         tx_in(t, bi); tx_act(t, a, 0);
@@ -302,7 +269,7 @@ static void build_tx(Gen *g, int k, uint32_t txindex, SmTx *t) {
         pick_name(g, nm, &nl);
         const SmNameRow *r = sm_find_name(s, nm);
         int bi = (r && r->st == SM_OFFERED) ? owner_idx(r->buyer) : -1;
-        if (bi < 0) { build_tx(g, OP_POST, txindex, t); return; }
+        if (bi < 0) { build_tx(g, OP_COMMIT, txindex, t); return; }
         SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_PAY; memcpy(a.name, nm, nl + 1); a.name_len = nl;
         tx_in(t, bi); tx_act(t, a, 0);
         tx_out(t, r->seller, r->seller_type, r->price);
@@ -315,7 +282,7 @@ static void build_tx(Gen *g, int k, uint32_t txindex, SmTx *t) {
         int64_t span = g->height - low; if (span < 0) span = 0;
         SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_RELEASE;
         a.has_anchor = 1; a.anchor = (uint64_t)(low + (int64_t)gbnd(g, (uint64_t)span + 1));
-        a.flags_len = (uint8_t)(1 + gbnd(g, 3));
+        a.flags_len = gen_flags_len(g, SM_FLAGS_MAX);
         for (int i = 0; i < a.flags_len; i++) a.flags[i] = (uint8_t)gbnd(g, 256);
         tx_in(t, signer); tx_act(t, a, 0);
         break;
@@ -327,13 +294,47 @@ static void build_tx(Gen *g, int k, uint32_t txindex, SmTx *t) {
         const SmNameRow *ra = sm_find_name(s, na), *rb = sm_find_name(s, nb);
         int ai = (ra && ra->st == SM_OWNED) ? owner_idx(ra->owner) : -1;
         int bi = (rb && rb->st == SM_OWNED) ? owner_idx(rb->owner) : -1;
-        if (ai < 0 || bi < 0 || ai == bi || strcmp(na, nb) == 0) { build_tx(g, OP_POST, txindex, t); return; }
+        if (ai < 0 || bi < 0 || ai == bi || strcmp(na, nb) == 0) { build_tx(g, OP_COMMIT, txindex, t); return; }
         SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_TRADE; a.idx_a = 0; a.idx_b = 1;
         memcpy(a.name, na, la + 1); a.name_len = la; memcpy(a.name_b, nb, lb + 1); a.name_b_len = lb;
         tx_in(t, ai); tx_in(t, bi); tx_act(t, a, 0);
         break;
     }
-    default: build_tx(g, OP_POST, txindex, t); return;
+    case OP_RENEW1: {                                                // by-name renew (§3.5): owner OR seller (listed names renewable)
+        pick_name(g, nm, &nl);
+        const SmNameRow *r = sm_find_name(s, nm);
+        int oi = r ? owner_idx(r->st == SM_OWNED ? r->owner : r->seller) : -1;
+        if (oi < 0) { build_tx(g, OP_COMMIT, txindex, t); return; }
+        SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_RENEW_NAME;
+        memcpy(a.name, nm, nl + 1); a.name_len = nl;
+        tx_in(t, oi); tx_act(t, a, lease_burn(g, 1 + (int)gbnd(g, 200)));
+        push_name(g, nm, nl);                                        // keep the chain hot
+        break;
+    }
+    case OP_TRANSFER1: {                                             // by-name gift (§3.5): sometimes to self (still a move)
+        pick_name(g, nm, &nl);
+        const SmNameRow *r = sm_find_name(s, nm);
+        int oi = (r && r->st == SM_OWNED) ? owner_idx(r->owner) : -1;
+        if (oi < 0) { build_tx(g, OP_COMMIT, txindex, t); return; }
+        int target = (gbnd(g, 8) == 0) ? oi : (int)gbnd(g, N_IDS);   // ~1/8 self-target
+        SmId tid; gen_id(target, &tid);
+        SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_TRANSFER_NAME; memcpy(a.addr, tid.h160, 20);
+        memcpy(a.name, nm, nl + 1); a.name_len = nl;
+        tx_in(t, oi); tx_act(t, a, 0);
+        push_name(g, nm, nl);
+        break;
+    }
+    case OP_RELEASE1: {                                              // by-name relinquish (§3.5): locked target → no-op path
+        pick_name(g, nm, &nl);
+        const SmNameRow *r = sm_find_name(s, nm);
+        int oi = r ? owner_idx(r->st == SM_OWNED ? r->owner : r->seller) : -1;
+        if (oi < 0) { build_tx(g, OP_COMMIT, txindex, t); return; }
+        SmAction a; memset(&a, 0, sizeof a); a.op = SM_OP_RELEASE_NAME;
+        memcpy(a.name, nm, nl + 1); a.name_len = nl;
+        tx_in(t, oi); tx_act(t, a, 0);
+        break;
+    }
+    default: build_tx(g, OP_COMMIT, txindex, t); return;
     }
 }
 
@@ -385,7 +386,6 @@ int sm_check_invariants(SmState *s, int64_t mtp) {
             VIOL("row in an unknown state");
         }
     }
-    if (s->overflow_flag) VIOL("vote accumulator overflow flag set");
     #undef VIOL
     return viol;
 }
@@ -398,7 +398,6 @@ uint64_t sm_generate(uint64_t seed, uint64_t count, int trace_blocks,
     sm_rng_seed(&g.rng, seed);
     g.st = sm_new(0);                                  // activation 0: all ops live in the soak
     g.clog  = malloc(sizeof(Commit) * CLOG_CAP);
-    g.plog  = malloc(sizeof(Post)   * PLOG_CAP);
     g.nmlog = malloc(sizeof(*g.nmlog) * NMLOG_CAP);
     for (int i = 0; i < 16; i++) g.ts_ring[i] = BASE_TS;
     g.last_ts = BASE_TS; g.height = 0;
@@ -442,7 +441,7 @@ uint64_t sm_generate(uint64_t seed, uint64_t count, int trace_blocks,
     sm_state_digest(g.st, state_digest);
     if (prop_digest) sha256_final(&ph, prop_digest);
     if (cov) for (int i = 0; i < SM_EV_COUNT; i++) cov[i] = g.st->ev[i];
-    free(g.clog); free(g.plog); free(g.nmlog); sm_free(g.st);
+    free(g.clog); free(g.nmlog); sm_free(g.st);
     return emitted;
 }
 
@@ -454,7 +453,6 @@ uint64_t sm_record_chain(uint64_t seed, uint64_t count,
     sm_rng_seed(&g.rng, seed);
     g.st = sm_new(0);
     g.clog  = malloc(sizeof(Commit) * CLOG_CAP);
-    g.plog  = malloc(sizeof(Post)   * PLOG_CAP);
     g.nmlog = malloc(sizeof(*g.nmlog) * NMLOG_CAP);
     for (int i = 0; i < 16; i++) g.ts_ring[i] = BASE_TS;
     g.last_ts = BASE_TS; g.height = 0;
@@ -482,6 +480,6 @@ uint64_t sm_record_chain(uint64_t seed, uint64_t count,
         B->tx_hi = nt; nb++;
     }
     *n_blocks = nb;
-    free(g.clog); free(g.plog); free(g.nmlog); sm_free(g.st);
+    free(g.clog); free(g.nmlog); sm_free(g.st);
     return (uint64_t)nt;
 }

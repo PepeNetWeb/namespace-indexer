@@ -113,9 +113,6 @@ fn check_invariants(st: &State, height: i64, m: i64) -> u64 {
             v += 1;
         }
     }
-    if st.overflow != 0 {
-        v += 1;
-    }
     v
 }
 
@@ -124,7 +121,6 @@ fn fingerprint(pd: &mut Sha256, st: &State) {
     let mut sum_lease: i128 = 0;
     let mut sum_price: i128 = 0;
     let mut sum_legs: i128 = 0;
-    let mut sum_vote: i128 = 0;
     for r in st.names.values() {
         match r.st {
             St::Owned => n_owned += 1,
@@ -140,24 +136,16 @@ fn fingerprint(pd: &mut Sha256, st: &State) {
             sum_legs += r.burn_leg as i128 + r.pay_leg as i128;
         }
     }
-    for sc in st.votes.values() {
-        sum_vote += *sc;
-    }
     pd.update(&(st.names.len() as u32).to_le_bytes());
     pd.update(&n_owned.to_le_bytes());
     pd.update(&n_listed.to_le_bytes());
     pd.update(&n_offered.to_le_bytes());
     pd.update(&n_reserved.to_le_bytes());
     pd.update(&(st.commits.len() as u32).to_le_bytes());
-    pd.update(&(st.votes.len() as u32).to_le_bytes());
     pd.update(&(st.muts.len() as u32).to_le_bytes());
-    let n_decors: usize = st.decors.iter().map(|p| p.records.len()).sum();
-    pd.update(&(n_decors as u32).to_le_bytes());
     pd.update(&sum_lease.to_le_bytes());
     pd.update(&sum_price.to_le_bytes());
     pd.update(&sum_legs.to_le_bytes());
-    pd.update(&sum_vote.to_le_bytes());
-    pd.update(&[st.overflow]);
 }
 
 // ───────────────────────── §11 meta (inert tx) ─────────────────────────
@@ -190,21 +178,21 @@ pub fn meta(seed: u64, count: u64) {
 /// for the already-folded state). Java reaches the same via `Fold.applyOneTx`.
 fn apply_one_inert_tx(st: &mut State, blk: &Block, m: i64) {
     let id = crate::generator::identity(0).0;
-    // zero-weight vote -> dropped (weight < DUST_FLOOR)
-    let zv = encode_action(&Action::VoteUp { target: [0u8; 32], vout: 0 });
+    // naked CLAIM (no live commit) -> drops
+    let naked = encode_action(&Action::Claim { salt: [0u8; 32], name: b"inert".to_vec() });
     // malformed RENEW bl=3 -> IGNORE (1..4 invalid)
     let malformed = vec![0xFFu8, 0x50, 0x4E, OP_RENEW, 0x01, 0x02, 0x03];
-    // orphan DECORATE -> discarded at tx end (no owned name body to attach to)
-    let dec = encode_action(&Action::Decorate { raw: vec![3u8, 1, 0, 9] });
-    // zero-value POST -> IGNORE (value 0 fails the post burn gate)
-    let post = b"hi".to_vec();
+    // UTF-8 noise / bare text -> IGNORE (names-only demux)
+    let noise = b"hi".to_vec();
+    // unknown opcode (overlay band) -> IGNORE
+    let overlay = vec![0xFFu8, 0x50, 0x4E, 0xD6, 0x00];
     let tx = Tx {
         inputs: vec![Input { identity: Some(id), stype: ScriptType::P2pkh, sighash_all: true }],
         outputs: vec![
-            Output::Carrier { payload: zv, value: 0 },
+            Output::Carrier { payload: naked, value: 1 },
             Output::Carrier { payload: malformed, value: 0 },
-            Output::Carrier { payload: dec, value: 0 },
-            Output::Carrier { payload: post, value: 0 },
+            Output::Carrier { payload: noise, value: 1 },
+            Output::Carrier { payload: overlay, value: 0 },
         ],
     };
     // re-fold the inert tx alone in its own block (pre-block transitions idempotent on the
@@ -424,9 +412,8 @@ fn fuzz_payload(rng: &mut SplitMix64) -> Vec<u8> {
 }
 
 fn grammar_payload(rng: &mut SplitMix64) -> Vec<u8> {
-    let op = (1 + rng.bounded(15)) as u8;
+    let op = (1 + rng.bounded(15)) as u8; // 0x01..0x0F name-action range
     let body_len: usize = match op {
-        OP_VOTE_UP | OP_VOTE_DOWN => 36,
         OP_COMMIT => 32,
         OP_CLAIM => 33 + rng.bounded(20) as usize,
         OP_RENEW => [0usize, 5, 6 + rng.bounded(71) as usize][rng.bounded(3) as usize],
@@ -438,9 +425,9 @@ fn grammar_payload(rng: &mut SplitMix64) -> Vec<u8> {
             }
         }
         OP_SELL => 13 + rng.bounded(20) as usize,
-        OP_RESERVE | OP_SETTLE | OP_PAY => 1 + rng.bounded(20) as usize,
+        OP_RENEW_NAME | OP_RELEASE_NAME | OP_RESERVE | OP_SETTLE | OP_PAY => 1 + rng.bounded(20) as usize,
+        OP_TRANSFER_NAME => 21 + rng.bounded(31) as usize,
         OP_RELEASE => 6 + rng.bounded(71) as usize,
-        OP_DECORATE => rng.bounded(77) as usize,
         OP_SELL_TO => 29 + rng.bounded(20) as usize,
         OP_AS => 1,
         OP_TRADE => 5 + rng.bounded(30) as usize,

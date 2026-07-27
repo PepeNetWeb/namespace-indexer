@@ -37,7 +37,7 @@ here).** This is **not** an SMT, **not** a light-client proof system, **not** co
   job of a sparse Merkle tree + a trust quorum, both **dropped** — the quorum reliance was
   the dealbreaker. If SPV is ever wanted it is a *separate*, additive step: swap the
   per-domain point-sum for a tree over the **same** §4 per-record encoding. Crucially, the
-  eager time-triggered materialization this memo locks down (§6) is groundwork SPV needs
+  eager time-triggered materialization this memo locks down (§5) is groundwork SPV needs
   anyway — so doing it now makes SPV-later a clean addition, not a retrofit. This memo
   forecloses nothing.
 - **Not consensus / advisory only.** Dogecoin has no commitment slot — the digest is never

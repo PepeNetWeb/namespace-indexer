@@ -1,6 +1,6 @@
-# pepenet protocol — Rust reference SM
+# PepeNet namespace — Rust reference SM
 
-An independent Rust implementation of the pepenet protocol state machine, built from the
+An independent Rust implementation of the PepeNet namespace state machine, built from the
 specification (`docs/protocol-spec.md` + `protocol-sm/SPEC-conformance.md`). It is part of the
 cross-language conformance suite: each implementation is written independently and they
 cross-validate the spec's consensus-critical outcomes. `impls/c` is the normative reference; the
@@ -38,8 +38,8 @@ the spec-mandated outcome for every consensus-critical vector. (See `SPEC-confor
 | `src/sha256.rs`, `src/ripemd160.rs`, `src/prng.rs` | self-rolled primitives (KAT-checked) | conf §1/§13 |
 | `src/decode.rs` | strict fail-closed wire decoder; single-push carrier; per-opcode parse → ACTION/POST/IGNORE | §1/§2/§9 |
 | `src/attrib.rs` | strict-DER+low-S, pubkey canonical, P2PKH + P2SH-multisig templates, in-order scan, legacy sighash **incl. FindAndDelete**, RIPEMD-160 identity; **injected** curve stubs (`on_curve`/`verify`) | §4/§13 |
-| `src/oracle.rs` | stateless fee oracle (signed clamp, floor div, fee-bearing participant filter, MIN_FEE_SAMPLE degrade, lower median) + MTP | §3.4/§6 |
-| `src/fold.rs` | the fold: commit→claim priority + same-block displacement, water-fill, open + directed market cascade, anchor-guarded bitmaps, AS/TRADE, DECORATE, votes, pre-block transitions | §3/§6 |
+| `src/oracle.rs` | stateless fee oracle (signed clamp, floor div, fee-bearing participant filter, MIN_FEE_SAMPLE degrade, lower median) + MTP | §3.4/§5 |
+| `src/fold.rs` | the fold: commit→claim priority + same-block displacement, water-fill, open + directed market cascade, anchor-guarded bitmaps, AS/TRADE, DECORATE, votes, pre-block transitions | §3/§5 |
 | `src/digest.rs` | canonical SHA-256 state digest (`SMv1` layout, pinned widths/sort orders) | conf §4 |
 | `src/selftest.rs` | exhaustive hand-authored battery (every rule + boundary, incl. the off-curve-P2PKH attribution regression) | — |
 | `src/forkvectors.rs` | the consensus-fork vectors | conf §"fork vectors" |

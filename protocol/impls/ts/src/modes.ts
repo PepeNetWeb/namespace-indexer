@@ -16,8 +16,8 @@ import {
 import * as B from "./builders.ts";
 import {
   OP, ST, N_IDS, NAME_POOL, BASE_TS, MAX_LEASE, SELL_PRICE_FLOOR, DUST_FLOOR,
-  REORG_BUFFER, RESERVE_WINDOW, DIRECT_WINDOW, COMMIT_EXPIRY, BILLING_UNIT,
-  LEASE_QUANTUM, RESERVE_BURN_BPS, RESERVE_PAY_BPS, BPS_DENOM,
+  REORG_BUFFER, RESERVE_WINDOW, DIRECT_WINDOW, COMMIT_EXPIRY,
+  RESERVE_BURN_BPS, RESERVE_PAY_BPS, BPS_DENOM,
 } from "./constants.ts";
 
 const dec = new TextDecoder();
@@ -50,8 +50,9 @@ function foldDigest(blocks: RecBlock[], lo: number, hi: number): string {
   return hex(f.digest());
 }
 
-// ─── op weights (conformance §5) ───────────────────────────────────────────────────────────────
-const WEIGHTS = [12, 12, 14, 13, 5, 5, 8, 7, 7, 3, 6, 5, 4]; // POST,VOTE,COMMIT,CLAIM,RENEW,TRANSFER,SELL,RESERVE,SETTLE,RELEASE,SELL_TO,PAY,TRADE
+// ─── op weights (names/market only) ───────────────────────────────────────────────────────────
+// COMMIT,CLAIM,RENEW,TRANSFER,SELL,RESERVE,SETTLE,RELEASE,SELL_TO,PAY,TRADE — AS rides on RENEW.
+const WEIGHTS = [14, 13, 5, 5, 8, 7, 7, 3, 6, 5, 4];
 const W_SUM = WEIGHTS.reduce((a, b) => a + b, 0);
 
 function nameOf(i: number): string { return "n" + i.toString(36); }
@@ -124,13 +125,13 @@ function buildTx(r: SplitMix64, f: Fold, height: bigint, mtp: bigint, rate: bigi
   const leaseVal = rate28 * days; // T == days
 
   switch (op) {
-    case 2: { // COMMIT
+    case 0: { // COMMIT
       const j = r.boundedN(NAME_POOL);
       const name = nameOf(j), salt = saltOf(saltCtr);
       ready.push({ idIdx: i, name, salt, commitHeight: height, commitTime: mtp });
       return oneIn(i, B.commit(B.commitmentOf(salt, name, id)));
     }
-    case 3: { // CLAIM a ready commit (≥1 deep, live, not already present)
+    case 1: { // CLAIM a ready commit (≥1 deep, live, not already present)
       for (let k = 0; k < ready.length; k++) {
         const p = ready[k];
         if (p.commitHeight < height && mtp <= p.commitTime + COMMIT_EXPIRY && rowOf(f, p.name) === undefined) {
@@ -140,15 +141,25 @@ function buildTx(r: SplitMix64, f: Fold, height: bigint, mtp: bigint, rate: bigi
       }
       break;
     }
-    case 4: { // RENEW all (owner with names)
-      if (namesWhere(f, id, -1).length > 0) return oneIn(i, B.renewAll(leaseVal));
+    case 2: { // RENEW all (owner with names); ~1/8 AS-attributed
+      if (namesWhere(f, id, -1).length > 0) {
+        if (r.boundedN(8) === 0) {
+          const other = r.boundedN(N_IDS);
+          const idx = r.boundedN(4) === 0 ? (2 + r.boundedN(8)) : 1;
+          return B.tx(
+            [B.input(B.genId(other), B.genType(other), true), B.input(id, B.genType(i), true)],
+            [B.asMarker(idx, 0), B.renewAll(leaseVal, 1)],
+          );
+        }
+        return oneIn(i, B.renewAll(leaseVal));
+      }
       break;
     }
-    case 5: { // TRANSFER all to a random id
+    case 3: { // TRANSFER all to a random id
       if (namesWhere(f, id, ST.OWNED).length > 0) return oneIn(i, B.transferAll(B.genId(r.boundedN(N_IDS))));
       break;
     }
-    case 6: { // SELL an owned name with enough lease tail
+    case 4: { // SELL an owned name with enough lease tail
       for (const nm of namesWhere(f, id, ST.OWNED)) {
         const row = rowOf(f, nm);
         if (mtp + RESERVE_WINDOW + REORG_BUFFER <= row.leaseExpiry) {
@@ -158,7 +169,7 @@ function buildTx(r: SplitMix64, f: Fold, height: bigint, mtp: bigint, rate: bigi
       }
       break;
     }
-    case 7: { // RESERVE a listed name (buyer != seller carrier value ≥ burn; pay-leg output)
+    case 5: { // RESERVE a listed name (buyer != seller carrier value ≥ burn; pay-leg output)
       const listed = namesWhere(f, null, ST.LISTED);
       if (listed.length > 0) {
         const nm = listed[r.boundedN(listed.length)];
@@ -171,7 +182,7 @@ function buildTx(r: SplitMix64, f: Fold, height: bigint, mtp: bigint, rate: bigi
       }
       break;
     }
-    case 8: { // SETTLE a reserved name (by its reserver)
+    case 6: { // SETTLE a reserved name (by its reserver)
       const res = namesWhere(f, null, ST.RESERVED);
       if (res.length > 0) {
         const nm = res[r.boundedN(res.length)];
@@ -183,7 +194,7 @@ function buildTx(r: SplitMix64, f: Fold, height: bigint, mtp: bigint, rate: bigi
       }
       break;
     }
-    case 9: { // RELEASE owned names via a full bitmap
+    case 7: { // RELEASE owned names via a full bitmap
       const set = ownedSetSorted(f, id);
       if (set.length > 0) {
         const flags = new Uint8Array((set.length + 7) >> 3).fill(0xff);
@@ -193,7 +204,7 @@ function buildTx(r: SplitMix64, f: Fold, height: bigint, mtp: bigint, rate: bigi
       }
       break;
     }
-    case 10: { // SELL_TO
+    case 8: { // SELL_TO
       for (const nm of namesWhere(f, id, ST.OWNED)) {
         const row = rowOf(f, nm);
         if (mtp + DIRECT_WINDOW + REORG_BUFFER <= row.leaseExpiry) {
@@ -204,7 +215,7 @@ function buildTx(r: SplitMix64, f: Fold, height: bigint, mtp: bigint, rate: bigi
       }
       break;
     }
-    case 11: { // PAY an offered name (by its named buyer)
+    case 9: { // PAY an offered name (by its named buyer)
       const off = namesWhere(f, null, ST.OFFERED);
       if (off.length > 0) {
         const nm = off[r.boundedN(off.length)];
@@ -215,7 +226,7 @@ function buildTx(r: SplitMix64, f: Fold, height: bigint, mtp: bigint, rate: bigi
       }
       break;
     }
-    case 12: { // TRADE two owned names between two ids
+    case 10: { // TRADE two owned names between two ids
       const myOwned = namesWhere(f, id, ST.OWNED);
       const i2 = (i + 1 + r.boundedN(N_IDS - 1)) % N_IDS;
       const id2 = B.genId(i2);
@@ -229,26 +240,13 @@ function buildTx(r: SplitMix64, f: Fold, height: bigint, mtp: bigint, rate: bigi
       }
       break;
     }
-    case 0: { // POST (optionally decorated if the author owns a name)
-      const body = "post" + Number(saltCtr % 1000n).toString(36);
-      if (namesWhere(f, id, -1).length > 0 && r.boundedN(2) === 0) {
-        const decBody = B.tlv(1 + r.boundedN(20), new Uint8Array([r.boundedN(256)]));
-        return oneIn(i, B.decorate(decBody), B.postCarrier(body, 1n + r.bounded(50), 1));
-      }
-      return oneIn(i, B.postCarrier(body, 1n + r.bounded(50)));
-    }
   }
-  // VOTE fallback (always valid): target a synthetic earlier post id
-  const th = height === 0n ? 0n : r.bounded(height);
-  const target = synthTxid(th, r.boundedN(8));
-  const up = r.boundedN(2) === 0;
-  const w = 1n + r.bounded(1000);
-  return oneIn(i, up ? B.voteUp(target, r.boundedN(4), w) : B.voteDown(target, r.boundedN(4), w));
-}
-
-// synthetic txid (conformance §3): u64_le(height) ‖ u32_le(vout) ‖ 20 zero bytes = 32 bytes
-function synthTxid(height: bigint, vout: number): Bytes {
-  return concat(u64le(height), u32le(vout), new Uint8Array(20));
+  // COMMIT fallback (always valid): inert-safe default when the chosen path has no material.
+  const j = r.boundedN(NAME_POOL);
+  const salt = saltOf(saltCtr);
+  const name = nameOf(j);
+  ready.push({ idIdx: i, name, salt, commitHeight: height, commitTime: mtp });
+  return oneIn(i, B.commit(B.commitmentOf(salt, name, id)));
 }
 
 // record the full chain (the shared chain that properties/reorg/meta/reorgfuzz re-fold).
@@ -319,13 +317,12 @@ function checkInvariants(f: Fold, height: bigint, mtp: bigint): bigint {
     }
   }
   for (const m of (f.muts as Map<string, any>).values()) if (m.height > height) v++; // mut height ≤ cur height
-  if (f.overflow) v++;
   return v;
 }
 
 function fingerprint(pd: Bytes[], f: Fold): void {
   let nOwned = 0, nListed = 0, nOffered = 0, nReserved = 0;
-  let sumLease = 0n, sumPrice = 0n, sumLegs = 0n, sumVote = 0n;
+  let sumLease = 0n, sumPrice = 0n, sumLegs = 0n;
   for (const r of (f.names as Map<string, any>).values()) {
     if (r.st === ST.OWNED) nOwned++;
     else if (r.st === ST.LISTED) nListed++;
@@ -335,10 +332,9 @@ function fingerprint(pd: Bytes[], f: Fold): void {
     if (r.st === ST.LISTED || r.st === ST.RESERVED) sumPrice += r.price;
     if (r.st === ST.RESERVED) sumLegs += r.burnLeg + r.payLeg;
   }
-  for (const vt of (f.votes as Map<string, any>).values()) sumVote += vt.score;
   pd.push(u32le(f.names.size), u32le(nOwned), u32le(nListed), u32le(nOffered), u32le(nReserved));
-  pd.push(u32le(f.commits.length), u32le(f.votes.size), u32le(f.muts.size), u32le(f.decors.length));
-  pd.push(i128le(sumLease), i128le(sumPrice), i128le(sumLegs), i128le(sumVote), u8(f.overflow ? 1 : 0));
+  pd.push(u32le(f.commits.length), u32le(f.muts.size));
+  pd.push(i128le(sumLease), i128le(sumPrice), i128le(sumLegs));
 }
 
 // ─── §11 meta: an action the protocol IGNORES is provably inert ────────────────────────────────
@@ -359,13 +355,13 @@ export function meta(seed: bigint, count: number): number {
 }
 
 function inertTx(): FoldTx {
-  // zero-weight vote → dropped; malformed RENEW (bl=3) → IGNORE; orphan DECORATE → discarded at tx
-  // end; zero-value non-action POST → IGNORE. None mutate the digested state.
-  const zv = B.voteUp(synthTxid(1n, 0), 0, 0n);                       // zero weight → dropped
-  const malformed = B.rawCarrier(new Uint8Array([0xff, 0x50, 0x4e, 0x05, 0x01, 0x02, 0x03]), 0n); // RENEW bl=3 → IGNORE
-  const decOrphan = B.decorate(B.tlv(3, new Uint8Array([9])));        // orphan DECORATE (no following body)
-  const zeroPost = B.rawCarrier(new TextEncoder().encode("hi"), 0n);  // zero-value POST → IGNORE
-  return oneIn(0, zv, malformed, decOrphan, zeroPost);
+  // Mirrors C build_inert_tx: truncated CLAIM, unknown opcode 0x20, bare UTF-8, overlay 0xD6.
+  // All decode to IGNORE — none mutate the digested state.
+  const badClaim = B.rawCarrier(new Uint8Array([0xff, 0x50, 0x4e, OP.CLAIM, 0, 0, 0, 0]), 0n, 0);
+  const unk = B.rawCarrier(new Uint8Array([0xff, 0x50, 0x4e, 0x20]), 0n, 1);
+  const utf8 = B.rawCarrier(new TextEncoder().encode("hello"), 1n, 2);
+  const overlay = B.rawCarrier(new Uint8Array([0xff, 0x50, 0x4e, 0xd6, 0x00]), 0n, 3);
+  return oneIn(0, badClaim, unk, utf8, overlay);
 }
 
 // ─── §10 reorg confluence: replay / resume / clear-rebuild / fork-and-return ───────────────────
@@ -486,18 +482,18 @@ function fuzzPayload(r: SplitMix64): Bytes {
 }
 
 function grammarPayload(r: SplitMix64): Bytes {
-  const op = 1 + r.boundedN(15);
+  const op = 1 + r.boundedN(15); // 0x01..0x0F
   let bodyLen: number;
   switch (op) {
-    case OP.VOTE_UP: case OP.VOTE_DOWN: bodyLen = 36; break;
     case OP.COMMIT: bodyLen = 32; break;
     case OP.CLAIM: bodyLen = 33 + r.boundedN(20); break;
+    case OP.RENEW_NAME: case OP.RELEASE_NAME: bodyLen = 1 + r.boundedN(20); break;
+    case OP.TRANSFER_NAME: bodyLen = 21 + r.boundedN(31); break;
     case OP.RENEW: bodyLen = [0, 5, 6 + r.boundedN(71)][r.boundedN(3)]; break;
     case OP.TRANSFER: bodyLen = r.boundedN(2) === 0 ? 20 : 26 + r.boundedN(51); break;
     case OP.SELL: bodyLen = 13 + r.boundedN(20); break;
     case OP.RESERVE: case OP.SETTLE: case OP.PAY: bodyLen = 1 + r.boundedN(20); break;
     case OP.RELEASE: bodyLen = 6 + r.boundedN(71); break;
-    case OP.DECORATE: bodyLen = r.boundedN(77); break;
     case OP.SELL_TO: bodyLen = 29 + r.boundedN(20); break;
     case OP.AS: bodyLen = 1; break;
     case OP.TRADE: bodyLen = 5 + r.boundedN(30); break;

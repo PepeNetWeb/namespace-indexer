@@ -2,14 +2,14 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
 /// Directed conformance vectors — the C# port of impls/c `scenario`. Each builds a
 /// deterministic, named construction and emits `name &lt;digest&gt;` (canonical §4 state
 /// digest) or `name &lt;u64&gt;`; the rolling `combined` sha256 (raw 32-byte digests /
 /// u64 LE) is the single-line cross-language check. These pin the spec's named edge
-/// cases (§6) with auditable outcomes, and cover the rare branches the random soak
+/// cases (§5) with auditable outcomes, and cover the rare branches the random soak
 /// almost never hits (deep displacement, i128 accumulation past 2^64, the fee oracle).
 /// </summary>
 public static class Scenarios
@@ -30,19 +30,8 @@ public static class Scenarios
     private static Tx Tx2(byte t0, byte t1, params Out[] outs) =>
         new() { Inputs = new List<Input> { In(t0), In(t1) }, Outputs = outs.ToList() };
 
-    private static Out Post(ulong value) =>
-        Out.Carrier(System.Text.Encoding.ASCII.GetBytes("hello"), value); // impls/c add_post
-    private static byte[] Tgt(byte b) { var t = new byte[32]; t[0] = b; return t; }
     private static byte[] Cmt(byte saltByte, string name, byte[] author) =>
         B.Commitment(B.Salt(saltByte), B.Name(name), author);
-
-    // impls/c decorate_n(): nrec empty (len-0) TLV records, tag = per-carrier index i+1.
-    private static byte[] DecorateN(int nrec)
-    {
-        var recs = new List<byte[]>();
-        for (int i = 0; i < nrec; i++) recs.Add(B.DecRecord((byte)(i + 1), Array.Empty<byte>()));
-        return B.Decorate(B.Concat(recs.ToArray()));
-    }
 
     /// <summary>Block driver mirroring C's sm_begin_block/sm_apply_tx: pre-block
     /// transitions via an empty ApplyBlock, then txs with EXPLICIT tx indexes.</summary>
@@ -244,23 +233,6 @@ public static class Scenarios
           s.Apply(Tx2(0xAA, 0xBB, Out.Carrier(B.Trade(0, 1, "aaa", "bbb"), 0)), 1); // anti-rug → drop
           EmitState("25_trade_rug_before", s); }
 
-        { var s = Minted(0xAA, "bob", 300, 1500); s.Begin(12, 1600);
-          s.Apply(Tx1(0xAA, Out.Carrier(B.Decorate(B.DecRecord(7, B.Name("reply"))), 0), Post(1)), 0); // owner → binds
-          s.Apply(Tx1(0xCC, Out.Carrier(B.Decorate(B.DecRecord(7, B.Name("x"))), 0), Post(1)), 1);     // nameless → drop
-          s.Apply(Tx1(0xAA, Out.Carrier(B.Decorate(B.DecRecord(7, B.Name("orphan"))), 0)), 2);         // orphan → drop
-          EmitState("26_decorate_gate", s); }
-
-        { var s = new S(); s.Begin(100, 1000);
-          s.Apply(Tx1(0xAA, Out.Carrier(B.Vote(true, Tgt(0x11), 0), 5),
-                            Out.Carrier(B.Vote(false, Tgt(0x11), 0), 2),
-                            Out.Carrier(B.Vote(true, Tgt(0x11), 0), 0)), 0);
-          EmitState("27_vote_score", s); }
-
-        // i128 accumulation past 2^64: three max-weight up-votes sum > 2^64 (a u64 impl wraps).
-        { var s = new S(); s.Begin(100, 1000);
-          for (int i = 0; i < 3; i++) s.Apply(Tx1(0xAA, Out.Carrier(B.Vote(true, Tgt(0x11), 0), ulong.MaxValue)), i);
-          EmitState("28_vote_past_u64", s); }
-
         // fee oracle (§3.4): signed under-claim clamp + participant filter + MIN_FEE_SAMPLE
         // degrade + lower-median + REF_SIZE scale + clamp. 4 participants < MIN_FEE_SAMPLE
         // ⇒ this small window now degrades to DUST_FLOOR (the big-window vectors are 49–51).
@@ -328,11 +300,6 @@ public static class Scenarios
         { var s = Minted(0xAA, "bob", 10, 1500); s.Begin(12, 865499); EmitState("36a_mtp_below_owned", s); }
         { var s = Minted(0xAA, "bob", 10, 1500); s.Begin(12, 865500); EmitState("36b_mtp_at_lapsed", s); }
 
-        // 37: i128 vote accumulator past −2⁶⁴ (three max down-votes; two's-complement LE).
-        { var s = new S(); s.Begin(100, 1000);
-          for (int i = 0; i < 3; i++) s.Apply(Tx1(0xAA, Out.Carrier(B.Vote(false, Tgt(0x11), 0), ulong.MaxValue)), i);
-          EmitState("37_vote_neg_past_u64", s); }
-
         // ── pre-block ordering & intra-block market races ──
         // 38: a same-block RENEW-vs-CLAIM race at the exact lapse tie. The pre-block lapse
         //     returns `bob` to the pool BEFORE any tx runs, so A's renew-all renews only `keep`
@@ -352,7 +319,7 @@ public static class Scenarios
           EmitState("38_lapse_renew_vs_claim", s); }
 
         // 39: a single pre-block tick that crosses reserve_expiry AND offer_expiry at once,
-        //     cascading RESERVED→LISTED→OWNED in one pass (§6 type-order reserve→offer→lease).
+        //     cascading RESERVED→LISTED→OWNED in one pass (§5 type-order reserve→offer→lease).
         { var s = Minted(0xAA, "w", 300, 1500);                           // lease_expiry = 25,921,500
           s.Begin(12, 1600); s.Apply(Tx1(0xAA, Out.Carrier(B.Sell(20000, 50000, "w"), 0)), 0);   // offer_expiry = 51600
           s.Begin(13, 1700); s.Apply(Tx1(0xBB, Out.Carrier(B.Reserve("w"), 100), B.Spend(A, K.TYPE_P2PKH, 100)), 0); // reserve_expiry = 19700 < 51600
@@ -504,9 +471,8 @@ public static class Scenarios
           }
           EmitU64("51_oracle_subsample_floor", Oracle.Rate(cb, by)); }             // → 1
 
-        // 52: charset = a DNS label [a-z0-9-], 1..32 (re-pinned 2026-07-07, supersedes
-        // the 2026-07-02 dot rule): hyphen and a 32-byte name MINT; '.' and '_' now DROP
-        // (uppercase still drops), leaving exactly the two valid names.
+        // 52: charset = a DNS label [a-z0-9-], 1..32: hyphen and a 32-byte name MINT;
+        // '.' and '_' DROP (uppercase still drops), leaving exactly the two valid names.
         { var s = new S();
           CommitThenClaim(s, 0xAA, "shib-p2p",                         0x71, 10, 1000, 10, 1500, 11);
           CommitThenClaim(s, 0xAA, "abcdefghijklmnopqrstuvwxyz0123ab", 0x72, 10, 2000, 12, 2500, 13);
@@ -514,30 +480,80 @@ public static class Scenarios
           CommitThenClaim(s, 0xAA, "shib_p2p",                         0x74, 10, 4000, 16, 4500, 17);
           EmitState("52_charset", s); }
 
-        // 53: §1 DECORATE pending-record cap (PendDecorMax = 64, pinned 2026-07-03).
-        // Owner posts 65 decoration records (26+26+13) then a body: exactly 64 bind, the
-        // 65th drops. An impl that buffers unbounded binds 65 → a different digest.
-        // Each DECORATE record is an empty (len-0) TLV [tag=i+1][0][0], i = per-carrier index.
-        { var s = Minted(0xAA, "d", 10, 1500);
-          s.Begin(12, 1600);
-          s.Apply(Tx1(0xAA,
-              Out.Carrier(DecorateN(26), 0),
-              Out.Carrier(DecorateN(26), 0),
-              Out.Carrier(DecorateN(13), 0),   // 65 records pending → 64 bind
-              Post(100)), 0);                  // body binds them (owner-signed)
-          EmitState("53_decor_pend_cap", s); }
+        // 52b: structural name rejects — leading/trailing hyphen and xn-- ACE drop.
+        { var s = new S();
+          CommitThenClaim(s, 0xAA, "-lead", 0x81, 10, 1000, 10, 1500, 11);
+          CommitThenClaim(s, 0xAA, "trail-", 0x82, 10, 2000, 12, 2500, 13);
+          CommitThenClaim(s, 0xAA, "xn--x",  0x83, 10, 3000, 14, 3500, 15);
+          CommitThenClaim(s, 0xAA, "ok-name",0x84, 10, 4000, 16, 4500, 17);
+          EmitState("52b_structural", s); }
 
-        // 54: NO per-tx count cap (§0). One tx carries 17 VOTE carriers — past the historical
-        // 16 — plus 17 payee outs; all fold. An impl that caps at 16 → a different vote score.
+        // 54: NO per-tx count cap (§0). One tx carries 17 COMMIT carriers past the
+        // historical 16; all fold. An impl that caps at 16 → a different commit count.
         { var s = new S();
           s.Begin(10, 1000);
           var outs = new List<Out>();
-          for (int i = 0; i < 17; i++) outs.Add(Out.Carrier(B.Vote(true, Tgt(0x55), 7), 3)); // 17 up-votes ×3
-          for (int i = 0; i < 17; i++) outs.Add(B.Spend(A, K.TYPE_P2PKH, 1));                // 17 payees
+          for (int i = 0; i < 17; i++)
+          {
+              var cmt = new byte[32]; cmt[0] = (byte)i;
+              outs.Add(Out.Carrier(B.Commit(cmt), 0));
+          }
+          for (int i = 0; i < 17; i++) outs.Add(B.Spend(A, K.TYPE_P2PKH, 1));
           s.Apply(Tx1(0xAA, outs.ToArray()), 0);
           EmitState("54_no_txcap", s); }
+
+        // 55: a name minted then RELEASEd earlier in the SAME block re-mints fresh on a
+        // later CLAIM in that block (§3.6 "immediately reclaimable"; row existence is
+        // authoritative, the block-local claim scratch never blocks a re-mint).
+        { var s = new S();
+          s.Begin(10, 1000);
+          s.Apply(Tx1(0xAA, Out.Carrier(B.Commit(Cmt(0x91, "foo", A)), 0)), 0);
+          s.Begin(11, 1500);
+          s.Apply(Tx1(0xAA, Out.Carrier(B.Claim(B.Salt(0x91), "foo"), 10)), 0);              // mint foo→A (A mut=11)
+          s.Apply(Tx1(0xAA, Out.Carrier(B.Release(11, new byte[] { 0x01 }), 0)), 1);         // release (row gone, scratch lingers)
+          s.Apply(Tx1(0xAA, Out.Carrier(B.Claim(B.Salt(0x91), "foo"), 10)), 2);              // MUST re-mint foo→A
+          EmitState("55_claim_release_reclaim_sameblock", s); }
+
+        // 55b: same, but the re-claim is by a DIFFERENT party B whose backing commit has
+        // LOWER priority than the departed A's — B still mints fresh (a released name's
+        // former owner priority is irrelevant once the row is gone).
+        { var s = new S();
+          s.Begin(10, 1000);
+          s.Apply(Tx1(0xAA, Out.Carrier(B.Commit(Cmt(0x91, "foo", A)), 0)), 0);              // A commit (10, tx0) — higher priority
+          s.Apply(Tx1(0xBB, Out.Carrier(B.Commit(Cmt(0x92, "foo", Bb)), 0)), 1);             // B commit (10, tx1) — lower priority
+          s.Begin(11, 1500);
+          s.Apply(Tx1(0xAA, Out.Carrier(B.Claim(B.Salt(0x91), "foo"), 10)), 0);              // A mints
+          s.Apply(Tx1(0xAA, Out.Carrier(B.Release(11, new byte[] { 0x01 }), 0)), 1);         // A releases
+          s.Apply(Tx1(0xBB, Out.Carrier(B.Claim(B.Salt(0x92), "foo"), 10)), 2);              // B mints fresh (owns foo)
+          EmitState("55b_reclaim_by_other", s); }
+
+        // 56: a self-transfer (TRANSFER-all whose target == the current owner) is a real
+        // move — it bumps last_set_mutation_height (owner's mut goes 11 → 12), NOT a no-op.
+        { var s = Minted(0xAA, "bar", 10, 1500);
+          s.Begin(12, 1600);
+          s.Apply(Tx1(0xAA, Out.Carrier(B.TransferAll(A), 0)), 0);
+          EmitState("56_self_transfer_bumps_mut", s); }
+
+        // 57: fee oracle with block_bytes == 0 — the /0 guard substitutes divisor 1 (NOT
+        // fee-per-byte 0), so the block still participates. 1000 blocks (== MIN_FEE_SAMPLE),
+        // each fee 5000 ⇒ per-byte 5000 ⇒ median 5000 × REF_SIZE 200 = 1_000_000.
+        { var cb = new ulong[1000]; var by = new ulong[1000];
+          for (int i = 0; i < 1000; i++) { cb[i] = K.SUBSIDY_KOINU + 5000; by[i] = 0; }
+          EmitU64("57_oracle_zero_bytes", Oracle.Rate(cb, by)); }                            // → 1000000
+
+        // 58: CLAIM burn near 2⁶⁴ at rate = DUST_FLOOR (1) — the lease day-count T overflows
+        // 64 bits (computed in 128-bit) and clamps to MAX_LEASE (365 days).
+        { var f = new Fold(0);
+          f.ApplyBlock(new Block { Height = 10, Mtp = 1000, Rate = 1 });
+          f.ApplyOneTx(Tx1(0xAA, Out.Carrier(B.Commit(Cmt(0x95, "foo", A)), 0)), 10, 1000, 1, 0);
+          f.ApplyBlock(new Block { Height = 11, Mtp = 1500, Rate = 1 });
+          f.ApplyOneTx(Tx1(0xAA, Out.Carrier(B.Claim(B.Salt(0x95), "foo"), ulong.MaxValue)), 11, 1500, 1, 0);
+          byte[] d58 = Digest.Compute(f);
+          Console.WriteLine($"58_lease_clamp_huge_burn {Hashing.Hex(d58)}");
+          feeds.Add(d58); }
 
         Console.WriteLine($"combined {Hashing.Hex(Hashing.Sha256(B.Concat(feeds.ToArray())))}");
         return 0;
     }
 }
+

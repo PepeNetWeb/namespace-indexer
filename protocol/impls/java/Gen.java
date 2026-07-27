@@ -9,10 +9,14 @@ import java.util.*;
 // that exercises the fold richly — enough to drive the generator-INDEPENDENT property
 // / reorg / meta assertions (violations==0, failures==0), which are the real
 // independent confirmations of fold correctness here.
+//
+// Names-only weights: COMMIT,CLAIM,RENEW,TRANSFER,SELL,RESERVE,SETTLE,RELEASE,SELL_TO,PAY,TRADE
+// (POST/VOTE removed; fall-back is COMMIT).
 final class Gen {
     static final int N_IDS = 16, NAME_POOL = 400;
     static final long BASE_TS = 1_700_000_000L;
-    static final int[] WEIGHTS = {12,12,14,13,5,5,8,7,7,3,6,5,4}; // POST,VOTE,COMMIT,CLAIM,RENEW,TRANSFER,SELL,RESERVE,SETTLE,RELEASE,SELL_TO,PAY,TRADE
+    // weights pinned to C gen.c (names/market only)
+    static final int[] WEIGHTS = {14, 13, 5, 5, 8, 7, 7, 3, 6, 5, 4};
     static int WSUM; static { int s=0; for (int w: WEIGHTS) s+=w; WSUM=s; }
 
     static byte[] identity(int i) { byte[] h = new byte[20]; h[0]=(byte)i; h[19]=(byte)i; return h; }
@@ -89,14 +93,14 @@ final class Gen {
         BigInteger leaseVal = rate28.multiply(BigInteger.valueOf(days)); // T == days
 
         switch (op) {
-            case 2 -> { // COMMIT
+            case 0 -> { // COMMIT
                 int j = rng.bnd(NAME_POOL); byte[] name = nameOf(j); byte[] salt = saltOf(saltCtr);
                 Pending p = new Pending(); p.idIdx = i; p.name = name; p.salt = salt; p.commitHeight = height; p.commitTime = mtp;
                 ready.add(p);
                 Action a = new Action(); a.op = Const.COMMIT; a.commitment = Hashes.sha256(Fold.concat(salt, name, id));
                 return oneIn(i, Model.TxOut.carrier(BigInteger.ZERO, Wire.encode(a)));
             }
-            case 3 -> { // CLAIM a ready commit (>=1 deep, live)
+            case 1 -> { // CLAIM a ready commit (>=1 deep, live)
                 for (int k = 0; k < ready.size(); k++) {
                     Pending p = ready.get(k);
                     if (p.commitHeight < height && mtp <= p.commitTime + Const.COMMIT_EXPIRY && !st.names.containsKey(State.nameKey(p.name))) {
@@ -106,15 +110,15 @@ final class Gen {
                     }
                 }
             }
-            case 4 -> { // RENEW all (owner with names)
+            case 2 -> { // RENEW all (owner with names)
                 List<String> owned = namesWhere(st, id, -1);
                 if (!owned.isEmpty()) { Action a = new Action(); a.op = Const.RENEW; a.renewMode = 0; return oneIn(i, Model.TxOut.carrier(leaseVal, Wire.encode(a))); }
             }
-            case 5 -> { // TRANSFER all to a random id
+            case 3 -> { // TRANSFER all to a random id
                 List<String> owned = namesWhere(st, id, Const.OWNED);
                 if (!owned.isEmpty()) { Action a = new Action(); a.op = Const.TRANSFER; a.tTarget = identity(rng.bnd(N_IDS)); a.selective = false; return oneIn(i, Model.TxOut.carrier(BigInteger.ZERO, Wire.encode(a))); }
             }
-            case 6 -> { // SELL an owned name with enough lease tail
+            case 4 -> { // SELL an owned name with enough lease tail
                 List<String> owned = namesWhere(st, id, Const.OWNED);
                 for (String nm : owned) {
                     State.NameRow r = st.names.get(nm);
@@ -125,7 +129,7 @@ final class Gen {
                     }
                 }
             }
-            case 7 -> { // RESERVE a listed name (buyer != seller)
+            case 5 -> { // RESERVE a listed name (buyer != seller)
                 List<String> listed = namesWhere(st, null, Const.LISTED);
                 if (!listed.isEmpty()) {
                     String nm = listed.get(rng.bnd(listed.size())); State.NameRow r = st.names.get(nm);
@@ -135,7 +139,7 @@ final class Gen {
                     return oneIn(buyer, Model.TxOut.carrier(burn, Wire.encode(a)), Model.TxOut.spend(payL, r.seller, r.sellerType));
                 }
             }
-            case 8 -> { // SETTLE a reserved name (by its reserver)
+            case 6 -> { // SETTLE a reserved name (by its reserver)
                 List<String> res = namesWhere(st, null, Const.RESERVED);
                 if (!res.isEmpty()) {
                     String nm = res.get(rng.bnd(res.size())); State.NameRow r = st.names.get(nm);
@@ -145,7 +149,7 @@ final class Gen {
                     return oneIn(buyer, Model.TxOut.carrier(BigInteger.ZERO, Wire.encode(a)), Model.TxOut.spend(rem, r.seller, r.sellerType));
                 }
             }
-            case 9 -> { // RELEASE owned names via a full-ish bitmap
+            case 7 -> { // RELEASE owned names via a full-ish bitmap
                 List<String> set = st.ownedSetSorted(id);
                 if (!set.isEmpty()) {
                     byte[] flags = new byte[(set.size() + 7) / 8]; Arrays.fill(flags, (byte) 0xFF);
@@ -154,7 +158,7 @@ final class Gen {
                     if (a.anchor <= height) return oneIn(i, Model.TxOut.carrier(BigInteger.ZERO, Wire.encode(a)));
                 }
             }
-            case 10 -> { // SELL_TO
+            case 8 -> { // SELL_TO
                 List<String> owned = namesWhere(st, id, Const.OWNED);
                 for (String nm : owned) {
                     State.NameRow r = st.names.get(nm);
@@ -164,7 +168,7 @@ final class Gen {
                     }
                 }
             }
-            case 11 -> { // PAY an offered name (by its named buyer)
+            case 9 -> { // PAY an offered name (by its named buyer)
                 List<String> off = namesWhere(st, null, Const.OFFERED);
                 if (!off.isEmpty()) {
                     String nm = off.get(rng.bnd(off.size())); State.NameRow r = st.names.get(nm);
@@ -173,7 +177,7 @@ final class Gen {
                     return oneIn(buyer, Model.TxOut.carrier(BigInteger.ZERO, Wire.encode(a)), Model.TxOut.spend(r.price, r.seller, r.sellerType));
                 }
             }
-            case 12 -> { // TRADE two owned names between two ids
+            case 10 -> { // TRADE two owned names between two ids
                 List<String> myOwned = namesWhere(st, id, Const.OWNED);
                 int i2 = (i + 1 + rng.bnd(N_IDS - 1)) % N_IDS; byte[] id2 = identity(i2);
                 List<String> theirs = namesWhere(st, id2, Const.OWNED);
@@ -186,20 +190,11 @@ final class Gen {
                     }
                 }
             }
-            case 0 -> { // POST (optionally decorated if the author owns a name)
-                byte[] body = ("post" + base36((int) (saltCtr % 1000))).getBytes(StandardCharsets.US_ASCII);
-                if (!namesWhere(st, id, -1).isEmpty() && rng.bnd(2) == 0) {
-                    Action dec = new Action(); dec.op = Const.DECORATE; dec.decTlv = Behav.tlv(1 + rng.bnd(20), new byte[]{(byte) rng.bnd(256)});
-                    return oneIn(i, Model.TxOut.carrier(BigInteger.ZERO, Wire.encode(dec)), Model.TxOut.carrier(BigInteger.valueOf(1 + rng.bnd(50)), body));
-                }
-                return oneIn(i, Model.TxOut.carrier(BigInteger.valueOf(1 + rng.bnd(50)), body));
-            }
         }
-        // VOTE fallback (always valid): target a synthetic earlier post id
-        long th = height == 0 ? 0 : rng.bounded(height);
-        byte[] target = Model.synthTxid(th, rng.bnd(8));
-        Action a = new Action(); a.op = (rng.bnd(2) == 0) ? Const.VOTE_UP : Const.VOTE_DOWN; a.target = target; a.vout = rng.bnd(4);
-        return oneIn(i, Model.TxOut.carrier(BigInteger.valueOf(1 + rng.bnd(1000)), Wire.encode(a)));
+        // COMMIT fallback (always valid) when the chosen op has no target
+        int j = rng.bnd(NAME_POOL); byte[] name = nameOf(j); byte[] salt = saltOf(saltCtr + 99);
+        Action a = new Action(); a.op = Const.COMMIT; a.commitment = Hashes.sha256(Fold.concat(salt, name, id));
+        return oneIn(i, Model.TxOut.carrier(BigInteger.ZERO, Wire.encode(a)));
     }
 
     static int idxOf(byte[] id) { for (int k = 0; k < N_IDS; k++) if (Arrays.equals(identity(k), id)) return k; return 0; }

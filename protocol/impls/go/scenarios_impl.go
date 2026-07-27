@@ -426,29 +426,33 @@ func scDirectedStrangerDrop() *FoldState {
 }
 
 func scASAttribution() *FoldState {
-	// One tx: vin0 = custodian C (funding), vin1 = user U. AS 1 re-points to U, who VOTEs.
-	C := idOf(8, 0)
-	U := idOf(2, 0)
-	target := makeSyntheticTxid(1, 0)
-	voteBody := append(append([]byte{}, target[:]...), leBytes32(0)...)
-	tx := FoldTx{txIndex: 0, inputs: []Identity{C, U},
+	// AS attribution — claim attributed to vin[1]=B (matches B's commit).
+	A := idOf(1, 0)
+	B := idOf(2, 0)
+	salt := salt32(0x55)
+	s := newState()
+	s.applyBlock(blk(1, T0, tx1(0, B, 0, commitPayload(salt, "bob", B.h160))))
+	// vin0=A (funding), vin1=B; AS 1 re-points CLAIM to B.
+	claimBody := append(append([]byte{}, salt[:]...), "bob"...)
+	tx := FoldTx{txIndex: 0, inputs: []Identity{A, B},
 		carriers: []FoldCarrier{
 			carrier(0, 0, payload(OP_AS, 0x01)),
-			carrier(1, 5, payload(OP_VOTE_UP, voteBody...)),
+			carrier(1, 10, payload(OP_CLAIM, claimBody...)),
 		}}
-	s := fold(blk(1, T0, tx))
-	// vote recorded; attribution is to U but votes don't store voter in our digest model;
-	// assert the vote exists with weight 5.
-	v := s.votes[voteKey(target, 0)]
-	check(v != nil && v.score.lo == 5 && v.score.hi == 0, "AS-attributed vote recorded")
+	s.applyBlock(blk(2, T0+300, tx))
+	o, ok := ownerOf(s, "bob")
+	check(ok && o == B.h160, "AS-attributed claim mints to vin[1]")
 	// AS out-of-range → segment drops.
-	tx2 := FoldTx{txIndex: 0, inputs: []Identity{C, U},
+	s2 := newState()
+	s2.applyBlock(blk(1, T0, tx1(0, B, 0, commitPayload(salt, "bob", B.h160))))
+	tx2 := FoldTx{txIndex: 0, inputs: []Identity{A, B},
 		carriers: []FoldCarrier{
 			carrier(0, 0, payload(OP_AS, 0x05)), // OOB
-			carrier(1, 5, payload(OP_VOTE_UP, voteBody...)),
+			carrier(1, 10, payload(OP_CLAIM, claimBody...)),
 		}}
-	s2 := fold(blk(1, T0, tx2))
-	check(s2.votes[voteKey(target, 0)] == nil, "AS OOB drops its segment")
+	s2.applyBlock(blk(2, T0+300, tx2))
+	_, ok2 := ownerOf(s2, "bob")
+	check(!ok2, "AS OOB drops its segment (claim fails)")
 	return s
 }
 
@@ -499,62 +503,6 @@ func mintTo(s *FoldState, id Identity, name string, saltb byte) {
 	h := s.curHeight
 	s.applyBlock(blk(h+1, T0+int64(h)*300, tx1(0, id, 0, commitPayload(salt, name, id.h160))))
 	s.applyBlock(blk(h+2, T0+int64(h+1)*300, tx1(0, id, 365, claimPayload(salt, name))))
-}
-
-func scDecorateBind() *FoldState {
-	// DECORATE then body (text post) by an author owning ≥1 name → records bound.
-	A := idOf(1, 0)
-	s := newState()
-	mintTo(s, A, "alpha", 0xA0) // A owns a name (gate)
-	// record: tag=0x01, len=2, value=0xAA 0xBB
-	rec := []byte{0x01, 0x02, 0x00, 0xAA, 0xBB}
-	decP := payload(OP_DECORATE, rec...)
-	post := []byte("hello world")
-	tx := FoldTx{txIndex: 0, inputs: []Identity{A},
-		carriers: []FoldCarrier{
-			carrier(0, 0, decP),
-			carrier(1, 100, post),
-		}}
-	s.applyBlock(blk(s.curHeight+1, T0+9000, tx))
-	check(len(s.decors) == 1, "decorate binds one record to the post")
-	if len(s.decors) == 1 {
-		check(bytesEqual(s.decors[0].rec, rec), "decoration rec stored as full on-wire record")
-	}
-	return s
-}
-
-func scDecorateOrphan() *FoldState {
-	A := idOf(1, 0)
-	s := newState()
-	mintTo(s, A, "alpha", 0xA0)
-	rec := []byte{0x01, 0x01, 0x00, 0xAA}
-	decP := payload(OP_DECORATE, rec...)
-	// DECORATE with no following body → orphan dropped.
-	tx := FoldTx{txIndex: 0, inputs: []Identity{A},
-		carriers: []FoldCarrier{carrier(0, 0, decP)}}
-	s.applyBlock(blk(s.curHeight+1, T0+9000, tx))
-	check(len(s.decors) == 0, "orphan decorate dropped at tx end")
-	return s
-}
-
-func scVoteI128() *FoldState {
-	// Accumulate up-votes past 2^64 into the i128 score (no wrap, no overflow flag).
-	A := idOf(1, 0)
-	target := makeSyntheticTxid(1, 0)
-	voteBody := append(append([]byte{}, target[:]...), leBytes32(0)...)
-	s := newState()
-	big := uint64(0xFFFFFFFFFFFFFFFF)
-	// two max-weight up-votes → score = 2^65-2, needs i128.
-	tx := FoldTx{txIndex: 0, inputs: []Identity{A},
-		carriers: []FoldCarrier{
-			carrier(0, big, payload(OP_VOTE_UP, voteBody...)),
-			carrier(1, big, payload(OP_VOTE_UP, voteBody...)),
-		}}
-	s.applyBlock(blk(2, T0+300, tx))
-	v := s.votes[voteKey(target, 0)]
-	check(v != nil && v.score.hi == 1 && v.score.lo == 0xFFFFFFFFFFFFFFFE, "i128 accumulates past 2^64")
-	check(!s.overflow, "no 128-bit overflow for two u64 votes")
-	return s
 }
 
 func scLapseVsRenewSameBlock() *FoldState {
@@ -653,7 +601,7 @@ func scOracleSubsampleFloor() uint64 {
 	return r
 }
 
-// medianTimePast = median of timestamps of the ≤11 blocks strictly before H (§6).
+// medianTimePast = median of timestamps of the ≤11 blocks strictly before H (§5).
 // k = min(11, #predecessors); sort; index ⌊k/2⌋ (upper-middle for even); MTP(0)=0.
 func medianTimePast(predecessors []int64) int64 {
 	k := len(predecessors)
@@ -686,32 +634,56 @@ func testWaterFillUnits() {
 }
 
 func testWireCodec() {
-	A := idOf(1, 0)
-	// VOTE_UP 36-byte body → ACTION.
-	vb := make([]byte, 36)
-	c := decode(payload(OP_VOTE_UP, vb...), 0)
-	check(c.kind == ACTION && c.opcode == OP_VOTE_UP, "decode VOTE_UP action")
+	// demux: bare UTF-8 / overlay / non-prefix → IGNORE; only name actions → ACTION.
+	c := decode([]byte("hello"), 1)
+	check(c.kind == IGNORE, "decode bare UTF-8 → IGNORE")
+	c = decode([]byte{0xFF, 0x50, 0x4E, 0xD6, 0x00}, 0)
+	check(c.kind == IGNORE, "decode overlay opcode → IGNORE")
+	// COMMIT 32-byte body → ACTION.
+	cm := make([]byte, 32)
+	c = decode(payload(OP_COMMIT, cm...), 0)
+	check(c.kind == ACTION && c.opcode == OP_COMMIT, "decode COMMIT action")
 	// wrong length → IGNORE.
-	c = decode(payload(OP_VOTE_UP, vb[:10]...), 0)
-	check(c.kind == IGNORE, "decode VOTE_UP wrong length → IGNORE")
-	// text post valid UTF-8 + value>0 → POST.
-	c = decode([]byte("héllo"), 5)
-	check(c.kind == POST, "decode text post")
-	// zero-value valid UTF-8 → IGNORE.
-	c = decode([]byte("hello"), 0)
-	check(c.kind == IGNORE, "decode zero-value post → IGNORE")
-	// invalid UTF-8 with value>0 → IGNORE.
-	c = decode([]byte{0xC0, 0x80}, 5)
-	check(c.kind == IGNORE, "decode invalid UTF-8 → IGNORE")
+	c = decode(payload(OP_COMMIT, cm[:10]...), 0)
+	check(c.kind == IGNORE, "decode COMMIT wrong length → IGNORE")
 	// uppercase name in CLAIM → IGNORE.
 	z := salt32(0)
 	body := append(append([]byte{}, z[:]...), "Alpha"...)
 	c = decode(payload(OP_CLAIM, body...), 0)
 	check(c.kind == IGNORE, "decode CLAIM uppercase name → IGNORE")
-	// malformed action (0xFF lead, bad opcode) → IGNORE, never POST.
+	// structural rejects on CLAIM name.
+	body = append(append([]byte{}, z[:]...), "-a"...)
+	c = decode(payload(OP_CLAIM, body...), 0)
+	check(c.kind == IGNORE, "decode CLAIM leading hyphen → IGNORE")
+	body = append(append([]byte{}, z[:]...), "xn--x"...)
+	c = decode(payload(OP_CLAIM, body...), 0)
+	check(c.kind == IGNORE, "decode CLAIM ACE prefix → IGNORE")
+	// malformed action (0xFF lead, bad opcode) → IGNORE.
 	c = decode([]byte{0xFF, 0x50, 0x4E, 0xFE, 0x00}, 5)
-	check(c.kind == IGNORE, "malformed action never a post")
-	_ = A
+	check(c.kind == IGNORE, "malformed action → IGNORE")
+
+	// §6 pinned carrier ceiling: flags at the exact consensus caps decode;
+	// one byte past the ceiling is IGNORE (fail-closed).
+	wideBody := make([]byte, 5+FLAGS_MAX) // anchor5 + flags at cap
+	for i := range wideBody {
+		wideBody[i] = byte(i*7 + 1)
+	}
+	wide := payload(OP_RENEW, wideBody...)
+	check(len(wide) == CARRIER_MAX, "RENEW at cap is exactly CARRIER_MAX (9996) payload bytes")
+	c = decode(wide, 0)
+	check(c.kind == ACTION && len(c.flags) == FLAGS_MAX,
+		"RENEW-selective decodes with all 9987 flag bytes")
+	c = decode(append(wide, 0x00), 0)
+	check(c.kind == IGNORE, "one byte past the L1 ceiling → IGNORE")
+	xferBody := make([]byte, 25+FLAGS_XFER_MAX) // target20 + anchor5 + flags at cap
+	c = decode(payload(OP_TRANSFER, xferBody...), 0)
+	check(c.kind == ACTION && len(c.flags) == FLAGS_XFER_MAX,
+		"TRANSFER-selective decodes at FLAGS_XFER_MAX (9967)")
+	c = decode(payload(OP_TRANSFER, append(xferBody, 0x00)...), 0)
+	check(c.kind == IGNORE, "TRANSFER flags past the cap → IGNORE")
+	relBody := make([]byte, 5+FLAGS_MAX)
+	c = decode(payload(OP_RELEASE, relBody...), 0)
+	check(c.kind == ACTION && len(c.flags) == FLAGS_MAX, "RELEASE decodes at FLAGS_MAX")
 }
 
 func runAttribSelftest() {

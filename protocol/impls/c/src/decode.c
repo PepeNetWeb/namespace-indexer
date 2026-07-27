@@ -2,12 +2,10 @@
 //
 // The base fold (fold.c) consumes already-decoded SmCarriers; this file is the
 // part a real indexer does FIRST: turn an OP_RETURN payload (the bytes of the
-// single minimal push, §1) into ACTION / POST / IGNORE, deterministically and
-// byte-for-byte identically across indexers (§0 "indexers MUST agree byte-for-byte
-// on validity"). `sm fuzz` feeds millions of random + grammar-perturbed payloads
-// through sm_decode_payload and cross-checks the result, so any parser/bounds
-// divergence between languages surfaces here. The codec is pinned in
-// SPEC-conformance.md §9; the field layouts mirror §2's registry exactly.
+// single minimal push, §1) into ACTION / IGNORE, deterministically and
+// byte-for-byte identically across indexers. `sm fuzz` feeds millions of random
+// + grammar-perturbed payloads through sm_decode_payload. Pinned in
+// SPEC-conformance.md §9; field layouts mirror §2's registry.
 #include "sm.h"
 #include <string.h>
 
@@ -19,43 +17,12 @@ static void     wr32(uint8_t *b, uint32_t v) { for (int i = 0; i < 4; i++) b[i] 
 static void     wr64(uint8_t *b, uint64_t v) { for (int i = 0; i < 8; i++) b[i] = (uint8_t)(v >> (8*i)); }
 static void     wr5 (uint8_t *b, uint64_t v) { for (int i = 0; i < 5; i++) b[i] = (uint8_t)(v >> (8*i)); }
 
-// ── RFC 3629 strict UTF-8 (§1 text-post demux) ───────────────────────────────
-// Reject overlong encodings, surrogates U+D800..U+DFFF, and code points > U+10FFFF.
-// A whole-payload test: a payload valid up front but invalid later is NOT UTF-8.
-int sm_valid_utf8(const uint8_t *p, size_t len) {
-    size_t i = 0;
-    while (i < len) {
-        uint8_t c = p[i];
-        if (c < 0x80) { i++; continue; }                       // ASCII
-        int n; uint32_t cp, lo, hi;
-        if      ((c & 0xE0) == 0xC0) { n = 1; cp = c & 0x1F; lo = 0x80;    hi = 0x7FF; }
-        else if ((c & 0xF0) == 0xE0) { n = 2; cp = c & 0x0F; lo = 0x800;   hi = 0xFFFF; }
-        else if ((c & 0xF8) == 0xF0) { n = 3; cp = c & 0x07; lo = 0x10000; hi = 0x10FFFF; }
-        else return 0;                                         // 0x80..0xBF lead, or 0xF8+ → invalid
-        if (i + (size_t)n >= len) return 0;                    // truncated: need n continuation bytes in-buffer
-        for (int k = 1; k <= n; k++) {
-            uint8_t cc = p[i + (size_t)k];
-            if ((cc & 0xC0) != 0x80) return 0;                 // not a continuation byte
-            cp = (cp << 6) | (cc & 0x3F);
-        }
-        if (cp < lo || cp > hi) return 0;                      // overlong or out of range
-        if (cp >= 0xD800 && cp <= 0xDFFF) return 0;            // surrogate half
-        i += (size_t)n + 1;
-    }
-    return 1;
-}
-
 // ── action decode (the part after the 4-byte 0xFF 'P' 'N' opcode header) ─────
 // b = payload+4, blen = len-4. Returns 1 with `a` filled (a->op set), else 0.
 static int decode_action(const uint8_t *b, size_t blen, uint8_t op, SmAction *a) {
     memset(a, 0, sizeof *a);
     a->op = op;
     switch (op) {
-    case SM_OP_VOTE_UP:
-    case SM_OP_VOTE_DOWN:
-        if (blen != 36) return 0;                              // txid(32) + vout(4)
-        memcpy(a->target_txid, b, 32); a->target_vout = rd32(b + 32);
-        return 1;
     case SM_OP_COMMIT:
         if (blen != 32) return 0;
         memcpy(a->commitment, b, 32);
@@ -68,23 +35,23 @@ static int decode_action(const uint8_t *b, size_t blen, uint8_t op, SmAction *a)
         memcpy(a->name, b + 32, nl); a->name[nl] = 0; a->name_len = (uint8_t)nl;
         return 1;
     }
-    case SM_OP_RENEW:                                          // 0=all | 5=all-safe | 6..76=selective
+    case SM_OP_RENEW:                                          // 0=all | 5=all-safe | 6..SM_BODY_MAX=selective
         if (blen == 0) { a->has_anchor = 0; a->flags_len = 0; return 1; }
         if (blen == 5) { a->has_anchor = 1; a->anchor = rd5(b); a->flags_len = 0; return 1; }
-        if (blen >= 6 && blen <= 76) {
+        if (blen >= 6 && blen <= SM_BODY_MAX) {
             a->has_anchor = 1; a->anchor = rd5(b);
-            size_t fl = blen - 5;                              // 1..71
-            memcpy(a->flags, b + 5, fl); a->flags_len = (uint8_t)fl;
+            size_t fl = blen - 5;                              // 1..SM_FLAGS_MAX
+            memcpy(a->flags, b + 5, fl); a->flags_len = (uint16_t)fl;
             return 1;
         }
         return 0;
-    case SM_OP_TRANSFER:                                       // 20=all | 26..76=selective
+    case SM_OP_TRANSFER:                                       // 20=all | 26..SM_BODY_MAX=selective
         if (blen == 20) { memcpy(a->addr, b, 20); a->has_anchor = 0; return 1; }
-        if (blen >= 26 && blen <= 76) {
+        if (blen >= 26 && blen <= SM_BODY_MAX) {
             memcpy(a->addr, b, 20);
             a->has_anchor = 1; a->anchor = rd5(b + 20);
-            size_t fl = blen - 25;                             // 1..51
-            memcpy(a->flags, b + 25, fl); a->flags_len = (uint8_t)fl;
+            size_t fl = blen - 25;                             // 1..SM_FLAGS_XFER_MAX
+            memcpy(a->flags, b + 25, fl); a->flags_len = (uint16_t)fl;
             return 1;
         }
         return 0;
@@ -96,6 +63,8 @@ static int decode_action(const uint8_t *b, size_t blen, uint8_t op, SmAction *a)
         memcpy(a->name, b + 12, nl); a->name[nl] = 0; a->name_len = (uint8_t)nl;
         return 1;
     }
+    case SM_OP_RENEW_NAME:
+    case SM_OP_RELEASE_NAME:
     case SM_OP_RESERVE:
     case SM_OP_SETTLE:
     case SM_OP_PAY: {                                          // name(1..32)
@@ -104,14 +73,18 @@ static int decode_action(const uint8_t *b, size_t blen, uint8_t op, SmAction *a)
         memcpy(a->name, b, blen); a->name[blen] = 0; a->name_len = (uint8_t)blen;
         return 1;
     }
-    case SM_OP_RELEASE:                                        // anchor(5)+flags(1..71)
-        if (blen < 6 || blen > 76) return 0;
-        a->has_anchor = 1; a->anchor = rd5(b);
-        { size_t fl = blen - 5; memcpy(a->flags, b + 5, fl); a->flags_len = (uint8_t)fl; }
+    case SM_OP_TRANSFER_NAME: {                                // target(20)+name(1..32)
+        if (blen < 21 || blen > 52) return 0;
+        memcpy(a->addr, b, 20);
+        size_t nl = blen - 20;
+        if (!sm_name_valid((const char *)(b + 20), nl)) return 0;
+        memcpy(a->name, b + 20, nl); a->name[nl] = 0; a->name_len = (uint8_t)nl;
         return 1;
-    case SM_OP_DECORATE:                                       // raw TLV records (fold parses, fail-closed)
-        if (blen > SM_DEC_MAX) return 0;                       // ≤ 76 in practice (len ≤ 80)
-        memcpy(a->dec, b, blen); a->dec_len = (uint8_t)blen;
+    }
+    case SM_OP_RELEASE:                                        // anchor(5)+flags(1..SM_FLAGS_MAX)
+        if (blen < 6 || blen > SM_BODY_MAX) return 0;
+        a->has_anchor = 1; a->anchor = rd5(b);
+        { size_t fl = blen - 5; memcpy(a->flags, b + 5, fl); a->flags_len = (uint16_t)fl; }
         return 1;
     case SM_OP_SELL_TO: {                                      // price(8)+buyer(20)+name(1..32)
         if (blen < 29 || blen > 60) return 0;
@@ -140,40 +113,33 @@ static int decode_action(const uint8_t *b, size_t blen, uint8_t op, SmAction *a)
         return 1;
     }
     default:
-        return 0;                                             // opcode 0x00 or > 0x0F
+        return 0;                                             // outside 0x01..0x0F
     }
 }
 
 void sm_decode_payload(const uint8_t *payload, size_t len, uint64_t value, SmCarrier *car) {
+    (void)value;
     memset(&car->act, 0, sizeof car->act);
-    car->post_len = 0;
     car->kind = SM_CAR_IGNORE;
 
     // §1 action recognition: prefix 0xFF 'P' 'N' + opcode 0x01..0x0F.
     if (len >= 4 && payload[0] == 0xFF && payload[1] == 0x50 && payload[2] == 0x4E) {
         uint8_t op = payload[3];
-        if (decode_action(payload + 4, len - 4, op, &car->act)) car->kind = SM_CAR_ACTION;
-        else                                                    car->kind = SM_CAR_IGNORE;  // malformed action (0xFF ⇒ not a post)
+        if (op >= SM_OP_MIN && op <= SM_OP_MAX &&
+            decode_action(payload + 4, len - 4, op, &car->act))
+            car->kind = SM_CAR_ACTION;
+        // else IGNORE (malformed / unknown opcode / overlay band)
         return;
     }
-    // §1 text-post demux: whole-payload strict UTF-8 with a burn (value > 0).
-    if (value > 0 && len >= 1 && sm_valid_utf8(payload, len)) {
-        car->kind = SM_CAR_POST;
-        size_t pl = len > SM_POST_MAX ? SM_POST_MAX : len;
-        memcpy(car->post, payload, pl); car->post_len = (uint8_t)pl;
-        return;
-    }
+    // everything else (UTF-8 noise, overlay, empty) → IGNORE
     car->kind = SM_CAR_IGNORE;
 }
 
 // ── canonical action encoder (inverse of decode_action; grammar-aware fuzz) ──
-size_t sm_encode_action(const SmAction *a, uint8_t out[80]) {
+size_t sm_encode_action(const SmAction *a, uint8_t out[SM_CARRIER_MAX]) {
     out[0] = 0xFF; out[1] = 0x50; out[2] = 0x4E; out[3] = a->op;
     uint8_t *b = out + 4;
     switch (a->op) {
-    case SM_OP_VOTE_UP:
-    case SM_OP_VOTE_DOWN:
-        memcpy(b, a->target_txid, 32); wr32(b + 32, a->target_vout); return 40;
     case SM_OP_COMMIT:
         memcpy(b, a->commitment, 32); return 36;
     case SM_OP_CLAIM:
@@ -182,31 +148,33 @@ size_t sm_encode_action(const SmAction *a, uint8_t out[80]) {
     case SM_OP_RENEW:
         if (!a->has_anchor && a->flags_len == 0) return 4;                 // all
         if (a->has_anchor && a->flags_len == 0) { wr5(b, a->anchor); return 9; }   // all-safe
-        if (a->has_anchor && a->flags_len >= 1 && a->flags_len <= 71) {
-            wr5(b, a->anchor); memcpy(b + 5, a->flags, a->flags_len); return 9 + a->flags_len;
+        if (a->has_anchor && a->flags_len >= 1 && a->flags_len <= SM_FLAGS_MAX) {
+            wr5(b, a->anchor); memcpy(b + 5, a->flags, a->flags_len); return 9 + (size_t)a->flags_len;
         }
         return 0;
     case SM_OP_TRANSFER:
         memcpy(b, a->addr, 20);
         if (!a->has_anchor) return 24;                                     // all
-        if (a->flags_len >= 1 && a->flags_len <= 51) {
-            wr5(b + 20, a->anchor); memcpy(b + 25, a->flags, a->flags_len); return 29 + a->flags_len;
+        if (a->flags_len >= 1 && a->flags_len <= SM_FLAGS_XFER_MAX) {
+            wr5(b + 20, a->anchor); memcpy(b + 25, a->flags, a->flags_len); return 29 + (size_t)a->flags_len;
         }
         return 0;
     case SM_OP_SELL:
         if (a->name_len < 1 || a->name_len > 32) return 0;
         wr64(b, a->price); wr32(b + 8, a->window); memcpy(b + 12, a->name, a->name_len); return 16 + a->name_len;
+    case SM_OP_RENEW_NAME:
+    case SM_OP_RELEASE_NAME:
     case SM_OP_RESERVE:
     case SM_OP_SETTLE:
     case SM_OP_PAY:
         if (a->name_len < 1 || a->name_len > 32) return 0;
         memcpy(b, a->name, a->name_len); return 4 + a->name_len;
+    case SM_OP_TRANSFER_NAME:
+        if (a->name_len < 1 || a->name_len > 32) return 0;
+        memcpy(b, a->addr, 20); memcpy(b + 20, a->name, a->name_len); return 24 + a->name_len;
     case SM_OP_RELEASE:
-        if (a->flags_len < 1 || a->flags_len > 71) return 0;
-        wr5(b, a->anchor); memcpy(b + 5, a->flags, a->flags_len); return 9 + a->flags_len;
-    case SM_OP_DECORATE:
-        if (a->dec_len > SM_DEC_MAX) return 0;
-        memcpy(b, a->dec, a->dec_len); return 4 + a->dec_len;
+        if (a->flags_len < 1 || a->flags_len > SM_FLAGS_MAX) return 0;
+        wr5(b, a->anchor); memcpy(b + 5, a->flags, a->flags_len); return 9 + (size_t)a->flags_len;
     case SM_OP_SELL_TO:
         if (a->name_len < 1 || a->name_len > 32) return 0;
         wr64(b, a->price); memcpy(b + 8, a->addr, 20); memcpy(b + 28, a->name, a->name_len); return 32 + a->name_len;

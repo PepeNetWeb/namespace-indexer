@@ -56,9 +56,20 @@ static void mod_p_once(uint8_t x[32]) {
     }
 }
 
+// Canonical SEC1 prefix gate — the self-rolled reference accepts ONLY 0x02/0x03 for
+// 33-byte and 0x04 for 65-byte keys. libsecp's ec_pubkey_parse ALSO accepts the
+// 65-byte HYBRID forms (0x06/0x07); admitting those here would make the shim accept
+// a key the pure impls reject → a consensus split for any direct caller. Reject them
+// before delegating so the shim and the reference accept exactly the same set.
+static int sec1_prefix_ok(const uint8_t *pub, int plen) {
+    if (plen == 33) return pub[0] == 0x02 || pub[0] == 0x03;
+    if (plen == 65) return pub[0] == 0x04;
+    return 0;
+}
+
 // ── on-curve (canonical-ENCODING is the caller's job, per §4) ─────────────────
 int secp_on_curve(const uint8_t *pub, int plen) {
-    if (plen != 33 && plen != 65) return 0;
+    if (!sec1_prefix_ok(pub, plen)) return 0;
     secp256k1_pubkey pk;
     return secp256k1_ec_pubkey_parse(CTX, &pk, pub, (size_t)plen) ? 1 : 0;
 }
@@ -68,6 +79,7 @@ int secp_on_curve(const uint8_t *pub, int plen) {
 // like the self-rolled reference which left low-S to the caller). ───────────────
 int secp_ecdsa_verify(const uint8_t hash32[32], const uint8_t r32[32],
                       const uint8_t s32[32], const uint8_t *pub, int plen) {
+    if (!sec1_prefix_ok(pub, plen)) return 0;               // reject hybrid (0x06/0x07), match pure impls
     secp256k1_pubkey pk;
     if (!secp256k1_ec_pubkey_parse(CTX, &pk, pub, (size_t)plen)) return 0;
     uint8_t compact[64];

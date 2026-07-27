@@ -14,4 +14,4 @@ Not compiled by this repo's own builds (the conformance harness deliberately use
 the self-rolled oracle). A consumer compiles it with the vendored library's include
 dir ahead of `impls/c/src` — both trees ship a header literally named
 `secp256k1.h`, and this file's `#include <secp256k1.h>` must resolve to the vendor
-one. See `pepenet-indexer` / `pepenet-social` Makefiles for the -I pattern.
+one. See the `namespace-indexer` Makefile for the -I pattern.

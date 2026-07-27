@@ -6,3 +6,6 @@ build/
 *.db-shm
 *.dSYM/
 .DS_Store
+test_db
+test_sync
+test_codec

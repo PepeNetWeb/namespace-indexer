@@ -35,15 +35,8 @@ export function carrier(op: number, body: Bytes, value = 0n, vout = 0): FoldCarr
 export function rawCarrier(payload: Bytes, value = 0n, vout = 0): FoldCarrier {
   return { payload, value, vout };
 }
-export function postCarrier(text: string | Bytes, value = 1n, vout = 0): FoldCarrier {
-  return { payload: typeof text === "string" ? str(text) : text, value, vout };
-}
 
-// ─── per-op body builders ─────────────────────────────────────────────────────────────────────
-export const voteUp = (target: Bytes, vout: number, weight: bigint, cvout = 0): FoldCarrier =>
-  carrier(OP.VOTE_UP, concat(target, u32le(vout)), weight, cvout);
-export const voteDown = (target: Bytes, vout: number, weight: bigint, cvout = 0): FoldCarrier =>
-  carrier(OP.VOTE_DOWN, concat(target, u32le(vout)), weight, cvout);
+// ─── per-op body builders (names-only 0x01–0x0C) ──────────────────────────────────────────────
 export const commit = (commitment: Bytes, vout = 0): FoldCarrier =>
   carrier(OP.COMMIT, commitment, 0n, vout);
 export const claim = (salt: Bytes, name: string, burn: bigint, vout = 0): FoldCarrier =>
@@ -66,8 +59,6 @@ export const settle = (name: string, vout = 0): FoldCarrier =>
   carrier(OP.SETTLE, str(name), 0n, vout);
 export const release = (anchor: bigint, flags: Bytes, vout = 0): FoldCarrier =>
   carrier(OP.RELEASE, concat(leBytes(anchor, 5), flags), 0n, vout);
-export const decorate = (body: Bytes, vout = 0): FoldCarrier =>
-  carrier(OP.DECORATE, body, 0n, vout);
 export const sellTo = (price: bigint, buyer: Bytes, name: string, vout = 0): FoldCarrier =>
   carrier(OP.SELL_TO, concat(u64le(price), buyer, str(name)), 0n, vout);
 export const pay = (name: string, vout = 0): FoldCarrier =>
@@ -76,9 +67,6 @@ export const asMarker = (index: number, vout = 0): FoldCarrier =>
   carrier(OP.AS, u8(index), 0n, vout);
 export const trade = (idxA: number, idxB: number, nameA: string, nameB: string, vout = 0): FoldCarrier =>
   carrier(OP.TRADE, concat(u8(idxA), u8(idxB), str(nameA), str(",") , str(nameB)), 0n, vout);
-
-// a DECORATE TLV record [tag:1][len:2 LE][value]
-export const tlv = (tag: number, value: Bytes): Bytes => concat(u8(tag), leBytes(BigInt(value.length), 2), value);
 
 // commitment = SHA256(salt ‖ name ‖ author_h160) — exported for test construction
 import { sha256 } from "./sha256.ts";

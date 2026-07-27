@@ -50,7 +50,7 @@ func carrier(vout uint32, value uint64, p []byte) FoldCarrier {
 
 // ---- C-reference scenario battery (impls/c `scenario`, byte-identical) ----
 // Builders mirroring the C reference's tx1/add_action/mk_* helpers: each op
-// body is framed FF 50 4E <op> and decoded through the real wire decoder.
+// body is framed FF 53 50 <op> and decoded through the real wire decoder.
 
 func mkTx(ins []Identity, cars []FoldCarrier, outs []FoldOutput) FoldTx {
 	return FoldTx{inputs: ins, carriers: cars, spend: outs}
@@ -92,38 +92,9 @@ func bTrade(ia, ib byte, na, nb string) FoldCarrier {
 	body = append(body, nb...)
 	return opCar(OP_TRADE, body, 0, 0)
 }
-func bDecorate(body []byte, vout uint32) FoldCarrier { return opCar(OP_DECORATE, body, 0, vout) }
-func bVote(up bool, target [32]byte, tvout uint32, weight uint64, cvout uint32) FoldCarrier {
-	op := byte(OP_VOTE_DOWN)
-	if up {
-		op = OP_VOTE_UP
-	}
-	body := append(append([]byte{}, target[:]...), leBytes32(tvout)...)
-	return opCar(op, body, weight, cvout)
-}
-func bPost(text string, value uint64, vout uint32) FoldCarrier {
-	return carrier(vout, value, []byte(text))
-}
 func bOut(id Identity, value uint64) FoldOutput {
 	return FoldOutput{h160: id.h160, styp: id.styp, value: value}
 }
-
-// tlvRec builds a DECORATE TLV record [tag:1][len:2 LE][value].
-func tlvRec(tag byte, val []byte) []byte {
-	return append([]byte{tag, byte(len(val)), byte(len(val) >> 8)}, val...)
-}
-
-// decorateN builds a DECORATE carrier packed with `nrec` empty (len-0) TLV
-// records — 3 bytes each [tag=i+1][0][0], per-carrier 1-based tag — mirroring
-// the C reference decorate_n. Used to drive the §1 pending-record cap vector.
-func decorateN(nrec int, vout uint32) FoldCarrier {
-	var body []byte
-	for i := 0; i < nrec; i++ {
-		body = append(body, byte(i+1), 0, 0)
-	}
-	return bDecorate(body, vout)
-}
-func tgt32(b byte) [32]byte { var t [32]byte; t[0] = b; return t }
 
 // scFold mirrors the C reference's sm_begin_block/sm_apply_tx build style over
 // the block-at-a-time applyBlock fold: txs queue under the open block and flush
@@ -187,10 +158,9 @@ func twoNamesF() *scFold {
 // Each builds a deterministic, named construction and emits `name <digest>`
 // (canonical §4 state digest) or `name <u64>`; the rolling `combined` hash is
 // the single-line cross-language check. These pin the spec's named edge cases
-// (§6) with auditable outcomes, and cover the rare branches the random soak
-// almost never hits (deep displacement, i128 accumulation past 2^64, the fee
-// oracle). The go-authored behavioral battery (scenarios_impl.go) runs in
-// `selftest` (testFoldScenarios).
+// (§5) with auditable outcomes, and cover the rare branches the random soak
+// almost never hits (deep displacement, fee oracle). The go-authored behavioral
+// battery (scenarios_impl.go) runs in `selftest` (testFoldScenarios).
 func runScenario() {
 	var comb []byte
 	emitState := func(name string, f *scFold) {
@@ -404,29 +374,6 @@ func runScenario() {
 		f.tx(1, mkTx([]Identity{A, Bb}, []FoldCarrier{bTrade(0, 1, "aaa", "bbb")}, nil))
 		emitState("25_trade_rug_before", f)
 	}
-	{ // 26: DECORATE gate — owner binds, nameless drops, orphan discarded
-		f := mintedF(0xAA, "bob", 300, 1500)
-		f.begin(12, 1600)
-		f.tx(0, one(A, bDecorate(tlvRec(7, []byte("reply")), 0), bPost("hello", 1, 1)))
-		f.tx(1, one(Cc, bDecorate(tlvRec(7, []byte("x")), 0), bPost("hello", 1, 1)))
-		f.tx(2, one(A, bDecorate(tlvRec(7, []byte("orphan")), 0)))
-		emitState("26_decorate_gate", f)
-	}
-	{ // 27: +5 −2 +0(dustless, dropped) → score 3
-		f := newScFold()
-		f.begin(100, 1000)
-		f.tx(0, one(A, bVote(true, tgt32(0x11), 0, 5, 0), bVote(false, tgt32(0x11), 0, 2, 1),
-			bVote(true, tgt32(0x11), 0, 0, 2)))
-		emitState("27_vote_score", f)
-	}
-	{ // 28: i128 accumulation past 2^64 (a u64 impl wraps)
-		f := newScFold()
-		f.begin(100, 1000)
-		for i := 0; i < 3; i++ {
-			f.tx(uint32(i), one(A, bVote(true, tgt32(0x11), 0, u64max, 0)))
-		}
-		emitState("28_vote_past_u64", f)
-	}
 	{ // 29: fee oracle — 4 participants < MIN_FEE_SAMPLE → DUST_FLOOR (big windows are 49–51)
 		cb := []int64{1_000_000_200_000, 1_000_000_400_000, 999_999_999_950, 1_000_001_000_000, 1_000_000_600_000}
 		sub, by := make([]int64, 5), make([]int64, 5)
@@ -521,14 +468,6 @@ func runScenario() {
 		f := mintedF(0xAA, "bob", 10, 1500)
 		f.begin(12, 865500)
 		emitState("36b_mtp_at_lapsed", f)
-	}
-	{ // 37: i128 vote accumulator past −2^64
-		f := newScFold()
-		f.begin(100, 1000)
-		for i := 0; i < 3; i++ {
-			f.tx(uint32(i), one(A, bVote(false, tgt32(0x11), 0, u64max, 0)))
-		}
-		emitState("37_vote_neg_past_u64", f)
 	}
 	{ // 38: pre-block lapse returns bob to the pool; renew-all misses it, the hunter mints it
 		f := newScFold()
@@ -661,9 +600,8 @@ func runScenario() {
 	emitU64("50_oracle_odd_median", scOracleOddMedian())           // odd |P|=1101 → 130000
 	emitU64("51_oracle_subsample_floor", scOracleSubsampleFloor()) // |P|=999 → DUST_FLOOR
 
-	// 52: charset = a DNS label [a-z0-9-], 1..32 (re-pinned 2026-07-07, supersedes
-	// the 2026-07-02 dot rule): hyphen and a 32-byte name MINT; '.' and '_' now DROP
-	// (uppercase still drops), leaving exactly the two valid names.
+	// 52: charset = a DNS label [a-z0-9-], 1..32: hyphen and a 32-byte name MINT;
+	// '.' and '_' DROP (uppercase still drops), leaving exactly the two valid names.
 	{
 		f := newScFold()
 		ctc(f, 0xAA, "shib-p2p", 0x71, 10, 1000, 10, 1500, 11)
@@ -673,25 +611,26 @@ func runScenario() {
 		emitState("52_charset", f)
 	}
 
-	// 53: §1 DECORATE pending-record cap (pendDecorMax = 64, pinned 2026-07-03).
-	// Owner posts 65 decoration records (26+26+13) then a body: exactly 64 bind,
-	// the 65th drops. An impl that buffers unbounded binds 65 → a different digest.
+	// 52b: structural name rejects — leading/trailing hyphen and xn-- ACE drop.
 	{
-		f := mintedF(0xAA, "d", 10, 1500)
-		f.begin(12, 1600)
-		f.tx(0, one(A, decorateN(26, 0), decorateN(26, 1), decorateN(13, 2), bPost("hello", 100, 3)))
-		emitState("53_decor_pend_cap", f)
+		f := newScFold()
+		ctc(f, 0xAA, "-lead", 0x81, 10, 1000, 10, 1500, 11)
+		ctc(f, 0xAA, "trail-", 0x82, 10, 2000, 12, 2500, 13)
+		ctc(f, 0xAA, "xn--x", 0x83, 10, 3000, 14, 3500, 15)
+		ctc(f, 0xAA, "ok-name", 0x84, 10, 4000, 16, 4500, 17)
+		emitState("52b_structural", f)
 	}
 
-	// 54: NO per-tx count cap (§0). One tx carries 17 VOTE carriers — past the
-	// historical 16 — plus 17 payee outs; all fold. An impl that caps at 16 drops
-	// the tx or the 17th carrier → a different vote score (51).
+	// 54: NO per-tx count cap (§0). One tx carries 17 COMMIT carriers past the
+	// historical 16; all fold.
 	{
 		f := newScFold()
 		f.begin(10, 1000)
 		cars := make([]FoldCarrier, 0, 17)
 		for i := 0; i < 17; i++ {
-			cars = append(cars, bVote(true, tgt32(0x55), 7, 3, uint32(i)))
+			var cm [32]byte
+			cm[0] = byte(i)
+			cars = append(cars, bCommit(cm, uint32(i)))
 		}
 		outs := make([]FoldOutput, 0, 17)
 		for i := 0; i < 17; i++ {
@@ -699,6 +638,51 @@ func runScenario() {
 		}
 		f.tx(0, mkTx([]Identity{A}, cars, outs))
 		emitState("54_no_txcap", f)
+	}
+	{ // 55: mint→RELEASE→re-CLAIM in the same block re-mints fresh (§3.6)
+		f := newScFold()
+		f.begin(10, 1000)
+		f.tx(0, one(A, bCommit(commitment(salt32(0x91), "foo", A.h160), 0)))
+		f.begin(11, 1500)
+		f.tx(0, one(A, bClaim(salt32(0x91), "foo", 10, 0)))
+		f.tx(1, one(A, bRelease(11, []byte{0x01})))
+		f.tx(2, one(A, bClaim(salt32(0x91), "foo", 10, 0)))
+		emitState("55_claim_release_reclaim_sameblock", f)
+	}
+	{ // 55b: same-block re-claim by a lower-priority party B still mints fresh
+		f := newScFold()
+		f.begin(10, 1000)
+		f.tx(0, one(A, bCommit(commitment(salt32(0x91), "foo", A.h160), 0)))
+		f.tx(1, one(Bb, bCommit(commitment(salt32(0x92), "foo", Bb.h160), 0)))
+		f.begin(11, 1500)
+		f.tx(0, one(A, bClaim(salt32(0x91), "foo", 10, 0)))
+		f.tx(1, one(A, bRelease(11, []byte{0x01})))
+		f.tx(2, one(Bb, bClaim(salt32(0x92), "foo", 10, 0)))
+		emitState("55b_reclaim_by_other", f)
+	}
+	{ // 56: self-transfer is a real move — bumps last_set_mutation_height
+		f := mintedF(0xAA, "bar", 10, 1500)
+		f.begin(12, 1600)
+		f.tx(0, one(A, bTransferAll(A.h160)))
+		emitState("56_self_transfer_bumps_mut", f)
+	}
+	{ // 57: fee oracle with block_bytes==0 → /0 guard substitutes divisor 1
+		n := 1000
+		cb, sub, by := make([]int64, n), make([]int64, n), make([]int64, n)
+		for i := 0; i < n; i++ {
+			sub[i], cb[i], by[i] = 1_000_000_000_000, 1_000_000_005_000, 0
+		}
+		emitU64("57_oracle_zero_bytes", oracleRate(cb, sub, by))
+	}
+	{ // 58: CLAIM burn near 2^64 at rate=DUST_FLOOR → T overflows, clamps to MAX_LEASE
+		f := newScFold()
+		f.begin(10, 1000)
+		f.blk.rate = 1
+		f.tx(0, one(A, bCommit(commitment(salt32(0x95), "foo", A.h160), 0)))
+		f.begin(11, 1500)
+		f.blk.rate = 1
+		f.tx(0, one(A, bClaim(salt32(0x95), "foo", u64max, 0)))
+		emitState("58_lease_clamp_huge_burn", f)
 	}
 
 	cd := sha256.Sum256(comb)

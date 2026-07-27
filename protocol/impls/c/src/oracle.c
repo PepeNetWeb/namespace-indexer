@@ -1,4 +1,4 @@
-// §3.4 / §6 oracle helpers — MTP and the coinbase fee-rate. Pure functions the
+// §3.4 / §5 oracle helpers — MTP and the coinbase fee-rate. Pure functions the
 // harness feeds into begin_block; the fold itself takes (mtp, rate) as givens, so
 // statelessness/chain-abstraction holds. Every step is fixed-width integer math
 // with the under-claim clamp, the fee-bearing participant filter (MIN_FEE_SAMPLE

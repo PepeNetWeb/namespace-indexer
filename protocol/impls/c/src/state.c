@@ -25,14 +25,12 @@ SmState *sm_new(uint64_t activation_height) {
 
 void sm_free(SmState *s) {
     if (!s) return;
-    free(s->names); free(s->commits); free(s->votes);
-    free(s->muts);  free(s->decors);  free(s->claimsc);
+    free(s->names); free(s->commits); free(s->muts); free(s->claimsc);
     free(s);
 }
 
 void sm_clear(SmState *s) {
-    s->n_names = s->n_commits = s->n_votes = s->n_muts = s->n_decors = s->n_claimsc = 0;
-    s->overflow_flag = 0;
+    s->n_names = s->n_commits = s->n_muts = s->n_claimsc = 0;
     s->cur_height = s->cur_mtp = 0; s->cur_rate = 0;
 }
 
@@ -42,11 +40,13 @@ int sm_name_valid(const char *name, size_t len) {
     if (len < 1 || len > SM_NAME_MAX) return 0;
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)name[i];
-        // charset re-pin 2026-07-07: [a-z0-9-] — a DNS label, lowercased. '.' and
-        // '_' dropped, '-' added (supersedes the 2026-07-02 dot rule). Still no
-        // structural rules — '-a', 'a-', 'xn--x' are valid names at consensus.
+        // charset: [a-z0-9-] — a DNS label, lowercased. reject, never fold.
         if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return 0;
     }
+    // structural (RFC-1123 / IDNA): no leading/trailing hyphen; no `--` at 3–4
+    // (kills xn-- and every ACE prefix). Every consensus-valid name is a safe hostname label.
+    if (name[0] == '-' || name[len - 1] == '-') return 0;
+    if (len >= 4 && name[2] == '-' && name[3] == '-') return 0;
     return 1;
 }
 
@@ -136,33 +136,6 @@ void sm_remove_name(SmState *s, SmNameRow *row) {
     s->names[i] = s->names[--s->n_names];   // order-independent (lookups are by name)
 }
 
-// ── votes (§3.8): cumulative i128 score, no silent wrap ──────────────────────
-
-static int i128_add_checked(__int128 *acc, __int128 delta) {
-    __int128 a = *acc;
-    __int128 r = (__int128)((unsigned __int128)a + (unsigned __int128)delta);
-    if (((a ^ r) & (delta ^ r)) < 0) return 0;   // signed overflow
-    *acc = r; return 1;
-}
-
-void sm_vote_add(SmState *s, const uint8_t target[32], uint32_t vout, int up, uint64_t weight) {
-    SmVote *v = NULL;
-    for (int i = 0; i < s->n_votes; i++)
-        if (s->votes[i].vout == vout && memcmp(s->votes[i].target, target, 32) == 0) {
-            v = &s->votes[i]; break;
-        }
-    if (!v) {
-        GROW(s->votes, s->n_votes, s->cap_votes, SmVote);
-        v = &s->votes[s->n_votes++];
-        memset(v, 0, sizeof(*v));
-        memcpy(v->target, target, 32); v->vout = vout;
-    }
-    __int128 delta = up ? (__int128)weight : -(__int128)weight;
-    if (!i128_add_checked(&v->score, delta)) {                       // fail-loud, never wrap
-        s->overflow_flag = 1; s->ev[SM_EV_VOTE_OVERFLOW]++;
-    }
-}
-
 // ── commits (§3.2) ───────────────────────────────────────────────────────────
 
 void sm_commit_add(SmState *s, const uint8_t commitment[32], int64_t height,
@@ -172,18 +145,6 @@ void sm_commit_add(SmState *s, const uint8_t commitment[32], int64_t height,
     memset(c, 0, sizeof(*c));
     memcpy(c->commitment, commitment, 32);
     c->commit_height = height; c->tx_index = txidx; c->commit_time = time;
-}
-
-// ── decorations (§1: verbatim, never interpreted) ────────────────────────────
-
-void sm_decor_add(SmState *s, const uint8_t txid[32], uint32_t vout,
-                  const uint8_t *rec, size_t rec_len) {
-    if (rec_len > SM_DEC_MAX) rec_len = SM_DEC_MAX;
-    GROW(s->decors, s->n_decors, s->cap_decors, SmDecor);
-    SmDecor *d = &s->decors[s->n_decors++];
-    memset(d, 0, sizeof(*d));
-    memcpy(d->txid, txid, 32); d->vout = vout;
-    memcpy(d->rec, rec, rec_len); d->rec_len = (uint8_t)rec_len;
 }
 
 // ── per-owner last mutation height (§3.5 anchor guard) ───────────────────────

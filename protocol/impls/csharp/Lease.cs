@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
 /// Lease day computation (§3.4) and water-fill allocation (§3.5).

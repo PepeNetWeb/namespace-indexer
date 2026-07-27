@@ -1,4 +1,5 @@
-// RENEW / TRANSFER / RELEASE — bitmaps over the owner's owned set (§3.5/§3.6).
+// RENEW / TRANSFER / RELEASE — bitmaps over the owner's owned set — and their
+// by-name singleton forms RENEW_NAME / TRANSFER_NAME / RELEASE_NAME (§3.5/§3.6).
 //
 // The owned set is every name the actor controls (plain OWNED, plus LISTED/
 // OFFERED/RESERVED where they are the seller — a listing stays in the owned set,
@@ -86,6 +87,50 @@ void sm_op_transfer(SmState *s, SmTxCtx *cx, const SmAction *a) {
         sm_bump_mutation(s, cx->actor, cx->height);
         sm_bump_mutation(s, a->addr, cx->height);
     }
+}
+
+// ── the by-name forms (§3.5) — the singleton siblings of the bitmap ops ──────
+// Each applies its bitmap sibling's exact state semantics to the one name the
+// payload spells out. A name string is its own position-independent address
+// into the owned set, so there is no anchor and no anchor guard — by-name ops
+// are valid under any concurrent set churn. The name MUST be in the actor's
+// owned set (same membership test as sm_collect_owned); else drop.
+
+// The row for `name` iff the actor controls it (owner, or seller when locked).
+static SmNameRow *find_mine(SmState *s, const uint8_t who[20], const SmAction *a) {
+    if (a->name_len < 1) return NULL;
+    SmNameRow *r = sm_find_name(s, a->name);
+    if (!r) return NULL;
+    const uint8_t *holder = (r->st == SM_OWNED) ? r->owner : r->seller;
+    return memcmp(holder, who, 20) == 0 ? r : NULL;
+}
+
+// RENEW_NAME (§3.5) — water-fill over the singleton; listed/offered names are
+// still renewable by their seller. Renewal never mutates the set: no bump.
+void sm_op_renew_name(SmState *s, SmTxCtx *cx, const SmAction *a) {
+    SmNameRow *r = find_mine(s, cx->actor, a);
+    if (!r) return;
+    sm_waterfill(s, cx->mtp, cx->rate, cx->car_value, &r, 1);
+}
+
+// TRANSFER_NAME (§3.5/§3.6) — gift exactly one owned (unlocked) name; lease
+// conveys. Locked → no-op (the one-name skip), no bump. A move bumps BOTH
+// parties (self-target included: still a move, both resolve to one owner).
+void sm_op_transfer_name(SmState *s, SmTxCtx *cx, const SmAction *a) {
+    SmNameRow *r = find_mine(s, cx->actor, a);
+    if (!r || r->st != SM_OWNED) return;                   // absent / not mine / locked
+    memcpy(r->owner, a->addr, 20); r->owner_type = SM_P2PKH;   // type meaningless for a gift (not digested)
+    sm_bump_mutation(s, cx->actor, cx->height);            // lease conveys (lease_expiry unchanged)
+    sm_bump_mutation(s, a->addr, cx->height);
+}
+
+// RELEASE_NAME (§3.5/§3.6) — return exactly one owned (unlocked) name to the
+// pool now, under RELEASE's full semantics. Locked → no-op, no bump.
+void sm_op_release_name(SmState *s, SmTxCtx *cx, const SmAction *a) {
+    SmNameRow *r = find_mine(s, cx->actor, a);
+    if (!r || r->st != SM_OWNED) return;                   // absent / not mine / locked
+    sm_remove_name(s, r); s->ev[SM_EV_RELEASE_NAME]++;     // → pool (immediately reclaimable)
+    sm_bump_mutation(s, cx->actor, cx->height);
 }
 
 // ── RELEASE (§3.6) — return selected owned (unlocked) names to the pool now ──

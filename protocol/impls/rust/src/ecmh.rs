@@ -4,6 +4,7 @@
 //! to the C reference: hash-to-curve KATs over fixed preimages, identity (∞)
 //! serialization, a tagged multiset sum (asserted commutative + pinned), and an
 //! inverse round-trip — all folded into one cross-language `combined` digest.
+//! Names-only: three domain tags (name/commit/mut).
 
 use crate::secp256k1::{secp_ecmh_add, secp_ecmh_hash, secp_ecmh_identity, secp_ecmh_negate};
 use crate::sha256::Sha256;
@@ -19,7 +20,6 @@ fn puthex(out: &mut String, d: &[u8]) {
 // domain tags — second-preimage separation between tables.
 const TAG_NAME: u8 = 0x01;
 const TAG_COMMIT: u8 = 0x02;
-const TAG_VOTE: u8 = 0x03;
 const TAG_MUT: u8 = 0x04;
 const ECMH_REC_TAG: [u8; 6] = [b'E', b'C', b'M', b'H', b'v', b'1'];
 
@@ -45,7 +45,7 @@ pub fn run() -> i32 {
     let h2c: [(&str, &[u8]); 4] = [
         ("empty", b""),
         ("a", b"a"),
-        ("shib", b"shibpost"),
+        ("pepe", b"pepenet"),
         ("doge", b"doge"),
     ];
     let ff = [0xFFu8; 32];
@@ -70,11 +70,10 @@ pub fn run() -> i32 {
     comb.update(&id);
 
     // 3. tagged multiset sum — a fixed set of (tag ‖ row) records, summed two ways.
-    let recs: [(u8, &[u8]); 5] = [
+    let recs: [(u8, &[u8]); 4] = [
         (TAG_NAME, b"\x03foo"),
         (TAG_NAME, b"\x03bar"),
         (TAG_COMMIT, b"commitment-blob-32-bytes-xxxxxx"),
-        (TAG_VOTE, b"vote-target-row"),
         (TAG_MUT, b"owner-mutation"),
     ];
     let mut fwd = secp_ecmh_identity();

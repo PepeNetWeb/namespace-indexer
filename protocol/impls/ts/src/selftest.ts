@@ -5,12 +5,12 @@ import { sha256 } from "./sha256.ts";
 import { ripemd160, hash160 } from "./ripemd160.ts";
 import { SplitMix64 } from "./prng.ts";
 import { validUtf8 } from "./utf8.ts";
-import { hex, fromHex, concat, u8, u32le, u64le, leBytes, cmpBytes, type Bytes } from "./bytes.ts";
+import { hex, fromHex, concat, u8, u32le, u64le, type Bytes } from "./bytes.ts";
 import { decodePayload, singleMinimalPush, validName } from "./decode.ts";
 import { Fold } from "./fold.ts";
 import type { FoldTx } from "./fold.ts";
 import { oracleRate, computeMTP } from "./oracle.ts";
-import { OP, PREFIX0, PREFIX1, PREFIX2, RESERVE_WINDOW, DIRECT_WINDOW, REORG_BUFFER, BILLING_UNIT, MAX_LEASE } from "./constants.ts";
+import { OP, PREFIX0, PREFIX1, PREFIX2, RESERVE_WINDOW, DIRECT_WINDOW, REORG_BUFFER, BILLING_UNIT, MAX_LEASE, BODY_MAX } from "./constants.ts";
 import * as B from "./builders.ts";
 import { attribute, parseTx } from "./attribution.ts";
 import {
@@ -64,10 +64,9 @@ function tPrimitives(): void {
   ok("utf8 accept 4-byte 😀", validUtf8(fromHex("f09f9880")));
 }
 
-// ───────────────────────────── charset (re-pin 2026-07-07) ─────────────────────────────
-// [a-z0-9-] — a DNS label, lowercased. '.'/'_' dropped, '-' added (supersedes the 2026-07-02
-// dot rule). No structural rules; hyphen and a 32-byte name are valid, '.'/'_'/uppercase/comma/
-// 33-byte are not. Pins the OUTCOME behind scenario 52 (its digest only proves agreement).
+// ───────────────────────────── charset + structural (§3.1) ─────────────────────────────
+// [a-z0-9-], 1..32; no leading/trailing hyphen; no `--` at positions 3–4.
+// Pins the OUTCOME behind scenario 52 / 52b.
 function tDottedNames(): void {
   ok("hyphen name valid", validName(enc("shib-p2p")));
   ok("32-byte name valid", validName(enc("abcdefghijklmnopqrstuvwxyz0123ab")));
@@ -76,6 +75,9 @@ function tDottedNames(): void {
   ok("underscore now invalid", !validName(enc("shib_p2p")));
   ok("uppercase still invalid", !validName(enc("Shib-p2p")));
   ok("comma still invalid (TRADE pair split relies on it)", !validName(enc("a,b")));
+  ok("leading hyphen invalid", !validName(enc("-a")));
+  ok("trailing hyphen invalid", !validName(enc("a-")));
+  ok("ACE prefix (xn--) invalid", !validName(enc("xn--x")));
 
   const A = B.genId(0xaa);
   const salt = (b: number): Bytes => new Uint8Array(32).fill(b);
@@ -101,17 +103,17 @@ function dk(payload: Bytes, value = 0n): string {
 function tDecoder(): void {
   // name validation
   ok("name lowercase ok", validName(enc("alice-99")));
-  ok("name reject uppercase", !validName(enc("Alice"))); // AMBIGUITY N1: charset is strict [a-z0-9-]
+  ok("name reject uppercase", !validName(enc("Alice"))); // charset is strict [a-z0-9-]
   ok("name reject underscore", !validName(enc("a_b")));
   ok("name reject empty", !validName(enc("")));
   ok("name reject 33", !validName(enc("a".repeat(33))));
   ok("name accept 32", validName(enc("a".repeat(32))));
   ok("name reject space", !validName(enc("a b")));
   ok("name reject comma", !validName(enc("a,b")));
+  ok("name reject leading hyphen", !validName(enc("-a")));
+  ok("name reject trailing hyphen", !validName(enc("a-")));
+  ok("name reject xn--", !validName(enc("xn--x")));
 
-  // VOTE bl==36
-  eq("VOTE good", dk(frame(OP.VOTE_UP, concat(new Uint8Array(32), u32le(0))), 1n), "ACTION");
-  eq("VOTE bad len 35", dk(frame(OP.VOTE_UP, new Uint8Array(35)), 1n), "IGNORE");
   // COMMIT bl==32
   eq("COMMIT good", dk(frame(OP.COMMIT, new Uint8Array(32))), "ACTION");
   eq("COMMIT bad 31", dk(frame(OP.COMMIT, new Uint8Array(31))), "IGNORE");
@@ -121,14 +123,20 @@ function tDecoder(): void {
   eq("CLAIM 64 (name32)", dk(frame(OP.CLAIM, concat(new Uint8Array(32), enc("a".repeat(32))))), "ACTION");
   eq("CLAIM 65 (name33)", dk(frame(OP.CLAIM, concat(new Uint8Array(32), enc("a".repeat(33))))), "IGNORE");
   eq("CLAIM bad name byte", dk(frame(OP.CLAIM, concat(new Uint8Array(32), enc("A")))), "IGNORE");
-  // RENEW modes 0/5/6..76, invalid 1..4
+  eq("CLAIM leading hyphen → ignore", dk(frame(OP.CLAIM, concat(new Uint8Array(32), enc("-a")))), "IGNORE");
+  // RENEW modes 0/5/6..BODY_MAX (§6 pinned ceiling), invalid 1..4
   eq("RENEW all bl0", dk(frame(OP.RENEW, new Uint8Array(0)), 1n), "ACTION");
   eq("RENEW all-safe bl5", dk(frame(OP.RENEW, new Uint8Array(5)), 1n), "ACTION");
   eq("RENEW sel bl6", dk(frame(OP.RENEW, new Uint8Array(6)), 1n), "ACTION");
   eq("RENEW bl1 invalid", dk(frame(OP.RENEW, new Uint8Array(1)), 1n), "IGNORE");
   eq("RENEW bl4 invalid", dk(frame(OP.RENEW, new Uint8Array(4)), 1n), "IGNORE");
-  eq("RENEW bl76 max", dk(frame(OP.RENEW, new Uint8Array(76)), 1n), "ACTION");
-  eq("RENEW bl77 over", dk(frame(OP.RENEW, new Uint8Array(77)), 1n), "IGNORE");
+  eq("RENEW bl77 valid (past the old 80-byte carrier)", dk(frame(OP.RENEW, new Uint8Array(77)), 1n), "ACTION");
+  eq("RENEW bl at BODY_MAX (9992)", dk(frame(OP.RENEW, new Uint8Array(BODY_MAX)), 1n), "ACTION");
+  eq("RENEW bl past BODY_MAX", dk(frame(OP.RENEW, new Uint8Array(BODY_MAX + 1)), 1n), "IGNORE");
+  eq("TRANSFER sel at BODY_MAX", dk(frame(OP.TRANSFER, new Uint8Array(BODY_MAX))), "ACTION");
+  eq("TRANSFER sel past BODY_MAX", dk(frame(OP.TRANSFER, new Uint8Array(BODY_MAX + 1))), "IGNORE");
+  eq("RELEASE at BODY_MAX", dk(frame(OP.RELEASE, new Uint8Array(BODY_MAX)), 1n), "ACTION");
+  eq("RELEASE past BODY_MAX", dk(frame(OP.RELEASE, new Uint8Array(BODY_MAX + 1)), 1n), "IGNORE");
   // TRANSFER 20, 26..76, invalid 21..25
   eq("TRANSFER all bl20", dk(frame(OP.TRANSFER, new Uint8Array(20))), "ACTION");
   eq("TRANSFER bl21 invalid", dk(frame(OP.TRANSFER, new Uint8Array(21))), "IGNORE");
@@ -144,7 +152,7 @@ function tDecoder(): void {
   // RELEASE bl 6..76
   eq("RELEASE bl6", dk(frame(OP.RELEASE, new Uint8Array(6))), "ACTION");
   eq("RELEASE bl5 invalid", dk(frame(OP.RELEASE, new Uint8Array(5))), "IGNORE");
-  // SELL_TO bl 29..48
+  // SELL_TO bl 29..60
   eq("SELL_TO bl29", dk(frame(OP.SELL_TO, concat(u64le(1n), new Uint8Array(20), enc("a")))), "ACTION");
   eq("SELL_TO bl28 (no name)", dk(frame(OP.SELL_TO, concat(u64le(1n), new Uint8Array(20)))), "IGNORE");
   // AS bl==1
@@ -157,12 +165,13 @@ function tDecoder(): void {
   eq("TRADE empty side", dk(frame(OP.TRADE, concat(u8(0), u8(1), enc("a,")))), "IGNORE");
   eq("TRADE idx byte = comma value (44) ok", dk(frame(OP.TRADE, concat(u8(44), u8(1), enc("a,b")))), "ACTION");
 
-  // demux: POST vs IGNORE
-  eq("POST utf8 value>0", dk(enc("hello"), 1n), "POST");
-  eq("IGNORE utf8 value=0", dk(enc("hello"), 0n), "IGNORE");
+  // demux: only ACTION or IGNORE (bare UTF-8 / overlay → IGNORE)
+  eq("IGNORE bare utf8 value>0", dk(enc("hello"), 1n), "IGNORE");
+  eq("IGNORE bare utf8 value=0", dk(enc("hello"), 0n), "IGNORE");
   eq("IGNORE bad-prefix non-utf8", dk(fromHex("ff414243"), 1n), "IGNORE");
-  eq("IGNORE FFSP bad opcode", dk(frame(0x99 & 0xff, new Uint8Array(4)), 1n), "IGNORE");
-  eq("POST single 'S'", dk(enc("S"), 1n), "POST"); // 0x53 alone is valid utf8 + value>0
+  eq("IGNORE FFSP bad opcode 0x10", dk(frame(0x10, new Uint8Array(0)), 1n), "IGNORE");
+  eq("IGNORE overlay 0xD6", dk(frame(0xd6, u8(0)), 0n), "IGNORE");
+  eq("IGNORE lone S", dk(enc("S"), 1n), "IGNORE");
 
   // single minimal push carrier (§1)
   ok("carrier OP_RETURN+push20", singleMinimalPush(concat(u8(0x6a), u8(20), new Uint8Array(20))) !== null);
@@ -689,111 +698,21 @@ function tTrade(): void {
   }
 }
 
-// ───────────────────────────── DECORATE (§1) ─────────────────────────────
-function tDecorate(): void {
-  // bind to next body iff author owns ≥1 name
-  {
-    const f = new Fold(0n);
-    claimName(f, 1, "a", 100n, 5n, 1000n);
-    f.beginBlock(8n, 1300n, 28n);
-    const rec = B.tlv(0x01, enc("reply"));
-    f.applyTx(B.tx([B.input(B.genId(1))], [B.decorate(rec, 0), B.postCarrier("hello", 1n, 1)]), 3);
-    eq("decoration bound", f.decors.length, 1);
-    eq("decoration vout = body vout", f.decors[0].vout, 1);
-  }
-  // nameless author → records dropped
-  {
-    const f = new Fold(0n);
-    f.beginBlock(8n, 1300n, 28n);
-    const rec = B.tlv(0x01, enc("reply"));
-    f.applyTx(B.tx([B.input(B.genId(5))], [B.decorate(rec, 0), B.postCarrier("hi", 1n, 1)]), 0); // id5 owns nothing
-    eq("nameless author: no decoration", f.decors.length, 0);
-  }
-  // orphan DECORATE (no body) discarded
-  {
-    const f = new Fold(0n);
-    claimName(f, 1, "a", 100n, 5n, 1000n);
-    f.beginBlock(8n, 1300n, 28n);
-    f.applyTx(B.tx([B.input(B.genId(1))], [B.decorate(B.tlv(1, enc("x")), 0)]), 0);
-    eq("orphan decorate discarded", f.decors.length, 0);
-  }
-  // AS flushes the buffer (records not bound)
-  {
-    const f = new Fold(0n);
-    claimName(f, 1, "a", 100n, 5n, 1000n);
-    f.beginBlock(8n, 1300n, 28n);
-    f.applyTx(B.tx([B.input(B.genId(1)), B.input(B.genId(1))],
-      [B.decorate(B.tlv(1, enc("x")), 0), B.asMarker(1, 1), B.postCarrier("hi", 1n, 2)]), 0);
-    eq("AS flushes decorate buffer", f.decors.length, 0);
-  }
-  // fail-closed TLV overrun: keep good record, drop overrunning tail
-  {
-    const f = new Fold(0n);
-    claimName(f, 1, "a", 100n, 5n, 1000n);
-    f.beginBlock(8n, 1300n, 28n);
-    // record1 = tag1 len1 'x' (good); then a bad header claiming len 99 (overruns)
-    const body = concat(B.tlv(1, enc("x")), u8(2), leBytes(99n, 2), enc("zz"));
-    f.applyTx(B.tx([B.input(B.genId(1))], [B.decorate(body, 0), B.postCarrier("hi", 1n, 1)]), 0);
-    eq("TLV fail-closed keeps 1 good record", f.decors.length, 1);
-  }
-  // multiple decorate carriers accumulate then bind to one body
-  {
-    const f = new Fold(0n);
-    claimName(f, 1, "a", 100n, 5n, 1000n);
-    f.beginBlock(8n, 1300n, 28n);
-    f.applyTx(B.tx([B.input(B.genId(1))],
-      [B.decorate(B.tlv(1, enc("p")), 0), B.decorate(B.tlv(2, enc("q")), 1), B.postCarrier("hi", 1n, 2)]), 0);
-    eq("two decorate carriers accumulate", f.decors.length, 2);
-  }
-  // §1 pending-record cap (PEND_DECOR_MAX = 64): 65 pending records (26+26+13) → exactly 64 bind.
-  {
-    const f = new Fold(0n);
-    claimName(f, 1, "a", 100n, 5n, 1000n);
-    f.beginBlock(8n, 1300n, 28n);
-    const decorateN = (nrec: number): Uint8Array => {
-      const b = new Uint8Array(nrec * 3);
-      for (let i = 0; i < nrec; i++) b[i * 3] = (i + 1) & 0xff;
-      return b;
-    };
-    f.applyTx(B.tx([B.input(B.genId(1))],
-      [B.decorate(decorateN(26), 0), B.decorate(decorateN(26), 1), B.decorate(decorateN(13), 2),
-       B.postCarrier("hi", 1n, 3)]), 0);
-    eq("DECORATE pending-record cap binds 64 of 65", f.decors.length, 64);
-  }
-}
-
-// ───────────────────────────── votes (§3.8) ─────────────────────────────
-function tVotes(): void {
+// ───────────────────────────── no per-tx count cap (§0) ─────────────────────────────
+function tTxBounds(): void {
+  // 17 COMMIT carriers (past the historical 16) all fold.
   const f = new Fold(0n);
-  const id = B.genId(1);
-  const target = new Uint8Array(32).fill(0xaa);
-  f.beginBlock(1n, 1000n, 28n);
-  f.applyTx(B.tx([B.input(id)], [B.voteUp(target, 0, 100n)]), 0);
-  f.applyTx(B.tx([B.input(id)], [B.voteDown(target, 0, 30n)]), 1);
-  const key = hex(target) + ":0";
-  eq("vote net score", f.votes.get(key)!.score, 70n);
-  // zero-weight dropped
-  f.applyTx(B.tx([B.input(id)], [B.voteUp(target, 0, 0n)]), 2);
-  eq("zero-weight vote dropped", f.votes.get(key)!.score, 70n);
-  // i128 accumulation past 2^64
-  const big = 1n << 63n;
-  f.applyTx(B.tx([B.input(id)], [B.voteUp(target, 1, big)]), 3);
-  f.applyTx(B.tx([B.input(id)], [B.voteUp(target, 1, big)]), 4);
-  eq("i128 past 2^64", f.votes.get(hex(target) + ":1")!.score, 1n << 64n);
-  // no per-tx count cap (§0): 17 VOTE_UP carriers (past the historical 16) all fold → 17×3 = 51.
-  {
-    const g = new Fold(0n);
-    const t2 = new Uint8Array(32); t2[0] = 0x55;
-    g.beginBlock(1n, 1000n, 28n);
-    const cs = [];
-    for (let i = 0; i < 17; i++) cs.push(B.voteUp(t2, 7, 3n, i));
-    g.applyTx(B.tx([B.input(B.genId(1))], cs), 0);
-    eq("no per-tx count cap: 17 votes score 51", g.votes.get(hex(t2) + ":7")!.score, 51n);
+  f.beginBlock(10n, 1000n, 28n);
+  const cs = [];
+  for (let i = 0; i < 17; i++) {
+    const c = new Uint8Array(32); c[0] = i & 0xff;
+    cs.push(B.commit(c, i));
   }
-  eq("no overflow flag", f.overflow, 0);
+  f.applyTx(B.tx([B.input(B.genId(0xaa))], cs), 0);
+  eq("no per-tx count cap: 17 COMMITs all record", f.commits.length, 17);
 }
 
-// ───────────────────────────── pre-block transitions (§6) ─────────────────────────────
+// ───────────────────────────── pre-block transitions (§5) ─────────────────────────────
 function tPreBlock(): void {
   // lease lapse exclusive boundary: owned iff MTP < lease_expiry
   {
@@ -846,15 +765,16 @@ function tPreBlock(): void {
 }
 
 // ───────────────────────────── gating (§3.0) ─────────────────────────────
+// All ops gate at one ACTIVATION_HEIGHT (no genesis-vs-gated split after VOTE removal).
 function tGating(): void {
   const f = new Fold(100n); // activation height 100
   const id = B.genId(1), salt = new Uint8Array(32).fill(2);
   f.beginBlock(50n, 1000n, 28n); // below activation
   f.applyTx(B.tx([B.input(id)], [B.commit(B.commitmentOf(salt, "early", id))]), 0);
   eq("gated COMMIT below activation dropped", f.commits.length, 0);
-  // a VOTE (genesis op) is NOT gated
-  f.applyTx(B.tx([B.input(id)], [B.voteUp(new Uint8Array(32), 0, 10n)]), 1);
-  eq("genesis VOTE works below activation", f.votes.size, 1);
+  f.beginBlock(100n, 1100n, 28n); // at activation
+  f.applyTx(B.tx([B.input(id)], [B.commit(B.commitmentOf(salt, "late", id))]), 0);
+  eq("COMMIT at activation records", f.commits.length, 1);
 }
 
 // ───────────────────────────── fee oracle + MTP ─────────────────────────────
@@ -982,7 +902,7 @@ function tDeterminism(): void {
     claimName(f, 2, "beta", 50n, 6n, 1000n);
     f.beginBlock(8n, 1300n, 28n);
     f.applyTx(B.tx([B.input(B.genId(1)), B.input(B.genId(2))], [B.trade(0, 1, "alpha", "beta")]), 0);
-    f.applyTx(B.tx([B.input(B.genId(1))], [B.voteUp(new Uint8Array(32).fill(1), 0, 42n)]), 1);
+    f.applyTx(B.tx([B.input(B.genId(2))], [B.sell(1000n, 18000n, "alpha")]), 1);
     return hex(f.digest());
   }
   eq("digest deterministic across two runs", build(), build());
@@ -994,7 +914,7 @@ function tEcmh(): void {
   const empty = new Fold(0n).stateEcmh();
   ok("ECMH empty-state stable", hex(new Fold(0n).stateEcmh()) === hex(empty));
   eq("ECMH empty-state anchor", hex(empty),
-    "053f61e599084024c9acd6a3127057ea5de001829225590ea2b175c5506b5c55");
+    "3ecfc3d7fa5be56fc513dde926bdf105c92accbf07088e702f85856fa69d10e0");
 
   // 2. ECMH induces the SAME equality relation as the canonical digest. Build the same logical
   //    rows in two different insertion orders (commits in the same order so the tx_index-bearing
@@ -1045,8 +965,7 @@ export function runSelftest(): { pass: number; fail: number } {
   tDirected();
   tAS();
   tTrade();
-  tDecorate();
-  tVotes();
+  tTxBounds();
   tPreBlock();
   tGating();
   tOracleMTP();
@@ -1058,7 +977,8 @@ export function runSelftest(): { pass: number; fail: number } {
     console.log("\n── FAILURES ──");
     for (const m of fails) console.log("  ✗ " + m);
   }
+  console.log(`empty_state_digest=${hex(new Fold(0n).digest())}`);
   console.log(`empty_state_ecmh=${hex(new Fold(0n).stateEcmh())}`);
-  console.log(`\nselftest: ${pass} passed, ${fail} failed`);
+  console.log(`selftest: ${pass} passed, ${fail} failed`);
   return { pass, fail };
 }

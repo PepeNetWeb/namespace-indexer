@@ -41,20 +41,20 @@ the same block, so both rows carry the same height `H` — no observable diverge
 impl that bumps only final owners emits a smaller, permanently-divergent `n_muts`.
 
 **1.4 A used commit lingers until the time-based prune.** No rule deletes a commit on
-successful use; it lingers until `MTP > commit_time + COMMIT_EXPIRY` (§3.2; §6). The natural
+successful use; it lingers until `MTP > commit_time + COMMIT_EXPIRY` (§3.2; §5). The natural
 delete-on-use reading forks `n_commits` (and the digest) for the ~20–60-block lingering
 window after *every* claim. It cannot double-mint (a minted name stays owned far longer than
 the ≤5 h commit life), so the only effect is the digest.
 
 **1.5 COMMIT_EXPIRY is the lone inclusive boundary.** A commit is live while
 `MTP ∈ [commit_time, commit_time + COMMIT_EXPIRY]`, pruned only once `MTP` *strictly
-exceeds* the upper bound (§3.2; §6). Every other boundary is exclusive (owned iff
-`MTP < lease_expiry`). The asymmetry is the classic off-by-one fork surface; §6 calls it out
+exceeds* the upper bound (§3.2; §5). Every other boundary is exclusive (owned iff
+`MTP < lease_expiry`). The asymmetry is the classic off-by-one fork surface; §5 calls it out
 explicitly so a uniform-exclusive reader does not prune a live commit one tick early.
 Pre-block pruning runs before the block's txs, so any commit reaching a CLAIM is live; the
 CLAIM additionally enforces `commit_height < claim_height`.
 
-**1.6 `commit_time` is the commit block's MTP.** Not the header timestamp (§3.2; §6),
+**1.6 `commit_time` is the commit block's MTP.** Not the header timestamp (§3.2; §5),
 digested as `i64`. MTP keeps the liveness predicate consistent with the rest of the time
 model; a header basis shifts the prune edge by the header-vs-median gap. *Behavioral cliff:*
 with `MTP(0) = 0` and realistic later timestamps, a height-0 commit is pruned by height 1 —
@@ -67,7 +67,7 @@ current expiry (`hᵢ = ⌊(MAX_LEASE − (expiryᵢ − now)) / BILLING_UNIT⌋
 is authoritative over the "never exceeds" phrasing.
 
 **1.8 A COMMIT needs a verified actor, not a matching committer.** A COMMIT must come from a
-verified actor to be recorded (§6 loop drops ⊥-actor actions), but the row stores only
+verified actor to be recorded (§5 loop drops ⊥-actor actions), but the row stores only
 `{commitment, commit_height, tx_index, commit_time}` — the carrier identity need not equal
 the author bound into the commitment hash (§3.2). This is what lets the commitment-copy
 attack record an inert row.
@@ -90,7 +90,7 @@ all cap and surplus is forfeited. The exact cap/remainder discretization is pinn
 reference (`impls/c/src/lease.c`).
 
 **2.2 Fail-closed at `T = 0`; an all-capped RENEW is an inert no-op.** CLAIM/RENEW require
-`T ≥ 1` (§6). An all-capped RENEW with `T ≥ 1` applies as a no-op (zero days, no lease
+`T ≥ 1` (§5). An all-capped RENEW with `T ≥ 1` applies as a no-op (zero days, no lease
 change; RENEW never bumps the mutation height) — drop and no-op are observationally
 identical. A single-name CLAIM has `count = 1`, so the `T < count` corner can't arise there.
 
@@ -170,7 +170,7 @@ comparators (`≥` vs `==`) also forks.
 **3.5 SELL window.** `window = 0` defaults to `RESERVE_WINDOW`; a nonzero window in
 `[1, RESERVE_WINDOW)` is out of range → ignored; `≥ RESERVE_WINDOW` is bounded by the
 *add-form* `MTP_now + window + REORG_BUFFER ≤ lease_expiry`, never the subtraction
-`(lease_expiry − MTP_now) − REORG_BUFFER` (which underflows) (§3.7; §6).
+`(lease_expiry − MTP_now) − REORG_BUFFER` (which underflows) (§3.7; §5).
 
 **3.6 SELL_TO price floor is `DUST_FLOOR`, not SELL's `3·DUST_FLOOR`** (§3.7) — the directed
 sale has no deposit split, so no remainder-underflow floor is needed.
@@ -195,27 +195,22 @@ directly (no reconstruction). The SETTLE remainder and directed legs are exact (
 **4.1 TRADE settles on its two named parties, ignoring the acting identity.** TRADE is
 dispatched before the actor check and settles on `vin[idxA]`/`vin[idxB]` alone; a TRADE in a
 tx whose acting identity is ⊥ still settles if both named parties are valid and each signs
-`SIGHASH_ALL` (§3.10, §6). A parties-only and an actor-gated reading diverge when `vin[0]` is
+`SIGHASH_ALL` (§3.9, §5). A parties-only and an actor-gated reading diverge when `vin[0]` is
 ⊥; the spec pins parties-only because a TRADE is an atomic two-party swap with no
 acting-identity role.
 
 **4.2 TRADE anti-rug: live-ownership re-check, fail-closed both ways.** TRADE re-checks
 `owner == party and st == OWNED` at its forward-pass position. A same-block TRANSFER of a
 pledged name *before* the TRADE drops it (re-check fails); *after* also fails (already moved)
-— no one-sided outcome (§6). TRADE drops the whole op on `idxA == idxB`, `nameA == nameB`,
+— no one-sided outcome (§5). TRADE drops the whole op on `idxA == idxB`, `nameA == nameB`,
 out-of-range index, not-owned party, or locked name.
 
-**4.3 AS re-points attribution only; the ⊥-actor rule; buffer flushing.** An AS marker
+**4.3 AS re-points attribution only; the ⊥-actor rule.** An AS marker
 re-points the acting identity for subsequent carriers; it never affects burn-accounting (each
-burn-bearing action's cost is its own carrier's `OP_RETURN` value) (§3.10). A malformed/OOB AS
-makes the segment actor ⊥ until the next valid AS or tx end; the §6 loop then drops any
+burn-bearing action's cost is its own carrier's `OP_RETURN` value) (§3.9). A malformed/OOB AS
+makes the segment actor ⊥ until the next valid AS or tx end; the §5 loop then drops any
 non-TRADE action under ⊥. An AS below `ACTIVATION_HEIGHT` is gated (dropped) before it can
-re-point. *Buffer:* exactly three things clear the pending DECORATE buffer — binding to a
-body, an AS, and tx-end (§1, §3.10); an AS flushes *even when its index is invalid* and *even
-when it fails* (§6 flushes before validating). A TRADE/VOTE/COMMIT/SELL between a DECORATE and
-its body is non-flushing — records survive and bind to the next body. A DECORATE under a ⊥
-actor drops its records immediately; this is observationally identical to buffer-then-fail (an
-anonymous author owns no name, and any intervening AS flushes anyway).
+re-point.
 
 ---
 
@@ -249,7 +244,7 @@ RENEW, pruning an empty owner's row, or missing the TRANSFER *recipient* bump (w
 from "either party" though the explicit examples name only SETTLE/PAY/TRADE) all fork
 `n_muts`.
 
-**5.5 A pre-block lapse stamps the mutation height to the connecting height `H`** (§3.5; §6;
+**5.5 A pre-block lapse stamps the mutation height to the connecting height `H`** (§3.5; §5;
 conf §3); an offer-close or reserve-revert leaves the name in the seller's set and does *not*
 bump. This is consensus-critical: a selective RENEW/RELEASE/TRANSFER anchored *before* a lapse
 but confirming at/after it must be *rejected* (resend) rather than acting on a now-stale lex
@@ -324,10 +319,12 @@ off-curve key (status 1). Oracles pinned verbatim:
 
 ## 7. Canonical state digest (conf §4)
 
+*(§7.4 and §7.7 removed in the names-only simplification.)*
+
 **7.1 Fixed-width names rows; market fields always emitted and physically reset.** Every names
 row is fixed-width: the market block (`seller`, `seller_type`, `price`, `offer_expiry`,
 `buyer`, `burn_leg`, `pay_leg`, `reserve_expiry`) is *always* emitted, zeroed when inactive,
-and physically reset on the transition leaving a market state (conf §4). The §6 prose ("for a
+and physically reset on the transition leaving a market state (conf §4). The §5 prose ("for a
 listed name") invites a variable-width reading, but conf §4 is an unconditional field list; a
 variable-width row, or a non-zero sentinel/stale inactive field, forks the SHA-256 though
 `n_names` agrees. Resetting on the transition (not just at serialize) keeps the reserve-revert
@@ -335,7 +332,7 @@ case consistent.
 
 **7.2 The single `buyer[20]` slot holds both reserver and directed buyer:** the reserver
 hash160 when `st = RESERVED`, the directed buyer when `st = OFFERED`, zero otherwise (conf §4;
-§6). The digest groups `buyer ‖ burn_leg ‖ pay_leg ‖ reserve_expiry` — the reservation fields —
+§5). The digest groups `buyer ‖ burn_leg ‖ pay_leg ‖ reserve_expiry` — the reservation fields —
 so `buyer` is the canonical single counterparty slot. Keeping the reserver in a non-digested
 side table (zeroing `buyer` for RESERVED) forks every reserved listing.
 
@@ -345,16 +342,8 @@ twice — it forks the digest on every market row and selects the payment-output
 yet it is pinned only in the conformance doc. Digesting `owner_type`, or a different
 `seller_type` encoding, forks every market row.
 
-**7.4 Decoration rows: one per record, verbatim TLV, stable within a post.** One row *per TLV
-record*: `txid[32] ‖ u32 vout ‖ u8 rec_len ‖ rec`, where `rec` = the verbatim on-wire
-`[tag:1][len:2 LE][value]` (the inner 2-byte len *is* re-emitted) and `rec_len = 3 +
-value_len`; `n_decors` = total record count; sorted by `(txid, vout)` *stably* (conf §4; §1).
-"Verbatim" admits three readings of `rec` (full TLV, `[tag][value]`, `[value]`), each forking
-the digest; full-TLV is canonical. A record is ≤ 76 bytes, so `rec_len` fits a `u8`. An
-unstable sort reorders multi-record posts and forks.
-
 **7.5 Mutation rows are never pruned** — a monotonic high-water mark, sorted by owner bytes,
-`owner[20] ‖ i64 height`, retained even for an emptied owner (§3.5, §3.9, conf §4). §3.9's
+`owner[20] ‖ i64 height`, retained even for an emptied owner (§3.5, §3.8, conf §4). §3.8's
 "only the live set" suggests pruning, which forks `n_muts` after any set-emptying lapse — the
 spec gives no pruning rule.
 
@@ -362,18 +351,8 @@ spec gives no pruning rule.
 bytes alone (conf §4). The commitment-copy attack deliberately creates identical-commitment
 rows; stopping at the primary key (or using insertion order) forks under that case.
 
-**7.7 Votes store net score; synthetic post-id is 32 bytes.** Vote row =
-`target[32] ‖ u32 vout ‖ i128 score[16]` (net `Σ up − Σ down`, no per-voter rows); a zero-net
-row is kept (conf §4). The accumulator is signed 128-bit, fail-loud on overflow via the
-trailing `overflow` byte (serializing the wrapped low 128 bits), astronomically unreachable. A
-synthetic post-id is a *32-byte* field `u64_le(height) ‖ u32_le(txindex) ‖ 20 zero bytes`
-(conf §3). *Trap:* conf §3 once narrated `u64 ‖ u32 ‖ 12 zero bytes` (= 24 bytes),
-inconsistent with the 32-byte `target`/`txid` field; emitting a literal 24-byte id misaligns
-the whole stream. The spec was hardened to the 32-byte width.
-
 **7.8 Signedness.** `lease_expiry`/`offer_expiry`/`reserve_expiry`/`commit_height`/
-`commit_time`/mutation heights are `i64`; `price`/`burn_leg`/`pay_leg` are `u64` (conf §4);
-`i128` scores are 16-byte LE two's-complement. The i64/u64 distinction is byte-identical for
+`commit_time`/mutation heights are `i64`; `price`/`burn_leg`/`pay_leg` are `u64` (conf §4). The i64/u64 distinction is byte-identical for
 the non-negative values these fields hold and would only differ above `2⁶³` (unreachable).
 
 ---
@@ -382,50 +361,30 @@ the non-negative values these fields hold and would only differ above `2⁶³` (
 
 **8.1 Single-minimal-push carrier gate.** A carrier is exactly `OP_RETURN <push>`, one
 *minimal* push of `P ≤ 80` bytes; multiple pushes, a non-minimal push, or a trailing opcode →
-*ignore* (§1). An empty push (`OP_0` / `P = 0`) can't carry the 4-byte prefix nor a `len ≥ 1`
-post → ignore. *Scope:* this is a script-layer gate; the abstract machine receives
+*ignore* (§1). An empty push (`OP_0` / `P = 0`) can't carry the 4-byte prefix → ignore. *Scope:* this is a script-layer gate; the abstract machine receives
 already-extracted payloads, so a full indexer must apply it at the script layer — conflating
 payload with scriptPubKey bytes treats multi-push `OP_RETURN`s as carriers and forks.
 
-**8.2 Name charset is reject-not-fold.** `[a-z0-9-]` — a DNS label, lowercased (re-pinned 2026-07-07, supersedes the 2026-07-02 dot rule; scenario 52), length 1–32; any non-name byte (incl.
-uppercase) → whole action IGNORE (§3.1; conf §9). §3.1's "canonical key is the lowercase form"
-could be misread as accept-and-fold; that mints `alice` for `CLAIM "Alice"` where the strict
-reading IGNOREs — a namespace fork. The charset is strict lowercase, so the clause is a no-op.
-
-**8.3 Strict RFC-3629 UTF-8 over the whole payload.** Reject overlong encodings, lone
-surrogates `U+D800..U+DFFF`, code points `> U+10FFFF`, tested over the *whole* payload, not the
-first byte (§1; conf §9) — a valid-then-invalid payload is not a post. A lenient decoder, or
-one substituting `U+FFFD`, mis-classifies a malformed payload as a post.
+**8.2 Name charset and structure are reject-not-fold.** `[a-z0-9-]` — a DNS label, lowercased,
+with RFC-1123 positioning: no leading `-`, no trailing `-`, and no `--` at positions 3-4
+(`name[2]=='-' && name[3]=='-'`, which kills `xn--` and every IDNA ACE label) (re-pinned
+2026-07-08, supersedes the 2026-07-07 charset-only rule; scenario 52), length 1–32; any
+non-name byte (incl. uppercase) or a structural violation (`-a`, `a-`, `xn--…`) → whole action
+IGNORE (§3.1; conf §9). §3.1's "canonical key is the lowercase form" could be misread as
+accept-and-fold; that mints `alice` for `CLAIM "Alice"` where the strict reading IGNOREs — a
+namespace fork. The charset is strict lowercase, so the clause is a no-op; every consensus-valid
+name is thereby a valid, safe domain label.
 
 **8.4 Action length bands are body lengths.** Conf §9 states bands as *body* lengths `bl`
 (= total − 4); §3.5's RENEW table (`4 / 9 / 10..80`) states *whole-OP_RETURN* lengths.
 Consistent once the 4-byte prefix is accounted for. Decode on `bl`: RENEW
 `{0, 5} ∪ [6, 76]` (`1..4` invalid); TRANSFER `{20} ∪ [26, 76]` (no anchored-all mode); TRADE
-`bl ≥ 5` (upper bound from name validation); DECORATE `[0, 76]` (`bl = 0` is a valid record-less
-buffer push) (§3.5; conf §9). §3.5 warns that reading its whole-payload numbers as body lengths
+`bl ≥ 5` (upper bound from name validation) (§3.5; conf §9). §3.5 warns that reading its
+whole-payload numbers as body lengths
 shifts the band and forks the decoder.
 
-**8.5 Value gates are at the fold, not the decoder.** A `value = 0` VOTE decodes to an ACTION
-regardless of value and is dropped by the fold (`value < DUST_FLOOR`); a zero-value valid-UTF-8
-payload decodes to IGNORE (a POST needs `value > 0`) (§6; conf §9). Per-op: VOTE
-`value ≥ DUST_FLOOR`; CLAIM/RENEW governed by the `T ≥ 1` water-fill gate (no separate
-precheck); RESERVE `value ≥ burn_leg`. A malformed-decoded IGNORE carrier is inert and does not
-flush the DECORATE buffer.
-
-**8.6 Decoration binding, ownership gate, orphan cleanup.** A DECORATE binds to the *next body*
-it reaches (not strictly the next output) — one tx may carry several decorated posts. A
-truncated TLV header or a `len` overrunning the payload fail-closes the *rest of that carrier*
-but keeps valid prior records (§1). A decorated post is honored only if the *body's* acting
-identity owns ≥ 1 live name at confirmation — counting LISTED/OFFERED/RESERVED (a listing is
-not a loss of ownership) — evaluated positionally (an earlier same-tx mint counts). A `len = 0`
-record is valid. Votes/decorations key on txid, persist independent of name liveness (a lapse
-does not clean them up). *Trap:* a whole-carrier drop on any malformed remnant forks the
-decoration digest; the gate is on the *body's* author (records and body share one identity when
-binding, since an intervening AS flushes).
-
-**8.7 POST is never gated and never dropped** — not subject to the `0x03..0x0F` activation gate;
-an unattributable POST is indexed as anonymous, its only digest effect being decoration binding
-(§1, §6).
+**8.5 Value gates are at the fold, not the decoder.** Per-op: CLAIM/RENEW governed by the
+`T ≥ 1` water-fill gate (no separate precheck); RESERVE `value ≥ burn_leg` (§5; conf §9).
 
 ---
 
@@ -433,14 +392,14 @@ an unattributable POST is indexed as anonymous, its only digest effect being dec
 
 **9.1 Transitions applied by type, not by boundary value.** When one MTP advance crosses
 several boundaries, apply by type in the order `reserve_expiry`, `offer_expiry`, `lease_expiry`,
-each idempotent, then prune expired commits before the block's txs (§6). Across distinct names
+each idempotent, then prune expired commits before the block's txs (§5). Across distinct names
 the order is irrelevant; type-order matters within one name's chain because the values can tie
 (`reserve_expiry == offer_expiry`) — a value-sorted impl forks on that tie. The COMMIT_EXPIRY
 prune must precede the txs so a CLAIM never sees an expired commit.
 
 **9.2 MTP window, even-window upper-middle, genesis.** `MTP(H)` = median of the up-to-11
 timestamps strictly before `H` (`k = min(11, H)`): sort and select index `⌊k/2⌋`, the *upper*-
-middle for even `k` (not an average); `MTP(0) = 0` (§6; conf §2). The upper-middle rule is
+middle for even `k` (not an average); `MTP(0) = 0` (§5; conf §2). The upper-middle rule is
 pinned in conf §2 but not the main spec, so a main-spec-only reader could average and fork a
 near-genesis boundary call; the machine runs from block 0, so this is reachable. MTP is
 sorted-by-value, never middle-by-height.
@@ -460,10 +419,8 @@ or rounding rule.
 
 **10.1 ≥128-bit overflow on value paths.** Compute the deposit legs (`price·bps`, `price` near
 `2⁶⁴`) and the lease numerator (`burn·LEASE_QUANTUM`) in ≥128 bits — a 64-bit multiply wraps a
-fat price to a near-zero deposit (ownership fork) or a wrong day count (lease fork). The vote
-accumulator is signed 128-bit and *fail-loud* on overflow (set the digest `overflow` byte),
-never silently wrapped. Languages without native 128-bit hand-roll these (Go `math/bits`; C#
-`UInt128`/`Int128`; a two's-complement `{hi, lo}` for the accumulator).
+fat price to a near-zero deposit (ownership fork) or a wrong day count (lease fork).
+Languages without native 128-bit hand-roll these (Go `math/bits`; C# `UInt128`/`Int128`).
 
 **10.2 Go `bits.Div64` panic floor — the `hi ≥ den` sentinel is mandatory.** Conf §2's no-panic
 argument rests on the *generator's* `rate ≥ 28`, but the *production* floor is `DUST_FLOOR = 1`
@@ -479,25 +436,24 @@ to zero *before* dividing so the dividend is non-negative and floor == truncatio
 subtraction of an under-claim wraps to ~`2⁶⁴`.
 
 **10.4 No floating point on any value path.** A `double` is exact only to `2⁵³ − 1`; one `/` or
-`Math.*` on a koinu/price/weight/lease value near `2⁵³`–`2⁶⁴` (e.g. `price·50/10000`) corrupts
+`Math.*` on a koinu/price/lease value near `2⁵³`–`2⁶⁴` (e.g. `price·50/10000`) corrupts
 the value bytes and forks. Carry every value-bearing field in an exact integer type; the
 conformance `VAL_BND` probe (`2⁵³−1, 2⁵³, 2⁵³+1, 2⁵⁴+1`) catches this.
 
 **10.5 Deterministic ordering — explicit bytewise sorts, never hash/dict iteration.** Sort every
 digested sequence by its pinned key with an explicit *unsigned bytewise* comparator: names by
-raw bytes; commits by `(commitment, height, tx_index)`; votes by `(target, vout)`; mutations by
-owner; decorations by `(txid, vout)` *stably*. Hash-map/dict/set iteration order (randomized in
-Go) must never feed the digest, and a locale-sensitive string compare must never order keys.
-Decorations need a stable sort (C# `List.Sort` is unstable — add an insertion-index tiebreak);
-the commitment-copy attack makes the commits secondary key load-bearing.
+raw bytes; commits by `(commitment, height, tx_index)`; mutations by owner. Hash-map/dict/set
+iteration order (randomized in Go) must never feed the digest, and a locale-sensitive string
+compare must never order keys. The commitment-copy attack makes the commits secondary key
+load-bearing.
 
 **10.6 Shifts, fixed-width IO, crash-safety.** Right-shift is arithmetic (sign-extending) on
 signed types in C/C#/Java; the bitmap read and SplitMix64 shifts must use unsigned/non-negative
 values. Use endianness-explicit IO (`BinaryPrimitives.*LittleEndian`, not host-dependent
-`BitConverter`). Length-guard every attacker-reachable index/slice in the decoder, TLV parser,
+`BitConverter`). Length-guard every attacker-reachable index/slice in the decoder
 and attribution cursor so a malformed payload returns IGNORE rather than throwing — the decoder
 is fail-closed and crash-safe by construction. Narrow integer types are fine only for genuinely
-≤32-bit fields (`vout`, `tx_index`, indices, name lengths, bit indices, TLV lengths); everything
+≤32-bit fields (`vout`, `tx_index`, indices, name lengths, bit indices); everything
 value- or time-bearing is ≥64-bit.
 
 ---
@@ -530,6 +486,6 @@ derivable — but they scope cross-implementation comparison:
 ---
 
 *Where the spec was hardened in response to these findings — the §3.2 claim tie-break, the
-off-curve-P2PKH status, the lapse mutation-height stamp, the 32-byte synthetic post-id, the
+off-curve-P2PKH status, the lapse mutation-height stamp, the
 LSB-first bitmap, and the fixed-width digest layout — the resolved answers above reflect the
 current `docs/protocol-spec.md` and `SPEC-conformance.md`.*

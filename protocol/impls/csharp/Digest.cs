@@ -2,13 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.Buffers.Binary;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
 /// Canonical SHA-256 state digest (SPEC-conformance §4). All multi-byte integers
-/// little-endian; signed two's-complement LE; i128 = 16 bytes LE. Sorts are
-/// explicit and unsigned-bytewise; Dictionary/HashSet enumeration never feeds the
-/// digest (brief). Written with BinaryPrimitives (host-endian-independent).
+/// little-endian; signed two's-complement LE. Sorts are explicit and unsigned-bytewise;
+/// Dictionary/HashSet enumeration never feeds the digest. Magic "SMv1". Names-only:
+/// tables = names + commits + muts (no votes/decors/overflow).
 /// </summary>
 public static class Digest
 {
@@ -57,27 +57,6 @@ public static class Digest
             buf.I64(c.CommitTime);
         }
 
-        // ---- votes: sorted by (target[32], vout) ----
-        var votes = new List<(byte[] target, uint vout, Int128 score)>();
-        foreach (var kv in f.VoteScore)
-        {
-            var (target, vout) = f.VoteKeyInfo[kv.Key];
-            votes.Add((target, vout, kv.Value));
-        }
-        votes.Sort((a, b) =>
-        {
-            int c = ByteArrayComparer.Instance.Compare(a.target, b.target);
-            if (c != 0) return c;
-            return a.vout.CompareTo(b.vout);
-        });
-        buf.U32((uint)votes.Count);
-        foreach (var v in votes)
-        {
-            buf.Fixed(v.target, 32);
-            buf.U32(v.vout);
-            buf.I128(v.score);
-        }
-
         // ---- muts: sorted by owner bytes ----
         var muts = new List<(byte[] owner, long h)>();
         foreach (var kv in f.Muts)
@@ -89,28 +68,6 @@ public static class Digest
             buf.Fixed(m.owner, 20);
             buf.I64(m.h);
         }
-
-        // ---- decors: sorted by (txid[32], vout) STABLE (insertion order within a post) ----
-        var decorsIdx = new List<(DecorRow row, int orig)>();
-        for (int i = 0; i < f.Decors.Count; i++) decorsIdx.Add((f.Decors[i], i));
-        decorsIdx.Sort((a, b) =>
-        {
-            int c = ByteArrayComparer.Instance.Compare(a.row.Txid, b.row.Txid);
-            if (c != 0) return c;
-            c = a.row.Vout.CompareTo(b.row.Vout);
-            if (c != 0) return c;
-            return a.orig.CompareTo(b.orig); // stable tiebreak = insertion order
-        });
-        buf.U32((uint)decorsIdx.Count);
-        foreach (var (row, _) in decorsIdx)
-        {
-            buf.Fixed(row.Txid, 32);
-            buf.U32(row.Vout);
-            buf.U8((byte)row.Rec.Length);
-            buf.Bytes(row.Rec);
-        }
-
-        buf.U8(f.OverflowFlag);
 
         return Hashing.Sha256(buf.ToSpan());
     }
@@ -137,14 +94,6 @@ public static class Digest
         public void U32(uint v) { Ensure(4); BinaryPrimitives.WriteUInt32LittleEndian(_b.AsSpan(_len, 4), v); _len += 4; }
         public void U64(ulong v) { Ensure(8); BinaryPrimitives.WriteUInt64LittleEndian(_b.AsSpan(_len, 8), v); _len += 8; }
         public void I64(long v) { Ensure(8); BinaryPrimitives.WriteInt64LittleEndian(_b.AsSpan(_len, 8), v); _len += 8; }
-        public void I128(Int128 v)
-        {
-            // 16 bytes LE two's complement: reinterpret bit pattern via UInt128.
-            UInt128 u = unchecked((UInt128)v);
-            ulong lo = (ulong)(u & (UInt128)ulong.MaxValue);
-            ulong hi = (ulong)(u >> 64);
-            U64(lo); U64(hi);
-        }
         public ReadOnlySpan<byte> ToSpan() => _b.AsSpan(0, _len);
     }
 }

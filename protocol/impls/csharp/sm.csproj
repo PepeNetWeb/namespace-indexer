@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <AssemblyName>sm</AssemblyName>
-    <RootNamespace>Shibpost</RootNamespace>
+    <RootNamespace>Pepenet</RootNamespace>
     <!-- No PackageReference of any kind: BCL only, per IMPLEMENTER-BRIEF. -->
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>

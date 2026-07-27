@@ -16,7 +16,7 @@
 
 use crate::decode::{Action, BitmapSel, RenewMode};
 use crate::digest::{hex32, state_digest};
-use crate::encode::{decor_record, encode_action};
+use crate::encode::encode_action;
 use crate::fold::State;
 use crate::model::{Block, Input, Output, Tx};
 use crate::oracle::{fee_per_byte, mtp, oracle_rate};
@@ -56,11 +56,6 @@ fn car(a: &Action, value: u64) -> Output {
     Output::Carrier { payload: encode_action(a), value }
 }
 
-/// The C `add_post`: a 5-byte UTF-8 body "hello" with the given burn.
-fn post(value: u64) -> Output {
-    Output::Carrier { payload: b"hello".to_vec(), value }
-}
-
 fn spend(dest: &Hash160, value: u64) -> Output {
     Output::Spend { hash160: *dest, stype: ScriptType::P2pkh, value }
 }
@@ -79,33 +74,6 @@ fn mk_commit(name: &[u8], author: &Hash160, salt0: u8) -> Action {
 
 fn mk_claim(name: &[u8], salt0: u8) -> Action {
     Action::Claim { salt: [salt0; 32], name: name.to_vec() }
-}
-
-fn vote(up: bool, target_tag: u8, tvout: u32) -> Action {
-    let mut target = [0u8; 32];
-    target[0] = target_tag;
-    if up {
-        Action::VoteUp { target, vout: tvout }
-    } else {
-        Action::VoteDown { target, vout: tvout }
-    }
-}
-
-fn decorate(tag: u8, val: &[u8]) -> Action {
-    Action::Decorate { raw: decor_record(tag, val) }
-}
-
-/// A DECORATE carrier packed with `nrec` empty (len-0) TLV records — 3 bytes each
-/// (`[tag=i+1][0][0]`, i = 0-based index within this carrier), mirroring C `decorate_n`.
-/// Used to drive the §1 pending-record cap vector.
-fn decorate_n(nrec: usize) -> Action {
-    let mut raw = Vec::with_capacity(3 * nrec);
-    for i in 0..nrec {
-        raw.push((i + 1) as u8);
-        raw.push(0);
-        raw.push(0);
-    }
-    Action::Decorate { raw }
 }
 
 /// Scenario harness: the C `sm_begin_block(h, mtp, RATE_DAYS)` + per-tx applies,
@@ -388,36 +356,7 @@ pub fn run() -> i32 {
         emit_state(&mut comb, "25_trade_rug_before", &sc);
     }
 
-    // 26: DECORATE gate — owner binds; nameless author drops; orphan (no body) drops.
-    {
-        let mut sc = minted(0xAA, b"bob", 300, 1500);
-        sc.block(12, 1600, vec![
-            tx1(0xAA, vec![car(&decorate(7, b"reply"), 0), post(1)]), // owner → binds
-            tx1(0xCC, vec![car(&decorate(7, b"x"), 0), post(1)]),     // nameless → drop
-            tx1(0xAA, vec![car(&decorate(7, b"orphan"), 0)]),         // orphan → drop
-        ]);
-        emit_state(&mut comb, "26_decorate_gate", &sc);
-    }
-
-    // 27: vote score — up 5, down 2, up 0 (dust-dropped) → net +3.
-    {
-        let mut sc = Sc::new();
-        sc.block(100, 1000, vec![tx1(0xAA, vec![
-            car(&vote(true, 0x11, 0), 5),
-            car(&vote(false, 0x11, 0), 2),
-            car(&vote(true, 0x11, 0), 0),
-        ])]);
-        emit_state(&mut comb, "27_vote_score", &sc);
-    }
-
-    // 28: i128 accumulation past 2^64 — three max-weight up-votes (a u64 impl wraps).
-    {
-        let mut sc = Sc::new();
-        sc.block(100, 1000, (0..3).map(|_| tx1(0xAA, vec![car(&vote(true, 0x11, 0), u64::MAX)])).collect());
-        emit_state(&mut comb, "28_vote_past_u64", &sc);
-    }
-
-    // 29–31: fee-oracle / MTP scalars (§3.4, §6).
+    // 29–31: fee-oracle / MTP scalars (§3.4, §5).
     {
         let sub: u64 = 1_000_000_000_000;
         let cb: [i64; 5] = [1_000_000_200_000, 1_000_000_400_000, 999_999_999_950, 1_000_001_000_000, 1_000_000_600_000];
@@ -497,13 +436,6 @@ pub fn run() -> i32 {
         let mut sc = minted(0xAA, b"bob", 10, 1500);
         sc.block(12, 865500, vec![]);
         emit_state(&mut comb, "36b_mtp_at_lapsed", &sc);
-    }
-
-    // 37: i128 vote accumulator past −2^64 (three max down-votes; two's-complement LE).
-    {
-        let mut sc = Sc::new();
-        sc.block(100, 1000, (0..3).map(|_| tx1(0xAA, vec![car(&vote(false, 0x11, 0), u64::MAX)])).collect());
-        emit_state(&mut comb, "37_vote_neg_past_u64", &sc);
     }
 
     // 38: same-block RENEW-vs-CLAIM race at the exact lapse tie (pre-block lapse first).
@@ -693,9 +625,8 @@ pub fn run() -> i32 {
         emit_u64(&mut comb, "51_oracle_subsample_floor", oracle_rate(&w)); // → 1
     }
 
-    // 52: charset = a DNS label [a-z0-9-], 1..32 (re-pinned 2026-07-07, supersedes the
-    // 2026-07-02 dot rule): hyphen and a 32-byte name MINT; '.' and '_' now DROP (uppercase
-    // still drops), leaving exactly the two valid names.
+    // 52: charset = a DNS label [a-z0-9-], 1..32: hyphen and a 32-byte name MINT;
+    // '.' and '_' DROP (uppercase still drops), leaving exactly the two valid names.
     {
         let mut sc = Sc::new();
         commit_then_claim(&mut sc, 0xAA, b"shib-p2p", 0x71, 10, 1000, 10, 1500, 11);
@@ -705,31 +636,93 @@ pub fn run() -> i32 {
         emit_state(&mut comb, "52_charset", &sc);
     }
 
-    // 53: §1 DECORATE pending-record cap (PEND_DECOR_MAX = 64, pinned 2026-07-03).
-    // Owner posts 65 decoration records (26+26+13) then a body: exactly 64 bind, the
-    // 65th drops. An impl that buffers unbounded binds 65 → a different digest, so this
-    // vector is what forces every port to adopt the cap.
-    {
-        let mut sc = minted(0xAA, b"d", 10, 1500);
-        sc.block(12, 1600, vec![tx1(0xAA, vec![
-            car(&decorate_n(26), 0),
-            car(&decorate_n(26), 0),
-            car(&decorate_n(13), 0), // 65 records pending → 64 bind
-            post(100),               // body binds them (owner-signed)
-        ])]);
-        emit_state(&mut comb, "53_decor_pend_cap", &sc);
-    }
-
-    // 54: NO per-tx count cap (§0). One tx carries 17 VOTE carriers — past the historical
-    // 16 — plus 17 payee outs; all fold. An impl that caps at 16 either drops the tx or the
-    // 17th carrier → a different vote score. Proves the reference agrees with an unbounded
-    // impl above the old bound (score 51 = 17 up-votes × weight 3).
+    // 52b: structural name rejects — leading/trailing hyphen and xn-- ACE drop.
     {
         let mut sc = Sc::new();
-        let mut outs: Vec<Output> = (0..17).map(|_| car(&vote(true, 0x55, 7), 3)).collect();
+        commit_then_claim(&mut sc, 0xAA, b"-lead", 0x81, 10, 1000, 10, 1500, 11);
+        commit_then_claim(&mut sc, 0xAA, b"trail-", 0x82, 10, 2000, 12, 2500, 13);
+        commit_then_claim(&mut sc, 0xAA, b"xn--x", 0x83, 10, 3000, 14, 3500, 15);
+        commit_then_claim(&mut sc, 0xAA, b"ok-name", 0x84, 10, 4000, 16, 4500, 17);
+        emit_state(&mut comb, "52b_structural", &sc);
+    }
+
+    // 54: NO per-tx count cap (§0). One tx carries 17 COMMIT carriers past the
+    // historical 16; all fold. An impl that caps at 16 either drops the tx or the
+    // 17th carrier → a different commit count.
+    {
+        let mut sc = Sc::new();
+        let mut outs: Vec<Output> = (0..17)
+            .map(|i| {
+                let mut commitment = [0u8; 32];
+                commitment[0] = i as u8;
+                car(&Action::Commit { commitment }, 0)
+            })
+            .collect();
         outs.extend((0..17).map(|_| spend(&a, 1)));
         sc.block(10, 1000, vec![tx1(0xAA, outs)]);
         emit_state(&mut comb, "54_no_txcap", &sc);
+    }
+
+    // 55: a name minted then RELEASEd earlier in the SAME block re-mints fresh on a
+    // later CLAIM in that block (§3.6 "immediately reclaimable"; row existence is
+    // authoritative, the block-local claim scratch never blocks a re-mint).
+    {
+        let mut sc = Sc::new();
+        sc.block(10, 1000, vec![tx1(0xAA, vec![car(&mk_commit(b"foo", &a, 0x91), 0)])]);
+        sc.block(11, 1500, vec![
+            tx1(0xAA, vec![car(&mk_claim(b"foo", 0x91), 10)]),                        // mint foo→A
+            tx1(0xAA, vec![car(&Action::Release { anchor: 11, flags: vec![0x01] }, 0)]), // release foo
+            tx1(0xAA, vec![car(&mk_claim(b"foo", 0x91), 10)]),                        // re-mint foo→A
+        ]);
+        emit_state(&mut comb, "55_claim_release_reclaim_sameblock", &sc);
+    }
+
+    // 55b: same, but the re-claim is by a DIFFERENT party B whose backing commit has
+    // LOWER priority than the departed A's — B still mints fresh.
+    {
+        let mut sc = Sc::new();
+        sc.block(10, 1000, vec![
+            tx1(0xAA, vec![car(&mk_commit(b"foo", &a, 0x91), 0)]), // A commit (10, tx0) — higher priority
+            tx1(0xBB, vec![car(&mk_commit(b"foo", &b, 0x92), 0)]), // B commit (10, tx1) — lower priority
+        ]);
+        sc.block(11, 1500, vec![
+            tx1(0xAA, vec![car(&mk_claim(b"foo", 0x91), 10)]),                        // A mints
+            tx1(0xAA, vec![car(&Action::Release { anchor: 11, flags: vec![0x01] }, 0)]), // A releases
+            tx1(0xBB, vec![car(&mk_claim(b"foo", 0x92), 10)]),                        // B mints fresh
+        ]);
+        emit_state(&mut comb, "55b_reclaim_by_other", &sc);
+    }
+
+    // 56: a self-transfer (TRANSFER-all whose target == the current owner) is a real
+    // move — it bumps last_set_mutation_height (owner's mut goes 11 → 12), NOT a no-op.
+    {
+        let mut sc = minted(0xAA, b"bar", 10, 1500);
+        sc.block(12, 1600, vec![tx1(0xAA, vec![car(&Action::Transfer { target: a, sel: None }, 0)])]);
+        emit_state(&mut comb, "56_self_transfer_bumps_mut", &sc);
+    }
+
+    // 57: fee oracle with block_bytes == 0 — the /0 guard substitutes divisor 1 (NOT
+    // fee-per-byte 0), so the block still participates. 1000 blocks, each fee 5000 ⇒
+    // per-byte 5000 ⇒ median 5000 × REF_SIZE 200 = 1_000_000.
+    {
+        let sub: u64 = 1_000_000_000_000;
+        let cb: u64 = 1_000_000_005_000;
+        let by: u64 = 0;
+        // Drive the REAL fee_per_byte (now divisor-1 guarded) so the vector exercises the
+        // production oracle path, not a copy of the rule.
+        let w: Vec<u64> = (0..1000).map(|_| fee_per_byte(cb, sub, by)).collect();
+        emit_u64(&mut comb, "57_oracle_zero_bytes", oracle_rate(&w));
+    }
+
+    // 58: CLAIM burn near 2⁶⁴ at rate = DUST_FLOOR (1) — the lease day-count T overflows
+    // 64 bits and clamps to MAX_LEASE (365 days).
+    {
+        let mut sc = Sc::new();
+        let blk10 = Block { height: 10, timestamp: 1000, rate: 1, txs: vec![tx1(0xAA, vec![car(&mk_commit(b"foo", &a, 0x95), 0)])] };
+        sc.st.apply_block(&blk10, &vec![1000i64; 10]);
+        let blk11 = Block { height: 11, timestamp: 1500, rate: 1, txs: vec![tx1(0xAA, vec![car(&mk_claim(b"foo", 0x95), u64::MAX)])] };
+        sc.st.apply_block(&blk11, &vec![1500i64; 11]);
+        emit_state(&mut comb, "58_lease_clamp_huge_burn", &sc);
     }
 
     let cd = sha256(&comb);

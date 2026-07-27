@@ -76,7 +76,12 @@ int txcheck_stateless(const uint8_t *raw, size_t len, char *reason, size_t rc) {
             if (idx_script_payee(tx.outs[o].spk, tx.outs[o].spklen, h160, &type)) {
                 if (v < TX_DUST_LIMIT) { ok = 0; why = "dust output"; break; }   // P2PKH / P2SH
             } else if (idx_op_return_payload(tx.outs[o].spk, tx.outs[o].spklen, &d, &dl)) {
-                // carrier (namespace op) — exempt from dust; value is protocol-meaningful
+                // carrier (namespace op) — exempt from dust; value is protocol-meaningful.
+                // RELAY policy (this gate) keeps the network-standard 80-byte payload
+                // (datacarriersize 83); the FOLD accepts up to the §6 consensus ceiling
+                // (SM_CARRIER_MAX) once mined — chain.c extracts at the consensus bound,
+                // this mempool forwards only what the rest of the network will.
+                if (dl > TX_RELAY_CARRIER_MAX) { ok = 0; why = "carrier past relay datacarriersize"; break; }
             } else {
                 ok = 0; why = "nonstandard scriptPubKey"; break;
             }

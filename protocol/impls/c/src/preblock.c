@@ -1,11 +1,11 @@
-// §6 time-triggered transitions, applied BEFORE a block's transactions.
+// §5 time-triggered transitions, applied BEFORE a block's transactions.
 //
 // For a single name the boundaries nest reserve_expiry ≤ offer_expiry ≤
 // lease_expiry − REORG_BUFFER (the RESERVE clamp, §3.7), so a per-row pass that
 // checks reserve → offer → lease IN THAT ORDER cascades correctly when one MTP
 // advance crosses several at once. Distinct names are independent; commit
 // pruning is independent of the market chain. All bounds are EXCLUSIVE (a name
-// is owned iff MTP < lease_expiry). See sm.h / protocol-spec.md §6.
+// is owned iff MTP < lease_expiry). See sm.h / protocol-spec.md §5.
 #include "sm.h"
 #include <string.h>
 
@@ -18,7 +18,7 @@ static void return_to_seller(SmNameRow *r) {
     r->burn_leg = r->pay_leg = 0;
     memset(r->seller, 0, 20); r->seller_type = 0;
     memset(r->buyer, 0, 20);
-    // lease_expiry carried unchanged (offer_expiry < lease_expiry, §6).
+    // lease_expiry carried unchanged (offer_expiry < lease_expiry, §5).
 }
 
 void sm_preblock(SmState *s, int64_t height, int64_t mtp) {
@@ -48,7 +48,7 @@ void sm_preblock(SmState *s, int64_t height, int64_t mtp) {
             // the connecting block H. A bitmap op anchored before the lapse then fails the
             // anchor guard (reject-and-resend) instead of acting on a now-shifted ordering
             // and touching the wrong name. (By here steps 1–2 have restored owner==the real
-            // owner: the §6 nesting offer_expiry < lease_expiry guarantees a sale row already
+            // owner: the §5 nesting offer_expiry < lease_expiry guarantees a sale row already
             // reverted via return_to_seller before its lease can lapse.)
             sm_bump_mutation(s, r->owner, height);
             sm_remove_name(s, r); s->ev[SM_EV_LAPSE]++;

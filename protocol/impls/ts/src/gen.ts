@@ -4,6 +4,8 @@
 // `input_digest` goldens (SPEC-conformance.md §6/§9). That is expected and stated plainly; I do not
 // fake a match. Its value: exercise the fold deterministically at scale and prove same-seed →
 // same-digest internally (a real cross-run determinism check).
+//
+// Names-only: op weights cover COMMIT..TRADE (no post/vote); AS is exercised on the renew path.
 import { SplitMix64 } from "./prng.ts";
 import { Fold } from "./fold.ts";
 import type { FoldTx } from "./fold.ts";
@@ -12,8 +14,8 @@ import { concat, u8, u32le, u64le, hex, type Bytes } from "./bytes.ts";
 import * as B from "./builders.ts";
 import { N_IDS, BASE_TS } from "./constants.ts";
 
-// op weights (conformance §5) — used as relative frequencies under MY OWN draw order.
-const WEIGHTS = [12, 12, 14, 13, 5, 5, 8, 7, 7, 3, 6, 5, 4]; // POST,VOTE,COMMIT,CLAIM,RENEW,...
+// op weights (names/market only): COMMIT,CLAIM,RENEW,TRANSFER,SELL,RESERVE,SETTLE,RELEASE,SELL_TO,PAY,TRADE
+const WEIGHTS = [14, 13, 5, 5, 8, 7, 7, 3, 6, 5, 4];
 const W_SUM = WEIGHTS.reduce((a, b) => a + b, 0);
 
 type PendingCommit = { salt: Bytes; name: string; author: number };
@@ -69,36 +71,39 @@ function buildTx(r: SplitMix64, f: Fold, commits: PendingCommit[], freshName: ()
   for (; op < WEIGHTS.length; op++) { if (x < WEIGHTS[op]) break; x -= WEIGHTS[op]; }
 
   switch (op) {
-    case 0: // POST
-      return B.tx([inp], [B.postCarrier("post-" + r.boundedN(1000), 1n)]);
-    case 1: { // VOTE
-      const target = new Uint8Array(32);
-      target[0] = r.boundedN(256);
-      const up = r.boundedN(2) === 0;
-      const w = 1n + r.bounded(1000);
-      return B.tx([inp], [up ? B.voteUp(target, 0, w) : B.voteDown(target, 0, w)]);
-    }
-    case 2: { // COMMIT (queue a claim for next block)
+    case 0: { // COMMIT (queue a claim for next block)
       const name = freshName();
       const salt = new Uint8Array(32);
       salt[0] = r.boundedN(256); salt[1] = r.boundedN(256);
       commits.push({ salt, name, author: idn });
       return B.tx([inp], [B.commit(B.commitmentOf(salt, name, id))]);
     }
-    case 4: // RENEW all
-      return B.tx([inp], [B.renewAll(1n + r.bounded(120))]);
-    case 5: { // TRANSFER all → random other id
+    case 1: // CLAIM fallback path is via pending commits; emit a harmless COMMIT
+      return B.tx([inp], [B.commit(new Uint8Array(32).fill(r.boundedN(256)))]);
+    case 2: { // RENEW all — occasionally AS-attributed
+      const burn = 1n + r.bounded(120);
+      if (r.boundedN(8) === 0) {
+        const other = r.boundedN(N_IDS);
+        const idx = r.boundedN(4) === 0 ? (2 + r.boundedN(8)) : 1; // sometimes OOB → segment drops
+        return B.tx(
+          [B.input(B.genId(other), B.genType(other)), B.input(id, B.genType(idn))],
+          [B.asMarker(idx, 0), B.renewAll(burn, 1)],
+        );
+      }
+      return B.tx([inp], [B.renewAll(burn)]);
+    }
+    case 3: { // TRANSFER all → random other id
       const tgt = B.genId(r.boundedN(N_IDS));
       return B.tx([inp], [B.transferAll(tgt)]);
     }
-    case 6: { // SELL a name the id owns (if any)
+    case 4: { // SELL a name the id owns (if any)
       const owned = ownedOf(f, id);
-      if (owned.length === 0) return B.tx([inp], [B.postCarrier("noop", 1n)]);
+      if (owned.length === 0) return B.tx([inp], [B.commit(new Uint8Array(32).fill(1))]);
       const name = owned[r.boundedN(owned.length)];
       return B.tx([inp], [B.sell(3n + r.bounded(100000), 18000n + r.bounded(50000), name)]);
     }
-    default: // CLAIM/RESERVE/SETTLE/RELEASE/SELL_TO/PAY/TRADE: emit a harmless VOTE to keep flowing
-      return B.tx([inp], [B.voteUp(new Uint8Array(32), 0, 1n + r.bounded(10))]);
+    default: // RESERVE/SETTLE/RELEASE/SELL_TO/PAY/TRADE: emit a harmless COMMIT to keep flowing
+      return B.tx([inp], [B.commit(new Uint8Array(32).fill(r.boundedN(256)))]);
   }
 }
 

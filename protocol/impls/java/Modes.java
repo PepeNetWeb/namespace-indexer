@@ -58,23 +58,22 @@ final class Modes {
             }
         }
         for (long mh : st.muts.values()) if (mh > height) v++;       // mutation height <= cur height
-        if (st.overflow) v++;
         return v;
     }
 
+    // §8 fingerprint — names-only aggregates (matches C sm_block_fingerprint field set).
     static void fingerprint(Buf pd, State st) {
         int nOwned = 0, nListed = 0, nOffered = 0, nReserved = 0;
-        BigInteger sumLease = BigInteger.ZERO, sumPrice = BigInteger.ZERO, sumLegs = BigInteger.ZERO, sumVote = BigInteger.ZERO;
+        BigInteger sumLease = BigInteger.ZERO, sumPrice = BigInteger.ZERO, sumLegs = BigInteger.ZERO;
         for (State.NameRow r : st.names.values()) {
             switch (r.st) { case Const.OWNED -> nOwned++; case Const.LISTED -> nListed++; case Const.OFFERED -> nOffered++; case Const.RESERVED -> nReserved++; }
             sumLease = sumLease.add(BigInteger.valueOf(r.leaseExpiry));
-            if (r.st == Const.LISTED || r.st == Const.RESERVED) sumPrice = sumPrice.add(r.price);
+            if (r.st == Const.LISTED || r.st == Const.OFFERED || r.st == Const.RESERVED) sumPrice = sumPrice.add(r.price);
             if (r.st == Const.RESERVED) sumLegs = sumLegs.add(r.burnLeg).add(r.payLeg);
         }
-        for (State.Vote vt : st.votes.values()) sumVote = sumVote.add(vt.score);
         pd.u32(st.names.size()).u32(nOwned).u32(nListed).u32(nOffered).u32(nReserved);
-        pd.u32(st.commits.size()).u32(st.votes.size()).u32(st.muts.size()).u32(st.decors.size());
-        pd.i128(sumLease).i128(sumPrice).i128(sumLegs).i128(sumVote).u8(st.overflow ? 1 : 0);
+        pd.u32(st.commits.size()).u32(st.muts.size());
+        pd.i128(sumLease).i128(sumPrice).i128(sumLegs);
     }
 
     // §11 meta: an action the protocol IGNORES is provably inert.
@@ -85,7 +84,7 @@ final class Modes {
         for (Model.Block b : blocks) {
             f.applyBlock(b);
             String before = StateDigest.digest(st);
-            f.applyOneTx(b.height, b.mtp, b.rate, inertTx());   // zero-weight vote, IGNORE carrier, orphan DECORATE, zero-value POST
+            f.applyOneTx(b.height, b.mtp, b.rate, inertTx());   // malformed CLAIM / unknown op / UTF-8 / overlay
             if (!StateDigest.digest(st).equals(before)) failures++;
         }
         System.out.println("failures=" + failures);
@@ -93,16 +92,18 @@ final class Modes {
         if (failures != 0) System.exit(1);
     }
 
+    // Mirrors C build_inert_tx: truncated CLAIM, unknown opcode, bare UTF-8, overlay-band.
     static Model.Tx inertTx() {
-        byte[] id = Gen.identity(0);
-        Action zv = new Action(); zv.op = Const.VOTE_UP; zv.target = Model.synthTxid(1, 0); zv.vout = 0;
-        Action dec = new Action(); dec.op = Const.DECORATE; dec.decTlv = Behav.tlv(3, new byte[]{9});
-        byte[] malformed = new byte[]{(byte) 0xFF, 0x50, 0x4E, (byte) 0x05, 0x01, 0x02, 0x03}; // RENEW bl=3 -> IGNORE
+        byte[] id = new byte[20]; id[0] = (byte) 0xEE; id[19] = (byte) 0xEE;
+        byte[] badClaim = new byte[]{(byte) 0xFF, 0x50, 0x4E, (byte) Const.CLAIM, 0, 0, 0, 0}; // truncated → IGNORE
+        byte[] unknown  = new byte[]{(byte) 0xFF, 0x50, 0x4E, 0x20};                           // gap opcode → IGNORE
+        byte[] utf8     = "hello".getBytes(java.nio.charset.StandardCharsets.US_ASCII);         // bare noise → IGNORE
+        byte[] overlay  = new byte[]{(byte) 0xFF, 0x50, 0x4E, (byte) 0xD6, 0x00};              // overlay band → IGNORE
         Model.TxOut[] outs = {
-            Model.TxOut.carrier(BigInteger.ZERO, Wire.encode(zv)),       // zero-weight vote -> dropped
-            Model.TxOut.carrier(BigInteger.ZERO, malformed),            // decodes to IGNORE
-            Model.TxOut.carrier(BigInteger.ZERO, Wire.encode(dec)),      // orphan DECORATE -> discarded at tx end
-            Model.TxOut.carrier(BigInteger.ZERO, "hi".getBytes(java.nio.charset.StandardCharsets.US_ASCII)), // zero-value POST -> IGNORE
+            Model.TxOut.carrier(BigInteger.ZERO, badClaim),
+            Model.TxOut.carrier(BigInteger.ZERO, unknown),
+            Model.TxOut.carrier(BigInteger.ONE, utf8),
+            Model.TxOut.carrier(BigInteger.ZERO, overlay),
         };
         return new Model.Tx(new Model.TxIn[]{ new Model.TxIn(id, Const.P2PKH, true) }, outs);
     }
@@ -200,7 +201,7 @@ final class Modes {
             int len = rng.bnd(81);
             byte[] p = new byte[len];
             for (int i = 0; i < len; i++) p[i] = (byte) rng.bnd(256);
-            if (rng.bnd(3) == 0 && len >= 4) { p[0] = (byte) 0xFF; p[1] = 0x50; p[2] = 0x4E; p[3] = (byte) (1 + rng.bnd(15)); }
+            if (rng.bnd(3) == 0 && len >= 4) { p[0] = (byte) 0xFF; p[1] = 0x50; p[2] = 0x4E; p[3] = (byte) (1 + rng.bnd(12)); }
             return p;
         }
         // grammar-aware: build a prefixed action-shaped payload, then maybe corrupt
@@ -214,14 +215,21 @@ final class Modes {
         return payload;
     }
     static byte[] grammarPayload(Rng rng) {
-        int op = 1 + rng.bnd(15);
+        int op = 1 + rng.bnd(15);   // 0x01..0x0F registry
         int bodyLen = switch (op) {
-            case Const.VOTE_UP, Const.VOTE_DOWN -> 36; case Const.COMMIT -> 32;
-            case Const.CLAIM -> 33 + rng.bnd(32); case Const.RENEW -> new int[]{0,5,6+rng.bnd(71)}[rng.bnd(3)];
-            case Const.TRANSFER -> rng.bnd(2)==0?20:26+rng.bnd(51); case Const.SELL -> 13+rng.bnd(32);
-            case Const.RESERVE, Const.SETTLE, Const.PAY -> 1+rng.bnd(32); case Const.RELEASE -> 6+rng.bnd(71);
-            case Const.DECORATE -> rng.bnd(77); case Const.SELL_TO -> 29+rng.bnd(32);
-            case Const.AS -> 1; case Const.TRADE -> 5+rng.bnd(30); default -> rng.bnd(77);
+            case Const.COMMIT -> 32;
+            case Const.CLAIM -> 33 + rng.bnd(32);
+            case Const.RENEW_NAME, Const.RELEASE_NAME -> 1 + rng.bnd(32);
+            case Const.TRANSFER_NAME -> 21 + rng.bnd(31);
+            case Const.RENEW -> new int[]{0, 5, 6 + rng.bnd(71)}[rng.bnd(3)];
+            case Const.TRANSFER -> rng.bnd(2) == 0 ? 20 : 26 + rng.bnd(51);
+            case Const.SELL -> 13 + rng.bnd(32);
+            case Const.RESERVE, Const.SETTLE, Const.PAY -> 1 + rng.bnd(32);
+            case Const.RELEASE -> 6 + rng.bnd(71);
+            case Const.SELL_TO -> 29 + rng.bnd(32);
+            case Const.AS -> 1;
+            case Const.TRADE -> 5 + rng.bnd(30);
+            default -> rng.bnd(77);
         };
         byte[] p = new byte[4 + bodyLen];
         p[0] = (byte) 0xFF; p[1] = 0x50; p[2] = 0x4E; p[3] = (byte) op;

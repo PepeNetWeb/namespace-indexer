@@ -80,13 +80,14 @@ echo "── scenario vectors (54 named adversarial cases + combined) ──"
 # NOTE — as of the 2026-06-29 C# clean-room promotion the gen.c seed soak is C-ONLY: every former
 # port (rust→py→go→cs) has been de-staled and PROMOTED to the independent reference tier below, so
 # there is no second byte-identical port to cross-check and NO expected staleness FAILs remain. The
-# soak self-regresses the c reference against its frozen goldens (scenario combined 4c84238f…,
+# soak self-regresses the c reference against its frozen goldens (scenario combined 301ce369…,
 # attrib-scenario 9fb14077…) and asserts the properties/reorg/reorgfuzz/meta violation counts are 0
 # and the generator/decode coverage is complete; the cross-impl `random`/`fuzz`/`bfuzz`/`attrib`
 # comparison loops simply no-op with a single soak impl. The cross-language guarantee lives entirely
 # in the seven-impl reference tier (c · py · ts · java · rust · go · cs).
 # See SPEC-conformance.md §"Two conformance tiers" / §6 and SPEC-RATIONALE.md.
-GOLDEN_COMBINED=4c84238fd39e407e394f1a00f40f31cfa5f754e3c5642053c101cd8b3b21778a
+# Re-pinned 2026-07-09 after the divergence-fix vectors 55/55b/56/57/58 (was c6101c4c…).
+GOLDEN_COMBINED=aca6749e79b7e6b582e1f5043693b7991fcc592f4df537461e09d6b9e451d347
 ref_scen=$("run_$REF" scenario 2>/dev/null)
 ref_comb=$(echo "$ref_scen" | awk '/^combined/{print $2}')
 checks=$((checks+1))
@@ -266,7 +267,8 @@ fi
 # across all 7 impls: this is the incremental state digest a node maintains in O(rows-changed)/block
 # to detect desync against peers (and the harness uses to detect an impl diverging). §13.2.
 echo "── ecmh: ECMH state-digest vector set (independent: c · py · ts · java · rust · go · cs) ──"
-ECMH_GOLDEN=2cdee6ada7cb8739a0a9478bd0d14c71568445f68fd3bbf9fb6fe4fc1d8b83b2
+# Re-pinned 2026-07-08: KAT set dropped TAG_VOTE (names-only).
+ECMH_GOLDEN=9acf22fd59d63a42791d6a57c68c397ec8e8e661b901bc1d2f1d1ada673a41e0
 ecmh_run() { case "$1" in
     c)    impls/c/sm ecmh ;;                    py)   python3 impls/py/sm.py ecmh ;;
     ts)   node impls/ts/sm.ts ecmh ;;           java) java impls/java/Sm.java ecmh ;;
@@ -292,7 +294,8 @@ fi
 # impl printing the same `empty_state_ecmh=` in its selftest proves the per-table tagging + the
 # top-level combine agree across languages (not just the curve math). §13.2.
 echo "── ecmh state anchor: sm_state_ecmh(empty) byte-identical (independent: c · py · ts · java · rust · go · cs) ──"
-ECMH_STATE_ANCHOR=053f61e599084024c9acd6a3127057ea5de001829225590ea2b175c5506b5c55
+# Re-pinned 2026-07-08: empty state is names+commits+muts only (3 ECMH tables).
+ECMH_STATE_ANCHOR=3ecfc3d7fa5be56fc513dde926bdf105c92accbf07088e702f85856fa69d10e0
 anchor_run() { case "$1" in
     c)    impls/c/sm selftest ;;                py)   python3 impls/py/sm.py selftest ;;
     ts)   node impls/ts/sm.ts selftest ;;       java) java impls/java/Sm.java selftest ;;

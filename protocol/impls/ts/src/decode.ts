@@ -1,48 +1,45 @@
 // Wire decoder (protocol-spec.md §1/§2/§3; SPEC-conformance.md §9). Strict, fail-closed: turns a
-// carrier payload + its output value into ACTION | POST | IGNORE. Any field/length mismatch, bad
-// prefix, or invalid name ⇒ IGNORE. Indexers MUST agree byte-for-byte (§0).
+// carrier payload into ACTION | IGNORE. Any field/length mismatch, bad prefix, or invalid name ⇒
+// IGNORE. Indexers MUST agree byte-for-byte (§0).
 //
-// All value-bearing fields (price, window, vote target is just bytes) are read straight to bigint.
+// Names-only demux: only 0xFF 'S' 'P' + opcode 0x01..0x0C can become ACTION; everything else
+// (bare UTF-8, overlay band, empty) is IGNORE. Value is accepted for API symmetry with other
+// impls but is not consulted by demux.
 import type { Bytes } from "./bytes.ts";
-import { rdLE, rdU32 } from "./bytes.ts";
-import { validUtf8 } from "./utf8.ts";
-import { OP, OP_MIN, OP_MAX, PREFIX0, PREFIX1, PREFIX2 } from "./constants.ts";
+import { rdLE } from "./bytes.ts";
+import { OP, OP_MIN, OP_MAX, PREFIX0, PREFIX1, PREFIX2, BODY_MAX } from "./constants.ts";
 
-export type DecodeKind = "ACTION" | "POST" | "IGNORE";
+export type DecodeKind = "ACTION" | "IGNORE";
 
 export type Action =
-  | { op: typeof OP.VOTE_UP | typeof OP.VOTE_DOWN; target: Bytes; vout: number }
   | { op: typeof OP.COMMIT; commitment: Bytes }
   | { op: typeof OP.CLAIM; salt: Bytes; name: Bytes }
   | { op: typeof OP.RENEW; mode: "all" | "all-safe" | "selective"; anchor: bigint; flags: Bytes }
   | { op: typeof OP.TRANSFER; mode: "all" | "selective"; target: Bytes; anchor: bigint; flags: Bytes }
   | { op: typeof OP.SELL; price: bigint; window: bigint; name: Bytes }
-  | { op: typeof OP.RESERVE | typeof OP.SETTLE | typeof OP.PAY; name: Bytes }
+  | { op: typeof OP.RENEW_NAME | typeof OP.RELEASE_NAME | typeof OP.RESERVE | typeof OP.SETTLE | typeof OP.PAY; name: Bytes }
+  | { op: typeof OP.TRANSFER_NAME; target: Bytes; name: Bytes }
   | { op: typeof OP.RELEASE; anchor: bigint; flags: Bytes }
-  | { op: typeof OP.DECORATE; body: Bytes }
   | { op: typeof OP.SELL_TO; price: bigint; buyer: Bytes; name: Bytes }
   | { op: typeof OP.AS; index: number }
   | { op: typeof OP.TRADE; idxA: number; idxB: number; nameA: Bytes; nameB: Bytes };
 
 export type DecodeResult =
   | { kind: "ACTION"; action: Action }
-  | { kind: "POST" }
   | { kind: "IGNORE" };
 
 const IGNORE: DecodeResult = { kind: "IGNORE" };
-const POST: DecodeResult = { kind: "POST" };
 
-// §3.1 name validation: charset [a-z0-9-] (a DNS label), length 1..32. NOTE (see SPEC-RATIONALE.md):
-// the prose also says "the canonical key is the lowercase form", but the charset admits only
-// lowercase, and §9 says a non-name byte ⇒ IGNORE — so we REJECT uppercase rather than lowercase it.
-// Re-pin 2026-07-07: '.'/'_' dropped, '-' added (supersedes the 2026-07-02 dot rule); no structural
-// rules — '-a', 'a-', 'xn--x' are all valid names.
+// §3.1 name validation: charset [a-z0-9-], length 1..32, plus structural (RFC-1123 / IDNA):
+// no leading/trailing hyphen; no `--` at positions 3–4 (kills xn-- and every ACE prefix).
 export function isNameByte(c: number): boolean {
   return (c >= 0x61 && c <= 0x7a) || (c >= 0x30 && c <= 0x39) || c === 0x2d;
 }
 export function validName(b: Bytes): boolean {
   if (b.length < 1 || b.length > 32) return false;
   for (let i = 0; i < b.length; i++) if (!isNameByte(b[i])) return false;
+  if (b[0] === 0x2d || b[b.length - 1] === 0x2d) return false; // leading / trailing hyphen
+  if (b.length >= 4 && b[2] === 0x2d && b[3] === 0x2d) return false; // `--` at positions 3–4
   return true;
 }
 
@@ -80,10 +77,10 @@ export function singleMinimalPush(spk: Bytes): Bytes | null {
   return spk.subarray(dataStart, dataEnd);
 }
 
-// §9 decoder: payload bytes + output value ⇒ ACTION | POST | IGNORE.
-export function decodePayload(payload: Bytes, value: bigint): DecodeResult {
+// §9 decoder: payload bytes (+ optional value, unused) ⇒ ACTION | IGNORE.
+export function decodePayload(payload: Bytes, _value: bigint = 0n): DecodeResult {
   const len = payload.length;
-  // action-prefix iff len≥4 and FF 50 4E and opcode in 0x01..0x0F (§6 pseudocode).
+  // action-prefix iff len≥4 and FF 44 4E and opcode in 0x01..0x0C.
   if (
     len >= 4 &&
     payload[0] === PREFIX0 &&
@@ -93,10 +90,9 @@ export function decodePayload(payload: Bytes, value: bigint): DecodeResult {
     payload[3] <= OP_MAX
   ) {
     const act = decodeAction(payload);
-    return act ? { kind: "ACTION", action: act } : IGNORE; // malformed action ⇒ IGNORE, never POST
+    return act ? { kind: "ACTION", action: act } : IGNORE; // malformed action ⇒ IGNORE
   }
-  // POST iff (not an action prefix) and value>0 and len≥1 and whole-payload strict UTF-8 (§1/§9).
-  if (value > 0n && len >= 1 && validUtf8(payload)) return POST;
+  // everything else (UTF-8 noise, overlay, empty) → IGNORE
   return IGNORE;
 }
 
@@ -105,11 +101,6 @@ function decodeAction(payload: Bytes): Action | null {
   const b = payload.subarray(4); // body
   const bl = b.length;
   switch (op) {
-    case OP.VOTE_UP:
-    case OP.VOTE_DOWN: {
-      if (bl !== 36) return null;
-      return { op, target: b.subarray(0, 32), vout: rdU32(b, 32) };
-    }
     case OP.COMMIT: {
       if (bl !== 32) return null;
       return { op: OP.COMMIT, commitment: b.subarray(0, 32) };
@@ -123,19 +114,19 @@ function decodeAction(payload: Bytes): Action | null {
     case OP.RENEW: {
       if (bl === 0) return { op: OP.RENEW, mode: "all", anchor: 0n, flags: new Uint8Array(0) };
       if (bl === 5) return { op: OP.RENEW, mode: "all-safe", anchor: rdLE(b, 0, 5), flags: new Uint8Array(0) };
-      if (bl >= 6 && bl <= 76)
+      if (bl >= 6 && bl <= BODY_MAX)
         return { op: OP.RENEW, mode: "selective", anchor: rdLE(b, 0, 5), flags: b.subarray(5) };
-      return null; // bl ∈ {1,2,3,4} or >76 invalid
+      return null; // bl ∈ {1,2,3,4} or >BODY_MAX invalid
     }
     case OP.TRANSFER: {
       if (bl === 20)
         return { op: OP.TRANSFER, mode: "all", target: b.subarray(0, 20), anchor: 0n, flags: new Uint8Array(0) };
-      if (bl >= 26 && bl <= 76)
+      if (bl >= 26 && bl <= BODY_MAX)
         return {
           op: OP.TRANSFER, mode: "selective", target: b.subarray(0, 20),
           anchor: rdLE(b, 20, 5), flags: b.subarray(25),
         };
-      return null; // bl ∈ [21,25], <20, >76 invalid
+      return null; // bl ∈ [21,25], <20, >BODY_MAX invalid
     }
     case OP.SELL: {
       if (bl < 13 || bl > 44) return null; // price8 + window4 + name1..32
@@ -143,6 +134,8 @@ function decodeAction(payload: Bytes): Action | null {
       if (!validName(name)) return null;
       return { op: OP.SELL, price: rdLE(b, 0, 8), window: rdLE(b, 8, 4), name };
     }
+    case OP.RENEW_NAME:
+    case OP.RELEASE_NAME:
     case OP.RESERVE:
     case OP.SETTLE:
     case OP.PAY: {
@@ -151,13 +144,15 @@ function decodeAction(payload: Bytes): Action | null {
       if (!validName(name)) return null;
       return { op, name };
     }
-    case OP.RELEASE: {
-      if (bl < 6 || bl > 76) return null; // anchor5 + flags1..71
-      return { op: OP.RELEASE, anchor: rdLE(b, 0, 5), flags: b.subarray(5) };
+    case OP.TRANSFER_NAME: {
+      if (bl < 21 || bl > 52) return null; // target20 + name1..32
+      const name = b.subarray(20);
+      if (!validName(name)) return null;
+      return { op: OP.TRANSFER_NAME, target: b.subarray(0, 20), name };
     }
-    case OP.DECORATE: {
-      if (bl > 80) return null; // bl 0..80 = SM_DEC_MAX raw TLV (fold parses); matches C reference
-      return { op: OP.DECORATE, body: b.subarray(0) };
+    case OP.RELEASE: {
+      if (bl < 6 || bl > BODY_MAX) return null; // anchor5 + flags1..FLAGS_MAX
+      return { op: OP.RELEASE, anchor: rdLE(b, 0, 5), flags: b.subarray(5) };
     }
     case OP.SELL_TO: {
       if (bl < 29 || bl > 60) return null; // price8 + buyer20 + name1..32

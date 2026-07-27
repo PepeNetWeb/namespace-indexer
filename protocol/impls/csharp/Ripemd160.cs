@@ -1,6 +1,6 @@
 using System;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
 /// Self-rolled RIPEMD-160 (RIPEMD160 was removed from the BCL after .NET

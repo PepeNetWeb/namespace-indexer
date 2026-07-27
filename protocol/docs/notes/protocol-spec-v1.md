@@ -1,6 +1,6 @@
-# pepenet Protocol — Action State Machine (v1)
+# PepeNet Namespace — Action State Machine (v1)
 
-This document defines the base layer of the pepenet protocol: an identity +
+This document defines the base layer of the PepeNet namespace: an identity +
 engagement layer carried in Dogecoin `OP_RETURN` actions, designed to operate
 strictly within the standard 80-byte `OP_RETURN` relay limit.
 
@@ -20,7 +20,7 @@ in the off-chain gossip layer (§5). A reference pure-C P2P client ships with th
 
 ## 0. Foundations
 
-- A pepenet action lives in `OP_RETURN` output(s) of a normal DOGE tx.
+- A PepeNet action lives in `OP_RETURN` output(s) of a normal DOGE tx.
 - An output is addressed by **`txid + vout`**. There is ~one `OP_RETURN` per tx today,
   but every reference uses `txid+vout` so it survives the move to multiple `OP_RETURN`s
   per tx (which several batching features in this spec are designed to exploit, §3.5).
@@ -82,7 +82,7 @@ A change ships only as a versioned **activation height** (forward-only, never re
 | `MAX_LEASE` | `31_536_000` s (~365 d) | cap on how far ahead of now a lease may extend (§3.3) |
 | `COMMIT_EXPIRY` | `18_000` s (~5 h) | a commit's live window; self-prunes after (§3.2) |
 | `RESERVE_WINDOW` | `18_000` s (~5 h) | a reserve's exclusive-buy window; also the SELL window floor (§3.7) |
-| `REORG_BUFFER` | `7_200` s (~2 h) | margin keeping ordered time-boundaries apart with reorg slack (§3.7, §6) |
+| `REORG_BUFFER` | `7_200` s (~2 h) | margin keeping ordered time-boundaries apart with reorg slack (§3.7, §5) |
 | `RESERVE_DEPOSIT_BPS` | `100` (1.00 %) | total reserve deposit, basis points of `price` (§3.7) |
 | `RESERVE_BURN_BPS` | `50` (0.50 %) | deposit leg **burned** |
 | `RESERVE_PAY_BPS` | `50` (0.50 %) | deposit leg **paid to seller** |
@@ -92,7 +92,7 @@ A change ships only as a versioned **activation height** (forward-only, never re
 ownership flip or a settle?" is a per-client risk choice (it may use depth, elapsed time,
 or cumulative chainwork), applied at display time, and never gates the deterministic fold.
 The protocol enforces a margin only where two *time-boundaries must stay ordered*
-(`REORG_BUFFER`, §3.7/§6) — see §8.
+(`REORG_BUFFER`, §3.7/§5) — see §7.
 
 ### Encoding primitives
 - `txid` — 32 bytes, internal (wire) byte order. (Explorers show the byte-reversed form;
@@ -115,8 +115,8 @@ posts with no content heuristics.
 | Byte | Value | Meaning |
 |------|-------|---------|
 | 0 | `0xFF` | UTF-8 escape / action flag |
-| 1 | `0x53` | `'S'` |
-| 2 | `0x50` | `'P'` |
+| 1 | `0x50` | `'P'` |
+| 2 | `0x4E` | `'N'` |
 | 3 | `[opcode]` | 1 byte, `0x01`–`0x0A` |
 
 **Text posts** carry no prefix: a burn-backed `OP_RETURN` whose **entire payload** is
@@ -133,7 +133,7 @@ the burn requirement because their miner fee + prefix already gate spam. A *text
 `value > 0` floor for a different reason: much of the existing `OP_RETURN` traffic on the chain is
 automated, zero-value, and incidentally valid UTF-8 (timestamps, anchors, machine markers) — none
 of it ever burns, because it has no reason to. Requiring even a 1-koinu burn is therefore the
-cheap, deterministic signal that separates an *intentional* pepenet post from ambient zero-value
+cheap, deterministic signal that separates an *intentional* PepeNet post from ambient zero-value
 `OP_RETURN` noise; a zero-value valid-UTF-8 `OP_RETURN` falls through to *ignore* (§6).
 
 ---
@@ -437,9 +437,9 @@ rule keeps it byte-identical across indexers.
 #### RENEW wire format (the pinned form)
 
 ```
-RENEW all        [0xFF SP 0x05]                          = 4 B   renew every owned name (water-fill the burn)
-RENEW all (safe) [0xFF SP 0x05][anchor:5]                = 9 B   same, reject if the set changed since H
-RENEW selective  [0xFF SP 0x05][anchor:5][flags:1..71]   = 10..80 B   ~568 names
+RENEW all        [0xFF PN 0x05]                          = 4 B   renew every owned name (water-fill the burn)
+RENEW all (safe) [0xFF PN 0x05][anchor:5]                = 9 B   same, reject if the set changed since H
+RENEW selective  [0xFF PN 0x05][anchor:5][flags:1..71]   = 10..80 B   ~568 names
 ```
 
 - Bits index your owned-set: all owned names **lexicographically** from bit 0. Bit *i* set ⇒ renew
@@ -479,8 +479,8 @@ RENEW selective  [0xFF SP 0x05][anchor:5][flags:1..71]   = 10..80 B   ~568 names
   (The same owned-set ordering governs TRANSFER's and RELEASE's bitmaps. RESERVE and SETTLE carry
   no bitmap — one name per `OP_RETURN`, batched at the tx level, §3.7.)
 
-**TRANSFER** mirrors this: `[0xFF SP 0x06][target:20]` transfers all owned names to `target`;
-`[0xFF SP 0x06][target:20][anchor:5][flags]` transfers the selected ones (the 20-byte target
+**TRANSFER** mirrors this: `[0xFF PN 0x06][target:20]` transfers all owned names to `target`;
+`[0xFF PN 0x06][target:20][anchor:5][flags]` transfers the selected ones (the 20-byte target
 eats flag space → ~400 names/tx). Lease conveys (§3.6).
 
 ### 3.6 TRANSFER (`0x06`) & RELEASE (`0x0A`) — gift & relinquish
@@ -769,7 +769,7 @@ rides in the spending `scriptSig`, so a multisig spend is attributed from the tx
 (multisig sighash is the same legacy machinery with `scriptCode = redeemScript`). Identity keys on
 the **bare hash160** everywhere (name ownership, the TRANSFER target, the RETRACT author,
 self-compare), so a name gifted/sold to a P2SH hash is owned and renewable immediately — no type
-byte in the wire format. The one derived fact the fold retains (§6), deterministic and shed-able:
+byte in the wire format. The one derived fact the fold retains (§5), deterministic and shed-able:
 - **Script type per party.** Every site that later *reconstructs* a controller's script — the SELL
   `seller` payment check (§3.7), a SETTLE writing the new owner-hash — records the **(hash160,
   script type)**, P2PKH **or** P2SH; the rule is *"reconstruct per recorded type,"* never "assume
@@ -802,7 +802,7 @@ every `ANYONECANPAY` variant (incl. `0x81`), and any other flag.
 > not use `ANYONECANPAY`.)
 
 > **Wallet note — no in-place fee bump.** Because `vin[0]` signs over the exact input array
-> and outputs, you cannot RBF a pepenet action by adding an input or trimming change (it
+> and outputs, you cannot RBF a PepeNet action by adding an input or trimming change (it
 > invalidates the sig and silently moves `vin[0]`). To raise the fee: rebuild and re-sign, or
 > CPFP via the change output. Wallets MUST NOT offer naive RBF on these txs.
 
@@ -823,7 +823,7 @@ out-of-range coordinates. The identity hash is over the *exact* pubkey bytes, so
 **Step-by-step:**
 
 1. **Length guard + shape.** Payload **≥ 4 bytes** (else drop, never read past the end);
-   confirm `0xFF 'S' 'P'` + a recognized opcode; for burn-bearing ops the value field meets
+   confirm `0xFF 'P' 'N'` + a recognized opcode; for burn-bearing ops the value field meets
    the op's requirement; bounds-check every field read against the exact length/format for
    that opcode (§2). Any out-of-bounds or mismatch → drop.
 2. **Classify `vin[0].scriptSig` (exact):** **P2PKH** iff exactly two pushes `[sig] [pubkey]`,
@@ -920,7 +920,7 @@ position). The scan extends the existing `valid_utf8()` demux:
 
 ```
 for each OP_RETURN output o in tx (vout order):       # vout order = intra-tx state-machine order
-    if o starts with 0xFF 'S' 'P' + opcode in 0x01..0x0A:   # contiguous; no reserved holes
+    if o starts with 0xFF 'P' 'N' + opcode in 0x01..0x0A:   # contiguous; no reserved holes
         run §4 stateless verification on vin[0]              # P2PKH O(1) or P2SH multisig O(m)
         if not verified: drop (spoof); continue
         if opcode in 0x03..0x0A and height < ACTIVATION_HEIGHT: drop; continue   # forward-only gate (§3.0)

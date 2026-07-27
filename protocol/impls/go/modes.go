@@ -27,8 +27,8 @@ const (
 	genBaseTS   = int64(1_700_000_000)
 )
 
-// op draw weights for: POST,VOTE,COMMIT,CLAIM,RENEW,TRANSFER,SELL,RESERVE,SETTLE,RELEASE,SELL_TO,PAY,TRADE
-var genWeights = []int{12, 12, 14, 13, 5, 5, 8, 7, 7, 3, 6, 5, 4}
+// op draw weights for: COMMIT,CLAIM,RENEW,TRANSFER,SELL,RESERVE,SETTLE,RELEASE,SELL_TO,PAY,TRADE
+var genWeights = []int{14, 13, 5, 5, 8, 7, 7, 3, 6, 5, 4}
 
 var genWSum = func() int {
 	s := 0
@@ -192,8 +192,8 @@ func genOneIn(i int, outs ...FoldCarrier) FoldTx {
 	return FoldTx{inputs: []Identity{genID(i)}, carriers: outs}
 }
 
-// genBuildTx mirrors java Gen.buildTx: pick an op, build a (usually valid) tx for
-// the current live state; fall back to a VOTE if the chosen op has no target.
+// genBuildTx mirrors C gen.c build_tx: pick an op, build a (usually valid) tx for
+// the current live state; fall back to a COMMIT if the chosen op has no target.
 func genBuildTx(p *splitMix64, s *FoldState, height, mtp int64, rate uint64, ready *[]genPending, saltCtr int64) FoldTx {
 	op := genPickOp(p)
 	i := bnd(p, genNIDs)
@@ -203,7 +203,7 @@ func genBuildTx(p *splitMix64, s *FoldState, height, mtp int64, rate uint64, rea
 	leaseVal := rate28 * days // T == days at rate=28; scales otherwise
 
 	switch op {
-	case 2: // COMMIT
+	case 0: // COMMIT
 		j := bnd(p, genNamePool)
 		name := genName(j)
 		salt := genSalt(saltCtr)
@@ -211,7 +211,7 @@ func genBuildTx(p *splitMix64, s *FoldState, height, mtp int64, rate uint64, rea
 		cm := commitment(salt, name, id.h160)
 		return genOneIn(i, carrier(0, 0, payload(OP_COMMIT, cm[:]...)))
 
-	case 3: // CLAIM a ready commit (≥1 deep, live, not already owned)
+	case 1: // CLAIM a ready commit (≥1 deep, live, not already owned)
 		for k := 0; k < len(*ready); k++ {
 			pend := (*ready)[k]
 			if pend.commitHeight < height && mtp <= pend.commitTime+COMMIT_EXPIRY {
@@ -223,18 +223,18 @@ func genBuildTx(p *splitMix64, s *FoldState, height, mtp int64, rate uint64, rea
 			}
 		}
 
-	case 4: // RENEW all
+	case 2: // RENEW all
 		if len(genNamesWhere(s, &id.h160, -1)) > 0 {
 			return genOneIn(i, carrier(0, leaseVal, payload(OP_RENEW)))
 		}
 
-	case 5: // TRANSFER all to a random id
+	case 3: // TRANSFER all to a random id
 		if len(genNamesWhere(s, &id.h160, ST_OWNED)) > 0 {
 			tgt := genID(bnd(p, genNIDs)).h160
 			return genOneIn(i, carrier(0, 0, payload(OP_TRANSFER, tgt[:]...)))
 		}
 
-	case 6: // SELL an owned name with enough lease tail
+	case 4: // SELL an owned name with enough lease tail
 		for _, nm := range genNamesWhere(s, &id.h160, ST_OWNED) {
 			r := s.names[nm]
 			if mtp+RESERVE_WINDOW+REORG_BUFFER <= r.leaseExpiry {
@@ -244,7 +244,7 @@ func genBuildTx(p *splitMix64, s *FoldState, height, mtp int64, rate uint64, rea
 			}
 		}
 
-	case 7: // RESERVE a listed name (buyer != seller)
+	case 5: // RESERVE a listed name (buyer != seller)
 		listed := genNamesWhere(s, nil, ST_LISTED)
 		if len(listed) > 0 {
 			nm := listed[bnd(p, len(listed))]
@@ -258,7 +258,7 @@ func genBuildTx(p *splitMix64, s *FoldState, height, mtp int64, rate uint64, rea
 			return tx
 		}
 
-	case 8: // SETTLE a reserved name (by its reserver)
+	case 6: // SETTLE a reserved name (by its reserver)
 		res := genNamesWhere(s, nil, ST_RESERVED)
 		if len(res) > 0 {
 			nm := res[bnd(p, len(res))]
@@ -271,7 +271,7 @@ func genBuildTx(p *splitMix64, s *FoldState, height, mtp int64, rate uint64, rea
 			return tx
 		}
 
-	case 9: // RELEASE owned names via a full-ish bitmap
+	case 7: // RELEASE owned names via a full-ish bitmap
 		set := s.ownedSorted(id.h160)
 		if len(set) > 0 {
 			flags := make([]byte, (len(set)+7)/8)
@@ -293,7 +293,7 @@ func genBuildTx(p *splitMix64, s *FoldState, height, mtp int64, rate uint64, rea
 			}
 		}
 
-	case 10: // SELL_TO
+	case 8: // SELL_TO
 		for _, nm := range genNamesWhere(s, &id.h160, ST_OWNED) {
 			r := s.names[nm]
 			if mtp+DIRECT_WINDOW+REORG_BUFFER <= r.leaseExpiry {
@@ -304,7 +304,7 @@ func genBuildTx(p *splitMix64, s *FoldState, height, mtp int64, rate uint64, rea
 			}
 		}
 
-	case 11: // PAY an offered name (by its named buyer)
+	case 9: // PAY an offered name (by its named buyer)
 		off := genNamesWhere(s, nil, ST_OFFERED)
 		if len(off) > 0 {
 			nm := off[bnd(p, len(off))]
@@ -316,7 +316,7 @@ func genBuildTx(p *splitMix64, s *FoldState, height, mtp int64, rate uint64, rea
 			return tx
 		}
 
-	case 12: // TRADE two owned names between two ids
+	case 10: // TRADE two owned names between two ids
 		myOwned := genNamesWhere(s, &id.h160, ST_OWNED)
 		i2 := (i + 1 + bnd(p, genNIDs-1)) % genNIDs
 		id2 := genID(i2)
@@ -332,32 +332,15 @@ func genBuildTx(p *splitMix64, s *FoldState, height, mtp int64, rate uint64, rea
 					carriers: []FoldCarrier{carrier(0, 0, payload(OP_TRADE, body...))}}
 			}
 		}
-
-	case 0: // POST (optionally decorated if the author owns a name)
-		body := []byte("post" + base36(int(saltCtr%1000)))
-		if len(genNamesWhere(s, &id.h160, -1)) > 0 && bnd(p, 2) == 0 {
-			tag := byte(1 + bnd(p, 20))
-			val := byte(bnd(p, 256))
-			rec := []byte{tag, 0x01, 0x00, val}
-			return genOneIn(i,
-				carrier(0, 0, payload(OP_DECORATE, rec...)),
-				carrier(1, uint64(1+bnd(p, 50)), body))
-		}
-		return genOneIn(i, carrier(0, uint64(1+bnd(p, 50)), body))
 	}
 
-	// VOTE fallback (always valid): target a synthetic earlier post id.
-	var th int64
-	if height != 0 {
-		th = int64(p.bounded(uint64(height)))
-	}
-	target := makeSyntheticTxid(th, uint32(bnd(p, 8)))
-	voteOp := byte(OP_VOTE_UP)
-	if bnd(p, 2) != 0 {
-		voteOp = OP_VOTE_DOWN
-	}
-	vbody := append(append([]byte{}, target[:]...), leBytes32(uint32(bnd(p, 4)))...)
-	return genOneIn(i, carrier(0, uint64(1+bnd(p, 1000)), payload(voteOp, vbody...)))
+	// COMMIT fallback (always valid): synthetic commitment.
+	j := bnd(p, genNamePool)
+	name := genName(j)
+	salt := genSalt(saltCtr + 1)
+	*ready = append(*ready, genPending{idIdx: i, name: name, salt: salt, commitHeight: height, commitTime: mtp})
+	cm := commitment(salt, name, id.h160)
+	return genOneIn(i, carrier(0, 0, payload(OP_COMMIT, cm[:]...)))
 }
 
 // ---- streaming digest helpers (own input_digest / property fingerprint) ----
@@ -372,7 +355,7 @@ func (d *digestBuf) u64(v uint64) {
 		d.b = append(d.b, byte(v>>(8*uint(i))))
 	}
 }
-func (d *digestBuf) i128(v i128) {
+func (d *digestBuf) u128(v u128) {
 	le := v.bytesLE()
 	d.b = append(d.b, le[:]...)
 }
@@ -487,38 +470,30 @@ func checkInvariants(s *FoldState, height, mtp int64) int64 {
 			v++
 		}
 	}
-	if s.overflow {
-		v++
-	}
 	return v
 }
 
 func fingerprint(pd *digestBuf, s *FoldState) {
 	var nOwned, nListed, nOffered, nReserved uint32
-	var sumLease, sumPrice, sumLegs, sumVote i128
-	add := func(a *i128, v uint64) { *a, _ = a.addOverflow(i128FromU64(v)) }
+	var sumLease, sumPrice, sumLegs u128
+	add := func(a *u128, v uint64) { *a = a.add(u128FromU64(v)) }
 	for _, r := range s.names {
 		switch r.st {
 		case ST_OWNED:
 			nOwned++
 		case ST_LISTED:
 			nListed++
+			add(&sumPrice, r.price)
 		case ST_OFFERED:
 			nOffered++
+			add(&sumPrice, r.price)
 		case ST_RESERVED:
 			nReserved++
-		}
-		add(&sumLease, uint64(r.leaseExpiry))
-		if r.st == ST_LISTED || r.st == ST_RESERVED {
 			add(&sumPrice, r.price)
-		}
-		if r.st == ST_RESERVED {
 			add(&sumLegs, r.burnLeg)
 			add(&sumLegs, r.payLeg)
 		}
-	}
-	for _, vt := range s.votes {
-		sumVote, _ = sumVote.addOverflow(vt.score)
+		add(&sumLease, uint64(r.leaseExpiry))
 	}
 	pd.u32(uint32(len(s.names)))
 	pd.u32(nOwned)
@@ -526,18 +501,10 @@ func fingerprint(pd *digestBuf, s *FoldState) {
 	pd.u32(nOffered)
 	pd.u32(nReserved)
 	pd.u32(uint32(len(s.commits)))
-	pd.u32(uint32(len(s.votes)))
 	pd.u32(uint32(len(s.muts)))
-	pd.u32(uint32(len(s.decors)))
-	pd.i128(sumLease)
-	pd.i128(sumPrice)
-	pd.i128(sumLegs)
-	pd.i128(sumVote)
-	if s.overflow {
-		pd.u8(1)
-	} else {
-		pd.u8(0)
-	}
+	pd.u128(sumLease)
+	pd.u128(sumPrice)
+	pd.u128(sumLegs)
 }
 
 // ====================================================================
@@ -573,22 +540,17 @@ func applyOneTx(s *FoldState, b FoldBlock, tx FoldTx) {
 	s.applyTx(b, tx)
 }
 
-// inertTx: a tx whose every carrier the protocol must IGNORE — a zero-weight
-// VOTE (dropped by the dust gate), a malformed RENEW (decodes to IGNORE), an
-// orphan DECORATE (discarded at tx end, no following body), and a zero-value POST
-// (decodes to IGNORE). Folding it must leave the state digest unchanged.
+// inertTx: a tx whose every carrier the protocol must IGNORE — truncated CLAIM,
+// unknown/gap opcode, bare UTF-8 noise, overlay-band carrier. Folding it must
+// leave the state digest unchanged (mirrors C harness build_inert_tx).
 func inertTx() FoldTx {
-	target := makeSyntheticTxid(1, 0)
-	zv := append(append([]byte{}, target[:]...), leBytes32(0)...)
-	malformed := []byte{0xFF, 0x50, 0x4E, 0x05, 0x01, 0x02, 0x03} // RENEW bl=3 → IGNORE
-	dec := payload(OP_DECORATE, 0x03, 0x01, 0x00, 0x09)
 	return FoldTx{
 		inputs: []Identity{genID(0)},
 		carriers: []FoldCarrier{
-			carrier(0, 0, payload(OP_VOTE_UP, zv...)), // zero-weight vote → dropped (dust gate)
-			carrier(1, 0, malformed),                  // decodes to IGNORE
-			carrier(2, 0, dec),                        // orphan DECORATE → discarded at tx end
-			carrier(3, 0, []byte("hi")),               // zero-value → IGNORE (POST needs value>0)
+			carrier(0, 0, []byte{0xFF, 0x50, 0x4E, OP_CLAIM, 0, 0, 0, 0}), // truncated CLAIM → IGNORE
+			carrier(1, 0, []byte{0xFF, 0x50, 0x4E, 0x20}),                 // gap opcode → IGNORE
+			carrier(2, 1, []byte("hello")),                                 // bare UTF-8 → IGNORE
+			carrier(3, 0, []byte{0xFF, 0x50, 0x4E, 0xD6, 0x00}),           // overlay band → IGNORE
 		},
 	}
 }
@@ -777,7 +739,7 @@ func fuzzPayload(p *splitMix64) []byte {
 			out[0] = 0xFF
 			out[1] = 0x50
 			out[2] = 0x4E
-			out[3] = byte(1 + bnd(p, 15))
+			out[3] = byte(1 + bnd(p, 15)) // 0x01..0x0F
 		}
 		return out
 	}
@@ -799,15 +761,17 @@ func fuzzPayload(p *splitMix64) []byte {
 }
 
 func grammarPayload(p *splitMix64) []byte {
-	op := 1 + bnd(p, 15)
+	op := 1 + bnd(p, 15) // 0x01..0x0F
 	var bodyLen int
 	switch op {
-	case OP_VOTE_UP, OP_VOTE_DOWN:
-		bodyLen = 36
 	case OP_COMMIT:
 		bodyLen = 32
 	case OP_CLAIM:
 		bodyLen = 33 + bnd(p, 20)
+	case OP_RENEW_NAME, OP_RELEASE_NAME:
+		bodyLen = 1 + bnd(p, 20)
+	case OP_TRANSFER_NAME:
+		bodyLen = 21 + bnd(p, 31)
 	case OP_RENEW:
 		bodyLen = []int{0, 5, 6 + bnd(p, 71)}[bnd(p, 3)]
 	case OP_TRANSFER:
@@ -822,8 +786,6 @@ func grammarPayload(p *splitMix64) []byte {
 		bodyLen = 1 + bnd(p, 20)
 	case OP_RELEASE:
 		bodyLen = 6 + bnd(p, 71)
-	case OP_DECORATE:
-		bodyLen = bnd(p, 77)
 	case OP_SELL_TO:
 		bodyLen = 29 + bnd(p, 20)
 	case OP_AS:

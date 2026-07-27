@@ -2,6 +2,7 @@
 // protocol-sm's SHA-256). See chain.h.
 #include "chain.h"
 #include "sha256.h"          // protocol-sm SHA-256 (quoted: resolves to SMDIR)
+#include "sm.h"              // SM_CARRIER_MAX — the §6 pinned payload ceiling
 #include <string.h>
 #include <stdlib.h>
 
@@ -56,8 +57,11 @@ int idx_script_payee(const uint8_t *spk, size_t n, uint8_t h160[20], uint8_t *ty
 }
 
 // ── OP_RETURN single-minimal-push (§1) ───────────────────────────────────────
-// Exactly OP_RETURN <push> where <push> is ONE minimal push of P≤80 bytes and
-// nothing follows. Reject multi-push / non-minimal / trailing-opcode → ignore.
+// Exactly OP_RETURN <push> where <push> is ONE minimal push of P ≤ SM_CARRIER_MAX
+// bytes (§6: the pinned protocol ceiling, 9996) and nothing follows. Reject
+// multi-push / non-minimal / trailing-opcode → ignore. Relay policy
+// (datacarriersize) gates FORWARDING far below this; the fold must accept any
+// mined carrier the spec accepts, so extraction runs at the §6 pin.
 int idx_op_return_payload(const uint8_t *spk, size_t n, const uint8_t **data, size_t *dlen) {
     if (n < 1 || spk[0] != 0x6A) return 0;
     size_t i = 1, len, off;
@@ -66,8 +70,11 @@ int idx_op_return_payload(const uint8_t *spk, size_t n, const uint8_t **data, si
     if (op >= 0x01 && op <= 0x4B) { len = op; off = i + 1; }                       // direct push (must be ≥1, minimal)
     else if (op == 0x4C) { if (i + 1 >= n) return 0; len = spk[i + 1]; off = i + 2; // OP_PUSHDATA1
                            if (len < 76) return 0; }                                // minimal-PUSHDATA1: <76 must use direct
-    else return 0;                                                                  // OP_0 / PUSHDATA2/4 / opcode → not a lone minimal push
-    if (len == 0 || len > 80) return 0;
+    else if (op == 0x4D) { if (i + 2 >= n) return 0;                                // OP_PUSHDATA2
+                           len = (size_t)spk[i + 1] | ((size_t)spk[i + 2] << 8); off = i + 3;
+                           if (len < 256) return 0; }                               // minimal-PUSHDATA2: <256 must use PUSHDATA1/direct
+    else return 0;                                                                  // OP_0 / PUSHDATA4 / opcode → not a lone minimal push
+    if (len == 0 || len > SM_CARRIER_MAX) return 0;
     if (off + len != n) return 0;                                                   // exactly one push, nothing trailing
     *data = spk + off; *dlen = len; return 1;
 }

@@ -1,8 +1,8 @@
 // Canonical, order-independent state digest (SHA-256) — the cross-language
 // equality oracle (SPEC-conformance.md §Digest). Every table is serialized in a
-// PINNED sort order with PINNED field widths/endianness (LE ints; i128 score as
-// 16-byte two's-complement LE), then hashed. Two states hash equal iff they are
-// the same fold state, regardless of internal array/iteration order.
+// PINNED sort order with PINNED field widths/endianness (LE ints), then hashed.
+// Two states hash equal iff they are the same fold state, regardless of internal
+// array/iteration order. Magic "SMv1".
 #include "sm.h"
 #include "sha256.h"
 
@@ -23,8 +23,6 @@ static void bu8 (Buf *b, uint8_t v)  { bput(b, &v, 1); }
 static void bu32(Buf *b, uint32_t v) { uint8_t t[4];  for (int i=0;i<4;i++)  t[i]=(uint8_t)(v>>(8*i)); bput(b,t,4); }
 static void bu64(Buf *b, uint64_t v) { uint8_t t[8];  for (int i=0;i<8;i++)  t[i]=(uint8_t)(v>>(8*i)); bput(b,t,8); }
 static void bi64(Buf *b, int64_t v)  { bu64(b, (uint64_t)v); }
-static void bi128(Buf *b, __int128 v){ unsigned __int128 u=(unsigned __int128)v; uint8_t t[16];
-                                       for (int i=0;i<16;i++) t[i]=(uint8_t)(u>>(8*i)); bput(b,t,16); }
 
 // ── sorting (index arrays + a single-threaded context pointer) ───────────────
 static SmState *g_s;
@@ -42,20 +40,8 @@ static int cmp_commits(const void *a, const void *b) {
     if (x->commit_height != y->commit_height) return (x->commit_height < y->commit_height) ? -1 : 1;
     return (x->tx_index < y->tx_index) ? -1 : (x->tx_index > y->tx_index);
 }
-static int cmp_votes(const void *a, const void *b) {
-    const SmVote *x = &g_s->votes[*(const int*)a], *y = &g_s->votes[*(const int*)b];
-    int c = memcmp(x->target, y->target, 32); if (c) return c;
-    return (x->vout < y->vout) ? -1 : (x->vout > y->vout);
-}
 static int cmp_muts(const void *a, const void *b) {
     return memcmp(g_s->muts[*(const int*)a].owner, g_s->muts[*(const int*)b].owner, 20);
-}
-static int cmp_decors(const void *a, const void *b) {
-    int ia = *(const int*)a, ib = *(const int*)b;
-    const SmDecor *x = &g_s->decors[ia], *y = &g_s->decors[ib];
-    int c = memcmp(x->txid, y->txid, 32); if (c) return c;
-    if (x->vout != y->vout) return (x->vout < y->vout) ? -1 : 1;
-    return (ia < ib) ? -1 : (ia > ib);          // stable: insertion order within a post
 }
 static int *sorted(int n, int (*cmp)(const void*, const void*)) {
     int *idx = malloc((size_t)(n ? n : 1) * sizeof(int));
@@ -95,15 +81,6 @@ void sm_state_digest(SmState *s, uint8_t out[32]) {
     }
     free(ci);
 
-    // votes
-    int *vi = sorted(s->n_votes, cmp_votes);
-    bu32(&b, (uint32_t)s->n_votes);
-    for (int k = 0; k < s->n_votes; k++) {
-        const SmVote *v = &s->votes[vi[k]];
-        bput(&b, v->target, 32); bu32(&b, v->vout); bi128(&b, v->score);
-    }
-    free(vi);
-
     // per-owner last mutation height
     int *mi = sorted(s->n_muts, cmp_muts);
     bu32(&b, (uint32_t)s->n_muts);
@@ -112,18 +89,6 @@ void sm_state_digest(SmState *s, uint8_t out[32]) {
         bput(&b, m->owner, 20); bi64(&b, m->height);
     }
     free(mi);
-
-    // bound decorations
-    int *di = sorted(s->n_decors, cmp_decors);
-    bu32(&b, (uint32_t)s->n_decors);
-    for (int k = 0; k < s->n_decors; k++) {
-        const SmDecor *d = &s->decors[di[k]];
-        bput(&b, d->txid, 32); bu32(&b, d->vout);
-        bu8(&b, d->rec_len); bput(&b, d->rec, d->rec_len);
-    }
-    free(di);
-
-    bu8(&b, (uint8_t)(s->overflow_flag ? 1 : 0));   // fail-loud marker
 
     SHA256_CTX h; sha256_init(&h);
     sha256_update(&h, b.p ? b.p : (const uint8_t*)"", (unsigned int)b.n);

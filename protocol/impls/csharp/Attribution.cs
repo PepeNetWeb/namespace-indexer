@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Buffers.Binary;
 
-namespace Shibpost;
+namespace Pepenet;
 
 // ---- raw tx model for the §4/§13 attribution surface ----
 

@@ -32,13 +32,35 @@ final class Selftest {
         s.bumpMut(owner, 11);
     }
 
-    // §3.1 charset re-pin (2026-07-07): [a-z0-9-] — a DNS label, lowercased. '.'/'_'
-    // dropped, '-' added (supersedes the 2026-07-02 dot rule); no structural rules.
-    // Mirrors C's test_dotted_names (validator locks + a commit→claim fold outcome).
+    // §3.1 charset + structural rules: [a-z0-9-], 1..32; no leading/trailing hyphen;
+    // no `--` at positions 3–4 (kills xn--). Mirrors C's test_dotted_names.
     private static Model.Tx oneCarrierTx(byte[] id, long value, Action a) {
         return new Model.Tx(new Model.TxIn[]{ new Model.TxIn(id, Const.P2PKH, true) },
                             new Model.TxOut[]{ Model.TxOut.carrier(java.math.BigInteger.valueOf(value), Wire.encode(a)) });
     }
+    // §6 pinned carrier ceiling: flags at the exact consensus caps decode;
+    // one byte past the ceiling is IGNORE (fail-closed).
+    private static void testL1CarrierCeiling() {
+        byte[] wide = new byte[4 + 5 + Const.FLAGS_MAX];
+        wide[0] = Const.P0; wide[1] = Const.P1; wide[2] = Const.P2; wide[3] = (byte) Const.RENEW;
+        for (int i = 9; i < wide.length; i++) wide[i] = (byte) (i * 7 + 1);
+        check("RENEW at cap is exactly CARRIER_MAX bytes", wide.length == Const.CARRIER_MAX);
+        Wire.Decoded d = Wire.decode(wide, java.math.BigInteger.ZERO);
+        check("RENEW-selective decodes with all 9987 flag bytes",
+              d.kind == Wire.Kind.ACTION && d.action.flags.length == Const.FLAGS_MAX);
+        byte[] over = java.util.Arrays.copyOf(wide, wide.length + 1);
+        check("one byte past the L1 ceiling -> IGNORE",
+              Wire.decode(over, java.math.BigInteger.ZERO).kind == Wire.Kind.IGNORE);
+        byte[] xfer = new byte[4 + 20 + 5 + Const.FLAGS_XFER_MAX];
+        xfer[0] = Const.P0; xfer[1] = Const.P1; xfer[2] = Const.P2; xfer[3] = (byte) Const.TRANSFER;
+        d = Wire.decode(xfer, java.math.BigInteger.ZERO);
+        check("TRANSFER-selective decodes at FLAGS_XFER_MAX",
+              d.kind == Wire.Kind.ACTION && d.action.flags.length == Const.FLAGS_XFER_MAX);
+        byte[] xover = java.util.Arrays.copyOf(xfer, xfer.length + 1);
+        check("TRANSFER flags past the cap -> IGNORE",
+              Wire.decode(xover, java.math.BigInteger.ZERO).kind == Wire.Kind.IGNORE);
+    }
+
     private static void testDottedNames() {
         check("hyphen name valid", Wire.validName(Sm.utf8("shib-p2p")));
         check("32-byte name valid", Wire.validName(Sm.utf8("abcdefghijklmnopqrstuvwxyz0123ab")));
@@ -47,6 +69,9 @@ final class Selftest {
         check("underscore now invalid", !Wire.validName(Sm.utf8("shib_p2p")));
         check("uppercase still invalid", !Wire.validName(Sm.utf8("Shib-p2p")));
         check("comma still invalid (TRADE pair split relies on it)", !Wire.validName(Sm.utf8("a,b")));
+        check("leading hyphen invalid", !Wire.validName(Sm.utf8("-a")));
+        check("trailing hyphen invalid", !Wire.validName(Sm.utf8("a-")));
+        check("ACE prefix (xn--) invalid", !Wire.validName(Sm.utf8("xn--x")));
 
         byte[] A = new byte[20]; A[0] = (byte) 0xAA; A[19] = (byte) 0xAA;
         byte[] s71 = new byte[32]; java.util.Arrays.fill(s71, (byte) 0x71);
@@ -130,10 +155,12 @@ final class Selftest {
         check("secp256k1 KAT (constants/2G/n·G=∞/decompress/sign-verify-tamper)", Secp.selftest() == 0);
 
         testDottedNames();
+        testL1CarrierCeiling();
         testEcmhState();
 
         System.out.println("────");
-        // §13.2 — empty-state ECMH cross-impl anchor.
+        // §4 / §13.2 — empty-state digests (cross-impl anchors; match C `sm selftest | head -2`).
+        System.out.println("empty_state_digest=" + StateDigest.digest(new State()));
         System.out.println("empty_state_ecmh=" + StateDigest.ecmhHex(new State()));
         System.out.println("selftest: " + pass + " pass, " + fail + " fail");
         if (fail > 0) System.exit(1);

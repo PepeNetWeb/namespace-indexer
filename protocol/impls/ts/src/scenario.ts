@@ -2,7 +2,7 @@
 // impls/c `scenario`. Each builds a deterministic, named construction and emits
 // `name <digest>` (canonical §4 state digest) or `name <u64>`; the rolling `combined`
 // hash is the single-line cross-language check. These pin the spec's named edge cases
-// (§6) with auditable outcomes, and cover the rare branches the random soak almost never
+// (§5) with auditable outcomes, and cover the rare branches the random soak almost never
 // hits (deep displacement, i128 accumulation past 2^64, the fee oracle).
 import type { Bytes } from "./bytes.ts";
 import { concat, hex, u64le } from "./bytes.ts";
@@ -15,10 +15,9 @@ import * as B from "./builders.ts";
 
 // rate = 28 makes the burn equal the number of days (see impls/c RATE_DAYS).
 const RATE = 28n;
-const U64_MAX = (1n << 64n) - 1n;
+const U64_MAX = (1n << 64n) - 1n; // used by deposit_2pow64
 
 const salt = (b: number): Bytes => new Uint8Array(32).fill(b);
-const tgt = (b: number): Bytes => { const t = new Uint8Array(32); t[0] = b; return t; };
 
 export function cmdScenario(): number {
   const feeds: Bytes[] = [];
@@ -197,22 +196,6 @@ export function cmdScenario(): number {
     f.applyTx(B.tx([B.input(A), B.input(Bb)], [B.trade(0, 1, "aaa", "bbb")]), 1); // anti-rug → drop
     emitState("25_trade_rug_before", f); }
 
-  { const f = minted(0xaa, "bob", 300n, 1500n); f.beginBlock(12n, 1600n, RATE);
-    f.applyTx(B.tx([B.input(A)], [B.decorate(B.tlv(7, B.str("reply")), 0), B.postCarrier("hello", 1n, 1)]), 0);  // owner → binds
-    f.applyTx(B.tx([B.input(Cc)], [B.decorate(B.tlv(7, B.str("x")), 0), B.postCarrier("hello", 1n, 1)]), 1);     // nameless → drop
-    f.applyTx(B.tx([B.input(A)], [B.decorate(B.tlv(7, B.str("orphan")), 0)]), 2);                                // orphan → drop
-    emitState("26_decorate_gate", f); }
-
-  { const f = new Fold(0n); f.beginBlock(100n, 1000n, RATE);
-    f.applyTx(B.tx([B.input(A)], [B.voteUp(tgt(0x11), 0, 5n, 0), B.voteDown(tgt(0x11), 0, 2n, 1),
-                                  B.voteUp(tgt(0x11), 0, 0n, 2)]), 0);
-    emitState("27_vote_score", f); }
-
-  // i128 accumulation past 2^64: three max-weight up-votes sum > 2^64 (a u64 impl wraps).
-  { const f = new Fold(0n); f.beginBlock(100n, 1000n, RATE);
-    for (let i = 0; i < 3; i++) f.applyTx(B.tx([B.input(A)], [B.voteUp(tgt(0x11), 0, U64_MAX)]), i);
-    emitState("28_vote_past_u64", f); }
-
   // fee oracle (§3.4): signed under-claim clamp + participant filter + MIN_FEE_SAMPLE
   // degrade + lower-median + REF_SIZE scale + clamp. 4 participants < MIN_FEE_SAMPLE
   // ⇒ this small window now degrades to DUST_FLOOR (the big-window vectors are 49–51).
@@ -281,11 +264,6 @@ export function cmdScenario(): number {
   { const f = minted(0xaa, "bob", 10n, 1500n); f.beginBlock(12n, 865499n, RATE); emitState("36a_mtp_below_owned", f); }
   { const f = minted(0xaa, "bob", 10n, 1500n); f.beginBlock(12n, 865500n, RATE); emitState("36b_mtp_at_lapsed", f); }
 
-  // 37: i128 vote accumulator past −2⁶⁴ (three max down-votes; two's-complement LE).
-  { const f = new Fold(0n); f.beginBlock(100n, 1000n, RATE);
-    for (let i = 0; i < 3; i++) f.applyTx(B.tx([B.input(A)], [B.voteDown(tgt(0x11), 0, U64_MAX)]), i);
-    emitState("37_vote_neg_past_u64", f); }
-
   // ── pre-block ordering & intra-block market races ──
   // 38: a same-block RENEW-vs-CLAIM race at the exact lapse tie. The pre-block lapse returns
   //     `bob` to the pool BEFORE any tx runs, so A's renew-all renews only `keep` and the
@@ -305,7 +283,7 @@ export function cmdScenario(): number {
     emitState("38_lapse_renew_vs_claim", f); }
 
   // 39: a single pre-block tick that crosses reserve_expiry AND offer_expiry at once,
-  //     cascading RESERVED→LISTED→OWNED in one pass (§6 type-order reserve→offer→lease).
+  //     cascading RESERVED→LISTED→OWNED in one pass (§5 type-order reserve→offer→lease).
   { const f = minted(0xaa, "w", 300n, 1500n);                       // lease_expiry = 25,921,500
     f.beginBlock(12n, 1600n, RATE); f.applyTx(B.tx([B.input(A)], [B.sell(20000n, 50000n, "w")]), 0);  // offer_expiry = 51600
     f.beginBlock(13n, 1700n, RATE); f.applyTx(B.tx([B.input(Bb)], [B.reserve("w", 100n)], [B.output(0, A, 100n)]), 0); // reserve_expiry = 19700 < 51600
@@ -451,9 +429,8 @@ export function cmdScenario(): number {
     }));
     emitU64("51_oracle_subsample_floor", oracleRate(win)); }             // → 1
 
-  // 52: charset = a DNS label [a-z0-9-], 1..32 (re-pinned 2026-07-07, supersedes
-  // the 2026-07-02 dot rule): hyphen and a 32-byte name MINT; '.' and '_' now DROP
-  // (uppercase still drops), leaving exactly the two valid names.
+  // 52: charset = a DNS label [a-z0-9-], 1..32: hyphen and a 32-byte name MINT;
+  // '.' and '_' DROP (uppercase still drops), leaving exactly the two valid names.
   { const f = new Fold(0n);
     commitThenClaim(f, 0xaa, "shib-p2p",                         0x71, 10n, 1000n, 10n, 1500n, 11n);
     commitThenClaim(f, 0xaa, "abcdefghijklmnopqrstuvwxyz0123ab", 0x72, 10n, 2000n, 12n, 2500n, 13n);
@@ -461,36 +438,76 @@ export function cmdScenario(): number {
     commitThenClaim(f, 0xaa, "shib_p2p",                         0x74, 10n, 4000n, 16n, 4500n, 17n);
     emitState("52_charset", f); }
 
-  // 53: §1 DECORATE pending-record cap (PEND_DECOR_MAX = 64, pinned 2026-07-03).
-  // Owner posts 65 decoration records (26+26+13) then a body: exactly 64 bind, the
-  // 65th drops. An impl that buffers unbounded binds 65 → a different digest, so this
-  // vector is what forces every port to adopt the cap. Each record is an empty len-0
-  // TLV — 3 bytes [tag=i+1][0][0], i = 0-based index WITHIN its carrier.
-  const decorateN = (nrec: number): Bytes => {
-    const b = new Uint8Array(nrec * 3);
-    for (let i = 0; i < nrec; i++) { b[i * 3] = (i + 1) & 0xff; b[i * 3 + 1] = 0; b[i * 3 + 2] = 0; }
-    return b;
-  };
-  { const f = minted(0xaa, "d", 10n, 1500n);
-    f.beginBlock(12n, 1600n, RATE);
-    f.applyTx(B.tx([B.input(A)], [
-      B.decorate(decorateN(26), 0), B.decorate(decorateN(26), 1), B.decorate(decorateN(13), 2), // 65 pending → 64 bind
-      B.postCarrier("hello", 100n, 3),                                                            // body binds them (owner-signed)
-    ]), 0);
-    emitState("53_decor_pend_cap", f); }
+  // 52b: structural name rejects — leading/trailing hyphen and xn-- ACE drop.
+  { const f = new Fold(0n);
+    commitThenClaim(f, 0xaa, "-lead", 0x81, 10n, 1000n, 10n, 1500n, 11n);
+    commitThenClaim(f, 0xaa, "trail-", 0x82, 10n, 2000n, 12n, 2500n, 13n);
+    commitThenClaim(f, 0xaa, "xn--x",  0x83, 10n, 3000n, 14n, 3500n, 15n);
+    commitThenClaim(f, 0xaa, "ok-name",0x84, 10n, 4000n, 16n, 4500n, 17n);
+    emitState("52b_structural", f); }
 
-  // 54: NO per-tx count cap (§0). One tx carries 17 VOTE carriers — past the historical
-  // 16 — plus 17 payee outs; all fold. An impl that caps at 16 either drops the tx or the
-  // 17th carrier → a different vote score (51 vs 48). Proves the reference agrees with an
-  // unbounded impl above the old bound.
+  // 54: NO per-tx count cap (§0). One tx carries 17 COMMIT carriers past the
+  // historical 16; all fold. An impl that caps at 16 either drops the tx or the
+  // 17th carrier → a different commit count.
   { const f = new Fold(0n);
     f.beginBlock(10n, 1000n, RATE);
     const carriers = [];
-    for (let i = 0; i < 17; i++) carriers.push(B.voteUp(tgt(0x55), 7, 3n, i)); // 17 up-votes ×3
+    for (let i = 0; i < 17; i++) {
+      const c = new Uint8Array(32); c[0] = i & 0xff;
+      carriers.push(B.commit(c, i));
+    }
     const outs = [];
-    for (let i = 0; i < 17; i++) outs.push(B.output(0, A, 1n));                 // 17 P2PKH payees
+    for (let i = 0; i < 17; i++) outs.push(B.output(0, A, 1n));
     f.applyTx(B.tx([B.input(A)], carriers, outs), 0);
     emitState("54_no_txcap", f); }
+
+  // 55: a name minted then RELEASEd earlier in the SAME block re-mints fresh on a
+  // later CLAIM in that block (§3.6 "immediately reclaimable"; row existence is
+  // authoritative, the block-local claim scratch never blocks a re-mint).
+  { const f = new Fold(0n);
+    f.beginBlock(10n, 1000n, RATE);
+    f.applyTx(B.tx([B.input(A)], [B.commit(B.commitmentOf(salt(0x91), "foo", A))]), 0);
+    f.beginBlock(11n, 1500n, RATE);
+    f.applyTx(B.tx([B.input(A)], [B.claim(salt(0x91), "foo", 10n)]), 0);          // mint foo→A
+    f.applyTx(B.tx([B.input(A)], [B.release(11n, Uint8Array.of(0x01))]), 1);      // release foo (row gone)
+    f.applyTx(B.tx([B.input(A)], [B.claim(salt(0x91), "foo", 10n)]), 2);          // MUST re-mint foo→A
+    emitState("55_claim_release_reclaim_sameblock", f); }
+
+  // 55b: same, but the re-claim is by a DIFFERENT party B whose backing commit has
+  // LOWER priority than the departed A's — B still mints fresh (a released name's
+  // former owner priority is irrelevant once the row is gone).
+  { const f = new Fold(0n);
+    f.beginBlock(10n, 1000n, RATE);
+    f.applyTx(B.tx([B.input(A)], [B.commit(B.commitmentOf(salt(0x91), "foo", A))]), 0);   // A commit (10, tx0)
+    f.applyTx(B.tx([B.input(Bb)], [B.commit(B.commitmentOf(salt(0x92), "foo", Bb))]), 1); // B commit (10, tx1)
+    f.beginBlock(11n, 1500n, RATE);
+    f.applyTx(B.tx([B.input(A)], [B.claim(salt(0x91), "foo", 10n)]), 0);          // A mints
+    f.applyTx(B.tx([B.input(A)], [B.release(11n, Uint8Array.of(0x01))]), 1);      // A releases
+    f.applyTx(B.tx([B.input(Bb)], [B.claim(salt(0x92), "foo", 10n)]), 2);         // B mints fresh
+    emitState("55b_reclaim_by_other", f); }
+
+  // 56: a self-transfer (TRANSFER-all whose target == the current owner) is a real
+  // move — it bumps last_set_mutation_height (owner's mut goes 11 → 12), NOT a no-op.
+  { const f = minted(0xaa, "bar", 10n, 1500n);
+    f.beginBlock(12n, 1600n, RATE);
+    f.applyTx(B.tx([B.input(A)], [B.transferAll(A)]), 0);
+    emitState("56_self_transfer_bumps_mut", f); }
+
+  // 57: fee oracle with block_bytes == 0 — the /0 guard substitutes divisor 1 (NOT
+  // fee-per-byte 0), so the block still participates. 1000 blocks (== MIN_FEE_SAMPLE),
+  // each fee 5000 ⇒ per-byte 5000 ⇒ median 5000 × REF_SIZE 200 = 1_000_000.
+  { const win: OracleBlock[] = Array.from({ length: 1000 }, () => ({
+      coinbaseTotal: 1_000_000_005_000n, blockBytes: 0n }));
+    emitU64("57_oracle_zero_bytes", oracleRate(win)); }
+
+  // 58: CLAIM burn near 2⁶⁴ at rate = DUST_FLOOR (1) — the lease day-count T overflows
+  // 64 bits (computed in 128-bit / bignum) and clamps to MAX_LEASE (365 days).
+  { const f = new Fold(0n);
+    f.beginBlock(10n, 1000n, 1n);
+    f.applyTx(B.tx([B.input(A)], [B.commit(B.commitmentOf(salt(0x95), "foo", A))]), 0);
+    f.beginBlock(11n, 1500n, 1n);
+    f.applyTx(B.tx([B.input(A)], [B.claim(salt(0x95), "foo", (1n << 64n) - 1n)]), 0);
+    emitState("58_lease_clamp_huge_burn", f); }
 
   console.log(`combined ${hex(sha256(concat(...feeds)))}`);
   return 0;

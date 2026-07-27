@@ -216,9 +216,19 @@ int idx_sync_rollback(SmState **s, sqlite3 *db, OracleFeed *oracle,
 }
 
 // ── file helpers ──────────────────────────────────────────────────────────────
+// Sanity bound on anything we slurp whole (block files, raw or hex-text). Far
+// above any real Doge block even hex-doubled; keeps a bogus/huge path from
+// turning into a blind malloc.
+#define IDX_READ_FILE_MAX  (256u * 1024 * 1024)
 static uint8_t *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb"); if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    // ftell returns -1 on an unseekable stream or a directory; unchecked, the
+    // (size_t)n + 1 below wraps to malloc(0) and fread is then asked for
+    // SIZE_MAX bytes into it. Check every seek/tell and bail cleanly.
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long n = ftell(f);
+    if (n < 0 || (unsigned long)n > IDX_READ_FILE_MAX) { fclose(f); return NULL; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
     uint8_t *buf = malloc((size_t)n + 1); if (!buf) { fclose(f); return NULL; }
     if (fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); fclose(f); return NULL; }
     fclose(f); buf[n] = 0; *len = (size_t)n; return buf;

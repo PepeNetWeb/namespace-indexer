@@ -34,13 +34,12 @@ static int cmd_selftest(void) {
     //    (proves the engine is linked & folding byte-identically in this build).
     uint8_t in[32], st[32];
     sm_generate(42, 2000, 0, in, st, NULL, NULL, NULL);
-    // Digests re-pinned 2026-07-20: 0xFF 'P' 'N' universal prefix (PepeNet).
-    // Goldens = impls/c `./sm random 42 2000` (the fuzz stream embeds the
-    // prefix, so any prefix skew between this link and the reference forks
-    // input_digest immediately).
-    EXPECT(eqhex(in, "a83f34b1c18398d2e50724b4e32de118417162a80876b84689264bcc91a49bef"),
+    // Goldens = protocol/impls/c `./sm random 42 2000` (the stream embeds the
+    // 0xFF 'P' 'N' universal prefix, so any prefix skew between this link and
+    // the reference forks input_digest immediately).
+    EXPECT(eqhex(in, "1b8e794802636a0bf6da528755eabe566ae20ef04eba7dcd2b71db3ce9b738d0"),
            "sm_generate(42,2000) input_digest matches reference");
-    EXPECT(eqhex(st, "94ca7666442ee768c9c9352c1b1f94a39050430fca0665b0752ae9286d9fbdfd"),
+    EXPECT(eqhex(st, "0bba34a7ab905a6bc403ce33fe28b1054bd6182ae14e0f7bcd7ff957756ea2ad"),
            "sm_generate(42,2000) state_digest matches reference");
 
     // 2. Empty-state digests (canonical + ECMH). The ECMH anchor exercises the
@@ -49,11 +48,10 @@ static int cmd_selftest(void) {
     uint8_t d[32], e[32];
     sm_state_digest(s, d);
     sm_state_ecmh(s, e);
-    // (Empty-state goldens are prefix-independent; these two were stale from
-    // before the 2026-07-20 re-pin — refreshed to the impls/c selftest prints.)
-    EXPECT(eqhex(d, "226d258381e8c6f6264d6cfefc96f111f60ef7815432aac16ba6887fbb768409"),
+    // (Empty-state goldens are prefix-independent; = the impls/c selftest prints.)
+    EXPECT(eqhex(d, "0967073bc100b3e1e16833c03f3277dcd7d5076c77a98d6b3ce9ce4aae8ec298"),
            "empty_state_digest matches reference");
-    EXPECT(eqhex(e, "053f61e599084024c9acd6a3127057ea5de001829225590ea2b175c5506b5c55"),
+    EXPECT(eqhex(e, "3ecfc3d7fa5be56fc513dde926bdf105c92accbf07088e702f85856fa69d10e0"),
            "empty_state_ecmh matches reference (libsecp shim)");
     sm_free(s);
 

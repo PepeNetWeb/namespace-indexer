@@ -1,17 +1,17 @@
 """Strict, fail-closed wire decoder (protocol-spec.md §0/§1/§2, SPEC-conformance.md §9).
 
-Turns an OP_RETURN payload into ACTION | POST | IGNORE. Any malformed field or
+Turns an OP_RETURN payload into ACTION | IGNORE. Any malformed field or
 length mismatch => IGNORE (fail closed). A malformed input never raises.
 
 Decode operates on the *payload* = the bytes of the single minimal push (§1).
 `single_minimal_push` extracts that from a raw scriptPubKey for completeness.
 """
-from const import (PREFIX, OP_VOTE_UP, OP_VOTE_DOWN, OP_COMMIT, OP_CLAIM,
+from const import (PREFIX, OP_RENEW_NAME, OP_TRANSFER_NAME, OP_COMMIT, OP_CLAIM,
+                   CARRIER_MAX, BODY_MAX,
                    OP_RENEW, OP_TRANSFER, OP_SELL, OP_RESERVE, OP_SETTLE,
-                   OP_RELEASE, OP_DECORATE, OP_SELL_TO, OP_PAY, OP_AS, OP_TRADE)
+                   OP_RELEASE, OP_RELEASE_NAME, OP_SELL_TO, OP_PAY, OP_AS, OP_TRADE)
 
 IGNORE = "IGNORE"
-POST = "POST"
 ACTION = "ACTION"
 
 _NAME_BYTES = frozenset(b"abcdefghijklmnopqrstuvwxyz0123456789-")
@@ -19,26 +19,18 @@ _NAME_BYTES = frozenset(b"abcdefghijklmnopqrstuvwxyz0123456789-")
 
 def valid_name(b):
     """§3.1: charset [a-z0-9-] (a DNS label), length 1..32, byte-for-byte (no case fold).
-    Re-pin 2026-07-07: '.'/'_' dropped, '-' added (supersedes the 2026-07-02 dot rule).
-    No structural rules — '-a', 'a-', 'xn--x' are valid names; uppercase stays invalid."""
+    Structural (RFC-1123 / IDNA): no leading/trailing hyphen; no `--` at positions
+    3–4 (kills xn-- and every ACE prefix). Uppercase stays invalid."""
     if not (1 <= len(b) <= 32):
         return False
     for ch in b:
         if ch not in _NAME_BYTES:
             return False
+    if b[0] == ord("-") or b[-1] == ord("-"):
+        return False
+    if len(b) >= 4 and b[2] == ord("-") and b[3] == ord("-"):
+        return False
     return True
-
-
-def valid_utf8(b):
-    """§1 strict RFC-3629: reject overlong, surrogates, > U+10FFFF.
-    CPython's strict utf-8 decoder enforces exactly this (see SPEC-RATIONALE.md)."""
-    if len(b) < 1:
-        return False
-    try:
-        b.decode("utf-8")
-        return True
-    except UnicodeDecodeError:
-        return False
 
 
 def single_minimal_push(spk):
@@ -91,7 +83,7 @@ def single_minimal_push(spk):
         return None
     if i != n:
         return None  # trailing bytes / extra opcode
-    if len(data) > 80:
+    if len(data) > CARRIER_MAX:
         return None
     return data
 
@@ -107,7 +99,6 @@ def _u64(b):
 def decode_payload(payload, value):
     """Return (kind, info).
     kind == ACTION  -> info is a dict {op, ...fields}
-    kind == POST    -> info is the payload bytes
     kind == IGNORE  -> info is None
     Never raises (fail closed)."""
     try:
@@ -118,29 +109,24 @@ def decode_payload(payload, value):
 
 def _decode(payload, value):
     n = len(payload)
-    # ACTION prefix test: len>=4, payload[0:3]==FF 50 4E
+    # ACTION prefix test: len>=4, payload[0:3]==FF 53 50, opcode 0x01..0x0F
     if n >= 4 and payload[0:3] == PREFIX:
         op = payload[3]
+        if not (OP_RENEW_NAME <= op <= OP_TRADE):
+            return (IGNORE, None)   # unknown / overlay band
         b = payload[4:]
         bl = n - 4
         info = _decode_action(op, b, bl)
         if info is None:
-            return (IGNORE, None)   # malformed action: 0xFF lead is never UTF-8
+            return (IGNORE, None)   # malformed action
         info["op"] = op
         return (ACTION, info)
-    # POST: not an action prefix, value>0, len>=1, whole payload strict UTF-8
-    if value > 0 and n >= 1 and valid_utf8(payload):
-        return (POST, payload)
+    # everything else (UTF-8 noise, empty, non-prefix) → IGNORE
     return (IGNORE, None)
 
 
 def _decode_action(op, b, bl):
     """Return a field dict on success, else None. (caller maps None -> IGNORE)"""
-    if op in (OP_VOTE_UP, OP_VOTE_DOWN):
-        if bl != 36:
-            return None
-        return {"target": b[0:32], "vout": _u32(b[32:36])}
-
     if op == OP_COMMIT:
         if bl != 32:
             return None
@@ -160,7 +146,7 @@ def _decode_action(op, b, bl):
             return {"mode": "all"}
         if bl == 5:
             return {"mode": "all_safe", "anchor": _u32_5(b[0:5])}
-        if 6 <= bl <= 76:
+        if 6 <= bl <= BODY_MAX:
             return {"mode": "selective", "anchor": _u32_5(b[0:5]),
                     "flags": b[5:]}
         return None
@@ -168,7 +154,7 @@ def _decode_action(op, b, bl):
     if op == OP_TRANSFER:
         if bl == 20:
             return {"mode": "all", "target": b[0:20]}
-        if 26 <= bl <= 76:
+        if 26 <= bl <= BODY_MAX:
             return {"mode": "selective", "target": b[0:20],
                     "anchor": _u32_5(b[20:25]), "flags": b[25:]}
         return None
@@ -183,7 +169,7 @@ def _decode_action(op, b, bl):
             return None
         return {"price": price, "window": window, "name": name}
 
-    if op in (OP_RESERVE, OP_SETTLE, OP_PAY):
+    if op in (OP_RENEW_NAME, OP_RELEASE_NAME, OP_RESERVE, OP_SETTLE, OP_PAY):
         if not (1 <= bl <= 32):    # name1..32
             return None
         name = b[0:bl]
@@ -191,15 +177,19 @@ def _decode_action(op, b, bl):
             return None
         return {"name": name}
 
+    if op == OP_TRANSFER_NAME:
+        if not (21 <= bl <= 52):   # target20 + name1..32
+            return None
+        target = b[0:20]
+        name = b[20:]
+        if not valid_name(name):
+            return None
+        return {"target": target, "name": name}
+
     if op == OP_RELEASE:
-        if not (6 <= bl <= 76):
+        if not (6 <= bl <= BODY_MAX):
             return None
         return {"anchor": _u32_5(b[0:5]), "flags": b[5:]}
-
-    if op == OP_DECORATE:
-        if not (0 <= bl <= 80):    # SM_DEC_MAX raw TLV bytes (C reference guard; blen ≤ 80)
-            return None
-        return {"raw": bytes(b)}   # fold parses TLV records
 
     if op == OP_SELL_TO:
         if not (29 <= bl <= 60):   # price8 + buyer20 + name1..32
@@ -231,7 +221,7 @@ def _decode_action(op, b, bl):
             return None
         return {"idxA": idxA, "idxB": idxB, "nameA": nameA, "nameB": nameB}
 
-    return None  # unknown opcode (0x00 or 0x10+)
+    return None  # unreachable (op range gated above)
 
 
 def _u32_5(b):

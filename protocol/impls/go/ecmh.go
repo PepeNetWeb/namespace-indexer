@@ -14,12 +14,11 @@ import (
 )
 
 // domain tags — second-preimage separation between tables.
+// names=01 commits=02 muts=04 (tag 0x03 was votes; left vacant).
 const (
 	ecmhTagName   = 0x01
 	ecmhTagCommit = 0x02
-	ecmhTagVote   = 0x03
 	ecmhTagMut    = 0x04
-	ecmhTagDecor  = 0x05
 )
 
 var ecmhRecTag = []byte{'E', 'C', 'M', 'H', 'v', '1'}
@@ -35,15 +34,12 @@ func ecmhFoldRow(acc []byte, tag byte, rowBytes []byte) {
 // stateEcmh is the incremental twin of stateDigest (§13.2): a per-table
 // Elliptic-Curve Multiset Hash over the SAME canonical per-row encoding the
 // state digest uses (so the two induce the identical equality relation),
-// combined into one 32-byte value. A point-sum is order-independent, so a
-// production fold maintains it in O(rows-changed)/block. Mirrors C
-// sm_state_ecmh in impls/c/src/ecmh.c.
+// combined into one 32-byte value. Three sub-accumulators (names/commits/muts);
+// combined = SHA256("ECMHtop1" ‖ A_names ‖ A_commits ‖ A_muts).
 func (s *FoldState) stateEcmh() [32]byte {
 	an := secpEcmhIdentity()
 	ac := secpEcmhIdentity()
-	av := secpEcmhIdentity()
 	am := secpEcmhIdentity()
-	ad := secpEcmhIdentity()
 
 	// names — per-row fields BYTE-IDENTICAL to digest.go (owner_type NOT encoded).
 	for k, r := range s.names {
@@ -71,42 +67,19 @@ func (s *FoldState) stateEcmh() [32]byte {
 		wI64(&b, c.commitTime)
 		ecmhFoldRow(ac, ecmhTagCommit, b.Bytes())
 	}
-	for _, v := range s.votes {
-		var b bytes.Buffer
-		b.Write(v.target[:])
-		wU32(&b, v.vout)
-		sc := v.score.bytesLE()
-		b.Write(sc[:])
-		ecmhFoldRow(av, ecmhTagVote, b.Bytes())
-	}
 	for o, h := range s.muts {
 		var b bytes.Buffer
 		b.Write(o[:])
 		wI64(&b, h)
 		ecmhFoldRow(am, ecmhTagMut, b.Bytes())
 	}
-	for _, d := range s.decors {
-		var b bytes.Buffer
-		b.Write(d.txid[:])
-		wU32(&b, d.vout)
-		b.WriteByte(byte(len(d.rec)))
-		b.Write(d.rec)
-		ecmhFoldRow(ad, ecmhTagDecor, b.Bytes())
-	}
 
-	// combined = SHA256("ECMHtop1" ‖ five sub-accumulators ‖ overflow flag).
+	// combined = SHA256("ECMHtop1" ‖ three sub-accumulators).
 	h := sha256.New()
 	h.Write([]byte("ECMHtop1"))
 	h.Write(an)
 	h.Write(ac)
-	h.Write(av)
 	h.Write(am)
-	h.Write(ad)
-	if s.overflow {
-		h.Write([]byte{1})
-	} else {
-		h.Write([]byte{0})
-	}
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out
@@ -130,7 +103,7 @@ func runEcmh() {
 	h2cs := []h2cVec{
 		{"empty", []byte{}},
 		{"a", []byte("a")},
-		{"shib", []byte("shibpost")},
+		{"pepe", []byte("pepenet")},
 		{"doge", []byte("doge")},
 		{"ff32", ff},
 		{"z32", z32},
@@ -156,7 +129,6 @@ func runEcmh() {
 		{ecmhTagName, []byte("\x03foo")},
 		{ecmhTagName, []byte("\x03bar")},
 		{ecmhTagCommit, []byte("commitment-blob-32-bytes-xxxxxx")},
-		{ecmhTagVote, []byte("vote-target-row")},
 		{ecmhTagMut, []byte("owner-mutation")},
 	}
 	recPoint := func(r rec) []byte {

@@ -1,17 +1,15 @@
 package main
 
-import "unicode/utf8"
-
-// Wire decoder: payload bytes (+ output value) → ACTION | POST | IGNORE.
+// Wire decoder: payload bytes (+ output value) → ACTION | IGNORE.
 // Strict, fail-closed (protocol-spec.md §0/§1/§2, SPEC-conformance.md §9).
 // A malformed payload NEVER panics and NEVER errors to the caller — it decodes
-// to IGNORE. Every slice read is bounds-guarded.
+// to IGNORE. Every slice read is bounds-guarded. Names-only: no text-POST branch;
+// bare UTF-8 and the overlay band fall through to IGNORE.
 
 type carrierKind int
 
 const (
 	IGNORE carrierKind = iota
-	POST
 	ACTION
 )
 
@@ -19,12 +17,8 @@ const (
 type Carrier struct {
 	kind   carrierKind
 	opcode byte
-	// POST: body bytes (capped at 80, stored verbatim)
-	postBytes []byte
 
 	// Per-opcode parsed fields (only those relevant to opcode are set):
-	txid   [32]byte // VOTE target
-	vout   uint32   // VOTE target vout
 	commit [32]byte // COMMIT commitment
 	salt   [32]byte // CLAIM salt
 	name   []byte   // CLAIM/SELL/RESERVE/SETTLE/PAY/SELL_TO name
@@ -36,8 +30,6 @@ type Carrier struct {
 	flags  []byte   // RENEW/TRANSFER/RELEASE bitmap (nil if absent / all-form)
 	hasAnchor bool
 
-	decRaw []byte // DECORATE raw TLV body
-
 	asIndex int    // AS index
 	idxA    int    // TRADE
 	idxB    int    // TRADE
@@ -45,9 +37,10 @@ type Carrier struct {
 	nameB   []byte // TRADE
 }
 
-// validName enforces §3.1: charset [a-z0-9-] (a DNS label), length 1..32, byte-for-byte, no folding.
-// Re-pin 2026-07-07: '.'/'_' dropped, '-' added (supersedes the 2026-07-02 dot rule). No structural
-// rules — '-a', 'a-', 'xn--x' are all valid names; uppercase stays invalid.
+// validName enforces §3.1: charset [a-z0-9-], length 1..32, reject-not-fold, plus
+// structural (RFC-1123 / IDNA): no leading/trailing hyphen; no `--` at positions
+// 3–4 (kills xn-- and every ACE prefix). Every consensus-valid name is a safe
+// hostname label.
 func validName(b []byte) bool {
 	if len(b) < 1 || len(b) > 32 {
 		return false
@@ -56,6 +49,12 @@ func validName(b []byte) bool {
 		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
 			return false
 		}
+	}
+	if b[0] == '-' || b[len(b)-1] == '-' {
+		return false
+	}
+	if len(b) >= 4 && b[2] == '-' && b[3] == '-' {
+		return false
 	}
 	return true
 }
@@ -78,31 +77,19 @@ func leU40(b []byte) int64 { // 5-byte little-endian height anchor
 	return v
 }
 
-// decode is the pure, fail-closed payload classifier.
+// decode is the pure, fail-closed payload classifier. value is accepted for
+// API compatibility with OP_RETURN carriers but is not used (names-only demux).
 func decode(payload []byte, value uint64) Carrier {
+	_ = value
 	ig := Carrier{kind: IGNORE}
 
-	// ACTION prefix: len>=4 and payload[0..2]==FF 50 4E.
+	// §1 action recognition: prefix 0xFF 'P' 'N' + opcode 0x01..0x0C.
 	if len(payload) >= 4 && payload[0] == 0xFF && payload[1] == 0x50 && payload[2] == 0x4E {
 		return decodeAction(payload)
 	}
-
-	// POST: not an action prefix, value>0, len>=1, whole payload strict UTF-8.
-	if value > 0 && len(payload) >= 1 && strictUTF8(payload) {
-		pb := payload
-		if len(pb) > 80 { // stored post bytes capped at 80 (conformance §9)
-			pb = pb[:80]
-		}
-		cp := make([]byte, len(pb))
-		copy(cp, pb)
-		return Carrier{kind: POST, postBytes: cp}
-	}
+	// everything else (UTF-8 noise, overlay, empty) → IGNORE
 	return ig
 }
-
-// strictUTF8 validates RFC-3629: rejects overlong, surrogates U+D800..U+DFFF,
-// and >U+10FFFF. We rely on utf8.Valid which implements exactly RFC-3629.
-func strictUTF8(b []byte) bool { return utf8.Valid(b) }
 
 func decodeAction(payload []byte) Carrier {
 	ig := Carrier{kind: IGNORE}
@@ -111,15 +98,11 @@ func decodeAction(payload []byte) Carrier {
 	bl := len(body)
 	c := Carrier{kind: ACTION, opcode: op, anchor: -1, asIndex: -1, idxA: -1, idxB: -1}
 
-	switch op {
-	case OP_VOTE_UP, OP_VOTE_DOWN:
-		if bl != 36 {
-			return ig
-		}
-		copy(c.txid[:], body[0:32])
-		c.vout = leU32(body[32:36])
-		return c
+	if op < OP_MIN || op > OP_MAX {
+		return ig
+	}
 
+	switch op {
 	case OP_COMMIT:
 		if bl != 32 {
 			return ig
@@ -140,7 +123,7 @@ func decodeAction(payload []byte) Carrier {
 		return c
 
 	case OP_RENEW:
-		// 0 = all; 5 = all-safe (anchor5); [6,76] = selective (anchor5 + flags1..71)
+		// 0 = all; 5 = all-safe (anchor5); [6,BODY_MAX] = selective (anchor5 + flags1..FLAGS_MAX)
 		switch {
 		case bl == 0:
 			return c
@@ -148,26 +131,26 @@ func decodeAction(payload []byte) Carrier {
 			c.hasAnchor = true
 			c.anchor = leU40(body[0:5])
 			return c
-		case bl >= 6 && bl <= 76:
+		case bl >= 6 && bl <= BODY_MAX:
 			c.hasAnchor = true
 			c.anchor = leU40(body[0:5])
-			c.flags = cloneBytes(body[5:]) // 1..71 bytes
+			c.flags = cloneBytes(body[5:]) // 1..FLAGS_MAX bytes
 			return c
 		default:
 			return ig
 		}
 
 	case OP_TRANSFER:
-		// 20 = all; [26,76] = selective (target20 + anchor5 + flags1..51)
+		// 20 = all; [26,BODY_MAX] = selective (target20 + anchor5 + flags1..FLAGS_XFER_MAX)
 		switch {
 		case bl == 20:
 			copy(c.target[:], body[0:20])
 			return c
-		case bl >= 26 && bl <= 76:
+		case bl >= 26 && bl <= BODY_MAX:
 			copy(c.target[:], body[0:20])
 			c.hasAnchor = true
 			c.anchor = leU40(body[20:25])
-			c.flags = cloneBytes(body[25:]) // 1..51
+			c.flags = cloneBytes(body[25:]) // 1..FLAGS_XFER_MAX
 			return c
 		default:
 			return ig
@@ -186,7 +169,7 @@ func decodeAction(payload []byte) Carrier {
 		c.name = cloneBytes(nm)
 		return c
 
-	case OP_RESERVE, OP_SETTLE, OP_PAY:
+	case OP_RENEW_NAME, OP_RELEASE_NAME, OP_RESERVE, OP_SETTLE, OP_PAY:
 		if bl < 1 || bl > 32 { // name1..32
 			return ig
 		}
@@ -196,20 +179,25 @@ func decodeAction(payload []byte) Carrier {
 		c.name = cloneBytes(body)
 		return c
 
+	case OP_TRANSFER_NAME:
+		if bl < 21 || bl > 52 { // target20 + name1..32
+			return ig
+		}
+		copy(c.target[:], body[0:20])
+		nm := body[20:]
+		if !validName(nm) {
+			return ig
+		}
+		c.name = cloneBytes(nm)
+		return c
+
 	case OP_RELEASE:
-		if bl < 6 || bl > 76 {
+		if bl < 6 || bl > BODY_MAX {
 			return ig
 		}
 		c.hasAnchor = true
 		c.anchor = leU40(body[0:5])
-		c.flags = cloneBytes(body[5:]) // 1..71
-		return c
-
-	case OP_DECORATE:
-		if bl < 0 || bl > 80 { // SM_DEC_MAX raw TLV bytes (C reference decode.c; blen ≤ 80)
-			return ig
-		}
-		c.decRaw = cloneBytes(body) // fold parses TLV
+		c.flags = cloneBytes(body[5:]) // 1..FLAGS_MAX
 		return c
 
 	case OP_SELL_TO:
@@ -261,8 +249,6 @@ func decodeAction(payload []byte) Carrier {
 		return c
 
 	default:
-		// opcode 0x00 or 0x10..0xFF: not a recognized action. 0xFF lead never
-		// valid UTF-8 → IGNORE (never a post).
 		return ig
 	}
 }

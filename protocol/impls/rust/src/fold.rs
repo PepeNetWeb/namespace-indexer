@@ -1,4 +1,4 @@
-//! The deterministic fold (§3 + §6). Single forward pass: pre-block time-triggered
+//! The deterministic fold (§3 + §5). Single forward pass: pre-block time-triggered
 //! transitions (reserve → offer → lease, then COMMIT_EXPIRY prune), then txs in
 //! (tx_index, vout) order, each change visible to everything after it.
 
@@ -74,20 +74,10 @@ pub struct CommitRow {
     pub commit_time: i64,
 }
 
-#[derive(Clone, Debug)]
-pub struct DecorPost {
-    pub txid: [u8; 32],
-    pub vout: u32,
-    pub records: Vec<Vec<u8>>,
-}
-
 pub struct State {
     pub names: BTreeMap<Vec<u8>, NameRow>,
     pub commits: Vec<CommitRow>,
-    pub votes: BTreeMap<([u8; 32], u32), i128>,
     pub muts: BTreeMap<Hash160, i64>,
-    pub decors: Vec<DecorPost>,
-    pub overflow: u8,
     pub activation_height: i64,
     scratch: BTreeMap<Vec<u8>, (i64, u32, Hash160)>,
 }
@@ -100,10 +90,7 @@ impl State {
         State {
             names: BTreeMap::new(),
             commits: Vec::new(),
-            votes: BTreeMap::new(),
             muts: BTreeMap::new(),
-            decors: Vec::new(),
-            overflow: 0,
             activation_height,
             scratch: BTreeMap::new(),
         }
@@ -123,10 +110,6 @@ impl State {
 
     fn last_mut(&self, owner: &Hash160) -> i64 {
         *self.muts.get(owner).unwrap_or(&i64::MIN)
-    }
-
-    fn is_owned(&self, owner: &Hash160) -> bool {
-        self.names.values().any(|r| &r.owner == owner)
     }
 
     /// Owned-set of `owner`, lexicographic (BTreeMap key order = unsigned bytewise).
@@ -197,7 +180,6 @@ impl State {
         let mut actor: Option<Hash160> = resolve_actor(tx, 0);
         let mut actor_type: ScriptType =
             tx.inputs.get(0).map(|i| i.stype).unwrap_or(ScriptType::P2pkh);
-        let mut pending: Vec<Vec<u8>> = Vec::new();
 
         let mut spends: SpendPool = Vec::new();
         for (vout, o) in tx.outputs.iter().enumerate() {
@@ -206,33 +188,20 @@ impl State {
             }
         }
 
-        for (vout, o) in tx.outputs.iter().enumerate() {
+        for (_vout, o) in tx.outputs.iter().enumerate() {
             let (payload, value) = match o {
                 Output::Carrier { payload, value } => (payload.as_slice(), *value),
                 Output::Spend { .. } => continue,
             };
             match decode_payload(payload, value) {
-                Decoded::Ignore => {} // does NOT flush pending buffer
-                Decoded::Post(_) => {
-                    let txid = synthetic_txid(h, txi);
-                    let owns = actor.map(|a| self.is_owned(&a)).unwrap_or(false);
-                    if !pending.is_empty() && actor.is_some() && owns {
-                        self.decors.push(DecorPost {
-                            txid,
-                            vout: vout as u32,
-                            records: std::mem::take(&mut pending),
-                        });
-                    } else {
-                        pending.clear(); // reaching a body always clears the buffer
-                    }
-                }
+                Decoded::Ignore => {}
                 Decoded::Action(act) => {
-                    if action_gated(&act) && h < self.activation_height {
-                        continue; // forward-only gate (§3.0)
+                    // forward-only activation gate (§3.0): all ops gate at one height.
+                    if h < self.activation_height {
+                        continue;
                     }
                     match act {
                         Action::As { index } => {
-                            pending.clear(); // AS flushes the DECORATE buffer
                             actor = resolve_actor(tx, index as usize);
                             actor_type = tx
                                 .inputs
@@ -244,25 +213,17 @@ impl State {
                             // TRADE never consults the acting identity (§3.10).
                             self.do_trade(tx, h, idx_a, idx_b, &name_a, &name_b);
                         }
-                        Action::Decorate { raw } => {
-                            // requires a valid actor (dispatch is after the §4 actor gate, §6)
-                            if actor.is_none() {
-                                continue;
-                            }
-                            parse_decorate(&raw, &mut pending);
-                        }
                         other => {
                             let a = match actor {
                                 Some(a) => a,
                                 None => continue, // ⊥ actor → drop
                             };
-                            self.dispatch(other, a, actor_type, blk, mtp, txi, vout as u32, value, &mut spends);
+                            self.dispatch(other, a, actor_type, blk, mtp, txi, value, &mut spends);
                         }
                     }
                 }
             }
         }
-        // end of tx: orphan DECORATE records discarded (pending dropped)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -274,14 +235,11 @@ impl State {
         blk: &Block,
         mtp: i64,
         txi: u32,
-        _vout: u32,
         value: u64,
         spends: &mut SpendPool,
     ) {
         let h = blk.height;
         match act {
-            Action::VoteUp { target, vout } => self.vote(target, vout, value, true),
-            Action::VoteDown { target, vout } => self.vote(target, vout, value, false),
             Action::Commit { commitment } => self.commits.push(CommitRow {
                 commitment,
                 commit_height: h,
@@ -293,6 +251,9 @@ impl State {
             }
             Action::Renew { mode } => self.do_renew(actor, &mode, h, mtp, value, blk.rate),
             Action::Transfer { target, sel } => self.do_transfer(actor, target, &sel, h),
+            Action::RenewName { name } => self.do_renew_name(actor, &name, mtp, value, blk.rate),
+            Action::TransferName { target, name } => self.do_transfer_name(actor, target, &name, h),
+            Action::ReleaseName { name } => self.do_release_name(actor, &name, h),
             Action::Sell { price, window, name } => {
                 self.do_sell(actor, actor_type, price, window, &name, mtp)
             }
@@ -303,21 +264,7 @@ impl State {
                 self.do_sell_to(actor, actor_type, price, buyer, &name, mtp)
             }
             Action::Pay { name } => self.do_pay(actor, &name, h, mtp, spends),
-            Action::As { .. } | Action::Trade { .. } | Action::Decorate { .. } => unreachable!(),
-        }
-    }
-
-    // ----- votes -----
-    fn vote(&mut self, target: [u8; 32], tv: u32, weight: u64, up: bool) {
-        if weight < DUST_FLOOR {
-            return;
-        }
-        let delta = weight as i128;
-        let e = self.votes.entry((target, tv)).or_insert(0i128);
-        let r = if up { e.checked_add(delta) } else { e.checked_sub(delta) };
-        match r {
-            Some(v) => *e = v,
-            None => self.overflow = 1,
+            Action::As { .. } | Action::Trade { .. } => unreachable!(),
         }
     }
 
@@ -427,6 +374,49 @@ impl State {
             }
         }
         // RENEW does NOT bump last_set_mutation_height (no membership/ordering change).
+    }
+
+    // ----- the by-name forms (§3.5): singleton siblings of the bitmap ops -----
+    // A name string is its own position-independent address into the owned set:
+    // no anchor, no anchor guard. The name MUST be the actor's (the owner stays
+    // the seller while listed/offered/reserved); else drop.
+
+    fn do_renew_name(&mut self, actor: Hash160, name: &[u8], mtp: i64, value: u64, rate: u64) {
+        match self.names.get(name) {
+            Some(r) if r.owner == actor => {}
+            _ => return, // absent / not mine → drop
+        }
+        let cur = vec![self.names.get(name).map(|r| r.lease_expiry).unwrap_or(mtp)];
+        let adds = match water_fill(value, rate, mtp, &cur) {
+            Some(a) => a,
+            None => return, // T==0 fail-closed
+        };
+        if let Some(r) = self.names.get_mut(name) {
+            r.lease_expiry += (adds[0] as i64) * (BILLING_UNIT as i64);
+        }
+        // renewal is not a set mutation → no bump.
+    }
+
+    fn do_transfer_name(&mut self, actor: Hash160, target: Hash160, name: &[u8], h: i64) {
+        match self.names.get(name) {
+            Some(r) if r.owner == actor && !r.locked() => {}
+            _ => return, // absent / not mine / locked → no-op, no bump
+        }
+        if let Some(r) = self.names.get_mut(name) {
+            r.owner = target;
+            r.otype = ScriptType::P2pkh; // owner_type cosmetic / not digested
+        }
+        self.bump_mut(actor, h); // a move bumps BOTH parties (self-target included)
+        self.bump_mut(target, h);
+    }
+
+    fn do_release_name(&mut self, actor: Hash160, name: &[u8], h: i64) {
+        match self.names.get(name) {
+            Some(r) if r.owner == actor && !r.locked() => {}
+            _ => return, // absent / not mine / locked → no-op, no bump
+        }
+        self.names.remove(name);
+        self.bump_mut(actor, h);
     }
 
     // ----- transfer -----
@@ -671,23 +661,12 @@ impl State {
 
 // ---------- free helpers ----------
 
-fn synthetic_txid(height: i64, txindex: u32) -> [u8; 32] {
-    let mut t = [0u8; 32];
-    t[0..8].copy_from_slice(&(height as u64).to_le_bytes());
-    t[8..12].copy_from_slice(&txindex.to_le_bytes());
-    t
-}
-
 fn resolve_actor(tx: &Tx, k: usize) -> Option<Hash160> {
     let inp = tx.inputs.get(k)?;
     if !inp.sighash_all {
         return None;
     }
     inp.identity
-}
-
-fn action_gated(act: &Action) -> bool {
-    !matches!(act, Action::VoteUp { .. } | Action::VoteDown { .. })
 }
 
 /// Select owned names by bitmap (LSB-first), ignoring out-of-bounds bits (≥K).
@@ -701,24 +680,6 @@ fn select_bits(owned: &[Vec<u8>], flags: &[u8]) -> Vec<Vec<u8>> {
         }
     }
     out
-}
-
-/// DECORATE TLV parse: [tag:1][len:2 LE][value:len], left→right, fail-closed on overrun/remnant.
-fn parse_decorate(raw: &[u8], pending: &mut Vec<Vec<u8>>) {
-    let mut i = 0usize;
-    let n = raw.len();
-    while i + 3 <= n {
-        let len = (raw[i + 1] as usize) | ((raw[i + 2] as usize) << 8);
-        let end = i + 3 + len;
-        if end > n {
-            break; // record len overruns payload → drop the rest
-        }
-        if pending.len() < PEND_DECOR_MAX {
-            pending.push(raw[i..end].to_vec()); // full on-wire [tag][len:2][value]
-        } // §1 cap: records past 64 are dropped, but parsing continues
-        i = end;
-    }
-    // trailing remnant < 3 bytes is silently dropped (loop exits)
 }
 
 /// Reserve/settle/pay deposit/payment leg: max(DUST_FLOOR, ⌊price·bps/10000⌋) in 128-bit.

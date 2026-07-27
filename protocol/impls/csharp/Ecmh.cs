@@ -2,18 +2,18 @@ using System;
 using System.Security.Cryptography;
 using System.Text;
 
-namespace Shibpost;
+namespace Pepenet;
 
 /// <summary>
 /// §13.2 ECMH primitive vector set (`sm ecmh`). Mirrors impls/c/src/ecmh.c
 /// (ecmh_cmd): hash-to-curve KATs, identity serialization, a tagged multiset sum
 /// (commutativity + inverse round-trip), printed as a cross-language byte-identical
-/// `combined` digest against this impl's own secp256k1.
+/// `combined` digest against this impl's own secp256k1. Names-only: no vote tag.
 /// </summary>
 public static class Ecmh
 {
-    // domain tags — second-preimage separation between tables.
-    private const byte TagName = 0x01, TagCommit = 0x02, TagVote = 0x03, TagMut = 0x04;
+    // domain tags — second-preimage separation between tables (TAG_MUT keeps 0x04).
+    private const byte TagName = 0x01, TagCommit = 0x02, TagMut = 0x04;
     private static readonly byte[] RecTag = { (byte)'E', (byte)'C', (byte)'M', (byte)'H', (byte)'v', (byte)'1' };
 
     public static int Run()
@@ -31,7 +31,7 @@ public static class Ecmh
         {
             ("empty", Array.Empty<byte>()),
             ("a",     Encoding.ASCII.GetBytes("a")),
-            ("shib",  Encoding.ASCII.GetBytes("shibpost")),
+            ("pepe",  Encoding.ASCII.GetBytes("pepenet")),
             ("doge",  Encoding.ASCII.GetBytes("doge")),
             ("ff32",  Fill(32, 0xFF)),
             ("z32",   new byte[32]),
@@ -53,7 +53,6 @@ public static class Ecmh
             (TagName,   Bytes(0x03, "foo")),
             (TagName,   Bytes(0x03, "bar")),
             (TagCommit, Encoding.ASCII.GetBytes("commitment-blob-32-bytes-xxxxxx")),
-            (TagVote,   Encoding.ASCII.GetBytes("vote-target-row")),
             (TagMut,    Encoding.ASCII.GetBytes("owner-mutation")),
         };
         byte[] fwd = Secp256k1.EcmhIdentity(), rev = Secp256k1.EcmhIdentity();

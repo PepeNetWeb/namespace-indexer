@@ -121,6 +121,59 @@ func (s *FoldState) applyRelease(b FoldBlock, c Carrier, actor Identity) {
 	}
 }
 
+// ── the by-name forms (§3.5) — the singleton siblings of the bitmap ops ──────
+// A name string is its own position-independent address into the owned set, so
+// there is no anchor and no anchor guard. The name MUST be in the actor's owned
+// set (same membership as ownedSorted: LISTED/OFFERED/RESERVED rows included,
+// owner stays the seller until settle/pay); else drop.
+
+// findMine returns the row for c.name iff the actor controls it, else nil.
+func (s *FoldState) findMine(c Carrier, actor Identity) (string, *NameRow) {
+	nm := string(c.name)
+	r := s.names[nm]
+	if r == nil || r.owner != actor.h160 {
+		return nm, nil
+	}
+	return nm, r
+}
+
+// applyRenewName water-fills the singleton set; listed/offered names are still
+// renewable by their seller. Renewal is not a set mutation → no bump.
+func (s *FoldState) applyRenewName(b FoldBlock, fc *FoldCarrier, actor Identity) {
+	nm, r := s.findMine(fc.c, actor)
+	if r == nil {
+		return
+	}
+	T, huge := leaseT(fc.value, b.rate)
+	if !huge && T == 0 {
+		return // fail-closed at T=0
+	}
+	waterFill([]*NameRow{r}, []string{nm}, T, huge, b.mtp)
+}
+
+// applyTransferName gifts exactly one owned (unlocked) name; lease conveys.
+// Locked → no-op, no bump. A move bumps BOTH parties (self-target included).
+func (s *FoldState) applyTransferName(b FoldBlock, c Carrier, actor Identity) {
+	_, r := s.findMine(c, actor)
+	if r == nil || r.st != ST_OWNED { // absent / not mine / locked
+		return
+	}
+	r.owner = c.target
+	s.bumpMut(actor.h160, b.height)
+	s.bumpMut(c.target, b.height)
+}
+
+// applyReleaseName returns exactly one owned (unlocked) name to the pool now.
+// Locked → no-op, no bump.
+func (s *FoldState) applyReleaseName(b FoldBlock, c Carrier, actor Identity) {
+	nm, r := s.findMine(c, actor)
+	if r == nil || r.st != ST_OWNED {
+		return
+	}
+	delete(s.names, nm)
+	s.bumpMut(actor.h160, b.height)
+}
+
 func (s *FoldState) applySell(b FoldBlock, c Carrier, actor Identity) {
 	nm := string(c.name)
 	r := s.names[nm]
@@ -309,21 +362,3 @@ func matchOutput(tx FoldTx, consumed []bool, seller [20]byte, styp byte, owed ui
 	return -1
 }
 
-// parseTLV splits DECORATE raw bytes into FULL on-wire records [tag:1][len:2 LE][value],
-// fail-closing the tail on overrun or a sub-3-byte remnant (§1). Returns kept records.
-func parseTLV(raw []byte) [][]byte {
-	var out [][]byte
-	i := 0
-	for i+3 <= len(raw) {
-		l := int(raw[i+1]) | int(raw[i+2])<<8
-		end := i + 3 + l
-		if end > len(raw) {
-			break // overrun → drop tail
-		}
-		rec := make([]byte, end-i)
-		copy(rec, raw[i:end])
-		out = append(out, rec)
-		i = end
-	}
-	return out
-}

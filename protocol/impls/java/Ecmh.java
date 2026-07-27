@@ -6,6 +6,7 @@ import java.security.MessageDigest;
 // accumulator algebra (identity / negate / add), and a tagged multiset sum,
 // printed as a cross-language byte-identical `combined` golden. Runs Java's OWN
 // secp256k1 (Secp.java) and must print output identical to the C reference.
+// Names-only: 3 domain tags (NAME/COMMIT/MUT); no VOTE/DECOR.
 final class Ecmh {
 
     private static MessageDigest sha256ctx() {
@@ -16,7 +17,6 @@ final class Ecmh {
     // domain tags — second-preimage separation between tables.
     private static final byte TAG_NAME   = 0x01;
     private static final byte TAG_COMMIT = 0x02;
-    private static final byte TAG_VOTE   = 0x03;
     private static final byte TAG_MUT    = 0x04;
     private static final byte[] ECMH_REC_TAG = { 'E','C','M','H','v','1' };
 
@@ -37,11 +37,11 @@ final class Ecmh {
         out.append("ecmh ECMHv1\n"); comb.update(ECMH_REC_TAG);
 
         // 1. hash-to-curve KAT — fixed preimages → (ctr, compressed even-Y point).
-        String[] labels = { "empty", "a", "shib", "doge", "ff32", "z32" };
+        String[] labels = { "empty", "a", "pepe", "doge", "ff32", "z32" };
         byte[][] pres = new byte[6][];
         pres[0] = new byte[0];
         pres[1] = Sm.utf8("a");
-        pres[2] = Sm.utf8("shibpost");
+        pres[2] = Sm.utf8("pepenet");
         pres[3] = Sm.utf8("doge");
         pres[4] = new byte[32]; java.util.Arrays.fill(pres[4], (byte) 0xFF);
         pres[5] = new byte[32];
@@ -58,12 +58,12 @@ final class Ecmh {
         out.append("identity ").append(Hex.enc(id)).append("\n"); comb.update(id);
 
         // 3. tagged multiset sum — a fixed set of (tag ‖ body) records, summed two ways.
-        byte[] tags = { TAG_NAME, TAG_NAME, TAG_COMMIT, TAG_VOTE, TAG_MUT };
+        //    Names-only: NAME, NAME, COMMIT, MUT (no VOTE).
+        byte[] tags = { TAG_NAME, TAG_NAME, TAG_COMMIT, TAG_MUT };
         byte[][] bodies = {
-            Sm.utf8("foo"),
-            Sm.utf8("bar"),
+            new byte[]{ 0x03, 'f', 'o', 'o' },
+            new byte[]{ 0x03, 'b', 'a', 'r' },
             Sm.utf8("commitment-blob-32-bytes-xxxxxx"),
-            Sm.utf8("vote-target-row"),
             Sm.utf8("owner-mutation"),
         };
         int nr = tags.length;

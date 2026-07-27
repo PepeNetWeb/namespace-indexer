@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""shibpost protocol reference state machine — clean-room Python implementation.
+"""PepeNet namespace reference state machine — clean-room Python implementation.
 
 Run:  python3 impl/sm.py <mode>
 Modes:
@@ -23,7 +23,7 @@ import prng as _prng
 import hashes as _hashes
 import attrib as _attrib
 from fold import (State, water_fill, lease_days, oracle_rate, compute_mtp,
-                  parse_tlv, state_digest, state_ecmh, synthetic_txid)
+                  state_digest, state_ecmh, synthetic_txid)
 
 
 # ============================================================
@@ -33,16 +33,24 @@ def enc(op, body):
     return PREFIX + bytes([op]) + body
 
 
-def e_vote(up, target, vout, ):
-    return enc(OP_VOTE_UP if up else OP_VOTE_DOWN, target + vout.to_bytes(4, "little"))
-
-
 def e_commit(commitment):
     return enc(OP_COMMIT, commitment)
 
 
 def e_claim(salt, name):
     return enc(OP_CLAIM, salt + name)
+
+
+def e_renew_name(name):
+    return enc(OP_RENEW_NAME, name)
+
+
+def e_transfer_name(target, name):
+    return enc(OP_TRANSFER_NAME, target + name)
+
+
+def e_release_name(name):
+    return enc(OP_RELEASE_NAME, name)
 
 
 def e_renew_all():
@@ -81,10 +89,6 @@ def e_release(anchor, flags):
     return enc(OP_RELEASE, anchor.to_bytes(5, "little") + flags)
 
 
-def e_decorate(raw):
-    return enc(OP_DECORATE, raw)
-
-
 def e_sell_to(price, buyer, name):
     return enc(OP_SELL_TO, price.to_bytes(8, "little") + buyer + name)
 
@@ -99,10 +103,6 @@ def e_as(index):
 
 def e_trade(idxA, idxB, nameA, nameB):
     return enc(OP_TRADE, bytes([idxA, idxB]) + nameA + b"," + nameB)
-
-
-def tlv(tag, value):
-    return bytes([tag]) + len(value).to_bytes(2, "little") + value
 
 
 # ============================================================
@@ -577,11 +577,10 @@ def t_directed_sell_to_pay():
 
 def t_as_attribution():
     s = _fresh()
-    # custodian tx: vin0 = custodian (X), vin1 = user U. AS 1 -> vote attributed to U.
+    # custodian tx: vin0 = custodian (X), vin1 = user U. AS 1 -> SELL attributed to U.
     X, U = ident(5), ident(6)
     _mint(s, 6, b"u", 5, 1000, MAX_LEASE)  # U owns a name
     s.begin_block(6, 1001)
-    target = synthetic_txid(6, 0)
     # AS 1 then a SELL by U on "u" (acts as U)
     s.process_tx(tx(0, [vin(5), vin(6)], [
         carrier(0, e_as(1)),
@@ -654,127 +653,13 @@ def t_trade_failclosed_edges():
     T.check(s.names[b"x"].owner == A, "TRADE counterparty not owning -> drop")
 
 
-def t_decorate_binding():
-    s = _fresh()
-    _mint(s, 1, b"dn", 5, 1000, MAX_LEASE)   # author owns a name
-    s.begin_block(6, 1001)
-    rec = tlv(0x01, b"hello")
-    # DECORATE then a body (post) by same actor who owns a name -> records bind
-    s.process_tx(tx(0, [vin(1)], [
-        carrier(0, e_decorate(rec)),
-        carrier(1, b"hi there", 5),          # text post (value>0, utf8)
-    ]), 6, 1001, 28)
-    txid = synthetic_txid(6, 0)
-    T.check((txid, 1) in s.decors and s.decors[(txid, 1)][0] == rec, "DECORATE binds to next body")
-
-
-def t_decorate_orphan_and_owner_gate():
-    # orphan: DECORATE with no following body -> discarded
-    s = _fresh()
-    _mint(s, 1, b"dn", 5, 1000, MAX_LEASE)
-    s.begin_block(6, 1001)
-    s.process_tx(tx(0, [vin(1)], [carrier(0, e_decorate(tlv(0x01, b"x")))]), 6, 1001, 28)
-    T.check(len(s.decors) == 0, "orphan DECORATE discarded at tx-end")
-    # owner gate: author owns no name -> records drop, post still a plain post
-    s2 = _fresh()
-    s2.begin_block(6, 1001)
-    s2.process_tx(tx(0, [vin(7)], [
-        carrier(0, e_decorate(tlv(0x01, b"x"))),
-        carrier(1, b"plain", 5),
-    ]), 6, 1001, 28)
-    T.check(len(s2.decors) == 0, "DECORATE dropped when author owns no name")
-
-
-def t_decorate_intervening_action_survives():
-    # §1: an intervening non-body, non-AS carrier (e.g. VOTE) does NOT flush buffer
-    s = _fresh()
-    _mint(s, 1, b"dn", 5, 1000, MAX_LEASE)
-    s.begin_block(6, 1001)
-    rec = tlv(0x02, b"k")
-    s.process_tx(tx(0, [vin(1)], [
-        carrier(0, e_decorate(rec)),
-        carrier(1, e_vote(True, b"\x00" * 32, 0), value=10),   # intervening VOTE
-        carrier(2, b"body", 5),
-    ]), 6, 1001, 28)
-    txid = synthetic_txid(6, 0)
-    T.check((txid, 2) in s.decors, "decoration survives an intervening VOTE carrier")
-
-
-def t_decorate_as_flushes():
-    # §1: an AS marker between DECORATE and body flushes the buffer
-    s = _fresh()
-    _mint(s, 1, b"dn", 5, 1000, MAX_LEASE)
-    s.begin_block(6, 1001)
-    rec = tlv(0x02, b"k")
-    s.process_tx(tx(0, [vin(1), vin(1)], [
-        carrier(0, e_decorate(rec)),
-        carrier(1, e_as(1)),                  # AS flushes pending buffer
-        carrier(2, b"body", 5),
-    ]), 6, 1001, 28)
-    T.check(len(s.decors) == 0, "AS flushes pending DECORATE buffer")
-
-
-def t_decorate_pend_cap():
-    # §1: the pending buffer caps at PEND_DECOR_MAX; 65 records → exactly 64 bind.
-    s = _fresh()
-    _mint(s, 1, b"dn", 5, 1000, MAX_LEASE)
-    s.begin_block(6, 1001)
-
-    def decorate_n(nrec):                    # nrec empty TLVs, tags 1..nrec (per-carrier)
-        raw = bytearray()
-        for i in range(nrec):
-            raw += bytes([i + 1, 0, 0])
-        return e_decorate(bytes(raw))
-    s.process_tx(tx(0, [vin(1)], [
-        carrier(0, decorate_n(26)),
-        carrier(1, decorate_n(26)),
-        carrier(2, decorate_n(13)),          # 65 pending → 64 bind
-        carrier(3, b"body", 5),
-    ]), 6, 1001, 28)
-    txid = synthetic_txid(6, 0)
-    bound = s.decors.get((txid, 3), [])
-    T.check(len(bound) == PEND_DECOR_MAX, "DECORATE pending-record cap binds exactly 64 of 65")
-
-
 def t_no_tx_count_cap():
-    # §0: no per-tx carrier cap — 17 VOTE carriers on one target all fold (17×3 = 51).
+    # §0: no per-tx carrier cap — 17 COMMIT carriers all record (vector 54).
     s = _fresh()
     s.begin_block(10, 1000)
-    target = bytes([0x55]) + b"\x00" * 31
-    cars = [carrier(i, e_vote(True, target, 7), value=3) for i in range(17)]
+    cars = [carrier(i, e_commit(bytes([i]) + b"\x00" * 31)) for i in range(17)]
     s.process_tx(tx(0, [vin(1)], cars), 10, 1000, 28)
-    T.check(s.votes.get((target, 7)) == 51, "17 up-votes ×3 fold to score 51 (no tx count cap)")
-
-
-def t_tlv_failclosed():
-    # a record whose len overruns -> drop the tail, keep earlier records
-    good = tlv(0x01, b"ok")
-    bad = bytes([0x02]) + (9999).to_bytes(2, "little") + b"short"
-    recs = parse_tlv(good + bad)
-    T.check(recs == [good], "TLV overrun fail-closed: keep good, drop bad tail")
-    # trailing remnant < 3 bytes -> dropped
-    recs2 = parse_tlv(good + b"\x05")
-    T.check(recs2 == [good], "TLV trailing remnant < header dropped")
-
-
-def t_vote_scoring_overflow():
-    s = _fresh()
-    s.begin_block(6, 1001)
-    tgt = b"\x00" * 32
-    s.process_tx(tx(0, [vin(1)], [carrier(0, e_vote(True, tgt, 0), value=100)]), 6, 1001, 28)
-    s.process_tx(tx(1, [vin(1)], [carrier(0, e_vote(False, tgt, 0), value=30)]), 6, 1001, 28)
-    T.check(s.votes[(tgt, 0)] == 70, "vote net score = up - down")
-    # zero-weight vote dropped
-    s.process_tx(tx(2, [vin(1)], [carrier(0, e_vote(True, tgt, 0), value=0)]), 6, 1001, 28)
-    T.check(s.votes[(tgt, 0)] == 70, "zero-weight vote dropped")
-    # overflow fail-loud
-    s2 = _fresh()
-    s2.begin_block(6, 1001)
-    big = (1 << 63)  # u64 weight near max
-    # accumulate beyond i128 max by many huge up-votes (simulate detection)
-    s2.votes[(tgt, 0)] = I128_MAX
-    s2.process_tx(tx(0, [vin(1)], [carrier(0, e_vote(True, tgt, 0), value=big)]), 6, 1001, 28)
-    T.check(s2.overflow == 1, "vote accumulator overflow fail-loud")
+    T.check(len(s.commits) == 17, "17 COMMITs all record (no tx count cap)")
 
 
 def t_fee_oracle():
@@ -939,10 +824,8 @@ def t_secp_kat():
 
 
 def t_dotted_names():
-    # charset re-pin (2026-07-07): [a-z0-9-] — a DNS label, lowercased. '.'/'_' dropped,
-    # '-' added (supersedes the 2026-07-02 dot rule). No structural rules; hyphen and a
-    # 32-byte name are valid, '.'/'_'/uppercase/comma/33-byte are not. Pins the OUTCOME
-    # behind scenario 52 (its digest only proves agreement).
+    # charset + structural rules (§3.1): [a-z0-9-], 1..32; no leading/trailing hyphen;
+    # no `--` at positions 3–4. Pins the OUTCOME behind scenario 52 / 52b.
     from wire import valid_name
     T.check(valid_name(b"shib-p2p"), "hyphen name valid")
     T.check(valid_name(b"abcdefghijklmnopqrstuvwxyz0123ab"), "32-byte name valid")
@@ -951,6 +834,9 @@ def t_dotted_names():
     T.check(not valid_name(b"shib_p2p"), "underscore now invalid")
     T.check(not valid_name(b"Shib-p2p"), "uppercase still invalid")
     T.check(not valid_name(b"a,b"), "comma still invalid (TRADE pair split relies on it)")
+    T.check(not valid_name(b"-a"), "leading hyphen invalid")
+    T.check(not valid_name(b"a-"), "trailing hyphen invalid")
+    T.check(not valid_name(b"xn--x"), "ACE prefix (xn--) invalid")
     s = _fresh()
     A = ident(0xAA)
     s71, s74 = b"\x71" * 32, b"\x74" * 32
@@ -968,6 +854,29 @@ def t_dotted_names():
     T.check(b"shib.p2p" not in s.names and len(s.names) == 1, "dotted claim drops")
 
 
+
+def t_l1_carrier_ceiling():
+    # §6 pinned carrier ceiling: flags at the exact consensus caps decode;
+    # one byte past the ceiling is IGNORE — fail-closed in both directions.
+    from wire import decode_payload, ACTION, IGNORE
+    from const import FLAGS_MAX, FLAGS_XFER_MAX, CARRIER_MAX
+    wide = e_renew_sel(7, bytes((i * 7 + 1) & 0xFF for i in range(FLAGS_MAX)))
+    T.check(len(wide) == CARRIER_MAX, "RENEW at cap is exactly CARRIER_MAX (9996) payload bytes")
+    k, info = decode_payload(wide, 0)
+    T.check(k == ACTION and len(info["flags"]) == FLAGS_MAX,
+            "RENEW-selective decodes with all 9987 flag bytes")
+    k, _ = decode_payload(wide + b"\x00", 0)
+    T.check(k == IGNORE, "one byte past the L1 ceiling -> ignore")
+    xfer = e_transfer_sel(b"\xbb" * 20, 7, b"\x01" * FLAGS_XFER_MAX)
+    k, info = decode_payload(xfer, 0)
+    T.check(k == ACTION and len(info["flags"]) == FLAGS_XFER_MAX,
+            "TRANSFER-selective decodes at FLAGS_XFER_MAX (9967)")
+    k, _ = decode_payload(e_transfer_sel(b"\xbb" * 20, 7, b"\x01" * (FLAGS_XFER_MAX + 1)), 0)
+    T.check(k == IGNORE, "TRANSFER flags past the cap -> ignore")
+    k, info = decode_payload(e_release(3, b"\xff" * FLAGS_MAX), 0)
+    T.check(k == ACTION and len(info["flags"]) == FLAGS_MAX, "RELEASE decodes at FLAGS_MAX")
+
+
 ALL_TESTS = [
     t_primitives, t_secp_kat, t_commit_claim_happy, t_naked_claim_dropped,
     t_same_block_commit_too_shallow, t_commitment_copy_attack,
@@ -978,22 +887,24 @@ ALL_TESTS = [
     t_release_locked_skipped, t_sell_floor_and_window, t_sell_window_addform_shorttail,
     t_reserve_settle_open_market, t_reserve_burn_short_drops, t_reserve_128bit_deposit,
     t_output_value_collision, t_directed_sell_to_pay, t_as_attribution, t_as_oob_drop,
-    t_trade_swap_and_antirug, t_trade_failclosed_edges, t_decorate_binding,
-    t_decorate_orphan_and_owner_gate, t_decorate_intervening_action_survives,
-    t_decorate_as_flushes, t_decorate_pend_cap, t_no_tx_count_cap,
-    t_tlv_failclosed, t_vote_scoring_overflow, t_fee_oracle,
+    t_trade_swap_and_antirug, t_trade_failclosed_edges, t_no_tx_count_cap,
+    t_fee_oracle,
     t_mtp_median, t_digest_sensitivity, t_release_all_reclaim_same_block,
-    t_attrib_a7_offcurve_p2pkh, t_ecmh, t_dotted_names,
+    t_attrib_a7_offcurve_p2pkh, t_ecmh, t_dotted_names, t_l1_carrier_ceiling,
 ]
 
 
 def run_selftest():
     for fn in ALL_TESTS:
         fn()
-    # §13.2 cross-impl anchor: ECMH of the empty state (all five A_T = ∞).
+    # cross-impl anchors: empty SMv1 state (names+commits+muts only; three ECMH tables).
+    esd = state_digest(_fresh())
     ese = state_ecmh(_fresh())
-    T.check(ese == "053f61e599084024c9acd6a3127057ea5de001829225590ea2b175c5506b5c55",
+    T.check(esd == "0967073bc100b3e1e16833c03f3277dcd7d5076c77a98d6b3ce9ce4aae8ec298",
+            "empty_state_digest matches cross-impl anchor")
+    T.check(ese == "3ecfc3d7fa5be56fc513dde926bdf105c92accbf07088e702f85856fa69d10e0",
             "empty_state_ecmh matches cross-impl anchor")
+    print("empty_state_digest=%s" % esd)
     print("empty_state_ecmh=%s" % ese)
     print("\nself-test: %d checks, %d failures" % (T.n, len(T.fails)))
     if T.fails:
@@ -1018,8 +929,9 @@ def run_selftest():
 N_IDS = 16
 NAME_POOL = 400
 BASE_TS = 1_700_000_000
-# weights: POST,VOTE,COMMIT,CLAIM,RENEW,TRANSFER,SELL,RESERVE,SETTLE,RELEASE,SELL_TO,PAY,TRADE
-_GEN_WEIGHTS = [12, 12, 14, 13, 5, 5, 8, 7, 7, 3, 6, 5, 4]
+# weights (names/market only; matches C gen.c): COMMIT,CLAIM,RENEW,TRANSFER,SELL,
+# RESERVE,SETTLE,RELEASE,SELL_TO,PAY,TRADE — AS rides on RENEW (~1/8 with OOB)
+_GEN_WEIGHTS = [14, 13, 5, 5, 8, 7, 7, 3, 6, 5, 4]
 _GEN_WSUM = sum(_GEN_WEIGHTS)
 
 
@@ -1098,7 +1010,7 @@ def _build_tx(rng, s, height, mtp, rate, ready, salt_ctr):
     rate28 = rate // 28
     lease_val = rate28 * days            # T == days (rate is a multiple of 28)
 
-    if op == 2:   # COMMIT
+    if op == 0:   # COMMIT
         j = rng.bounded(NAME_POOL)
         name = _name_of(j)
         salt = _salt_of(salt_ctr)
@@ -1106,7 +1018,7 @@ def _build_tx(rng, s, height, mtp, rate, ready, salt_ctr):
                       "commit_height": height, "commit_time": mtp})
         return _gen_one_in(i, [carrier(0, e_commit(commitment_of(salt, name, idb)))])
 
-    if op == 3:   # CLAIM a ready commit (>=1 deep, live, name free)
+    if op == 1:   # CLAIM a ready commit (>=1 deep, live, name free)
         for k in range(len(ready)):
             p = ready[k]
             if (p["commit_height"] < height
@@ -1115,24 +1027,29 @@ def _build_tx(rng, s, height, mtp, rate, ready, salt_ctr):
                 ready.pop(k)
                 return _gen_one_in(p["i"], [carrier(0, e_claim(p["salt"], p["name"]),
                                                     value=lease_val)])
-        # fall through to VOTE
+        # fall through to COMMIT
 
-    elif op == 4:  # RENEW all
-        if _names_where(s, idb, -1):
-            return _gen_one_in(i, [carrier(0, e_renew_all(), value=lease_val)])
+    elif op == 2:  # RENEW all (optionally AS-attributed ~1/8)
+        cars = [carrier(0, e_renew_all(), value=lease_val)]
+        if rng.bounded(8) == 0:
+            other = rng.bounded(N_IDS)
+            idx = (2 + rng.bounded(8)) if rng.bounded(4) == 0 else 1  # sometimes OOB
+            return tx(0, [vin_typed(other), vin_typed(i)],
+                      [carrier(0, e_as(idx)), carrier(1, e_renew_all(), value=lease_val)])
+        return _gen_one_in(i, cars)
 
-    elif op == 5:  # TRANSFER all to a random id
+    elif op == 3:  # TRANSFER all to a random id
         if _names_where(s, idb, ST_OWNED):
             return _gen_one_in(i, [carrier(0, e_transfer_all(gen_identity(rng.bounded(N_IDS))))])
 
-    elif op == 6:  # SELL an owned name with enough lease tail
+    elif op == 4:  # SELL an owned name with enough lease tail
         for nm in _names_where(s, idb, ST_OWNED):
             r = s.names[nm]
             if mtp + RESERVE_WINDOW + REORG_BUFFER <= r.lease_expiry:
                 price = 3 + rng.bounded(100000)
                 return _gen_one_in(i, [carrier(0, e_sell(price, 0, nm))])
 
-    elif op == 7:  # RESERVE a listed name
+    elif op == 5:  # RESERVE a listed name
         listed = _names_where(s, None, ST_LISTED)
         if listed:
             nm = listed[rng.bounded(len(listed))]
@@ -1144,7 +1061,7 @@ def _build_tx(rng, s, height, mtp, rate, ready, salt_ctr):
                       [carrier(0, e_reserve(nm), value=burn),
                        spend(1, r.seller, pay, r.seller_type)])
 
-    elif op == 8:  # SETTLE a reserved name (by its reserver)
+    elif op == 6:  # SETTLE a reserved name (by its reserver)
         res = _names_where(s, None, ST_RESERVED)
         if res:
             nm = res[rng.bounded(len(res))]
@@ -1155,7 +1072,7 @@ def _build_tx(rng, s, height, mtp, rate, ready, salt_ctr):
                       [carrier(0, e_settle(nm)),
                        spend(1, r.seller, rem, r.seller_type)])
 
-    elif op == 9:  # RELEASE owned names via a full bitmap
+    elif op == 7:  # RELEASE owned names via a full bitmap
         owned = s.owned_names_of(idb)
         if owned:
             flags = bytes([0xFF] * ((len(owned) + 7) // 8))
@@ -1164,7 +1081,7 @@ def _build_tx(rng, s, height, mtp, rate, ready, salt_ctr):
             if anchor <= height:
                 return _gen_one_in(i, [carrier(0, e_release(anchor, flags))])
 
-    elif op == 10:  # SELL_TO
+    elif op == 8:  # SELL_TO
         for nm in _names_where(s, idb, ST_OWNED):
             r = s.names[nm]
             if mtp + DIRECT_WINDOW + REORG_BUFFER <= r.lease_expiry:
@@ -1172,7 +1089,7 @@ def _build_tx(rng, s, height, mtp, rate, ready, salt_ctr):
                 buyer = gen_identity(rng.bounded(N_IDS))
                 return _gen_one_in(i, [carrier(0, e_sell_to(price, buyer, nm))])
 
-    elif op == 11:  # PAY an offered name (by its named buyer)
+    elif op == 9:  # PAY an offered name (by its named buyer)
         off = _names_where(s, None, ST_OFFERED)
         if off:
             nm = off[rng.bounded(len(off))]
@@ -1181,7 +1098,7 @@ def _build_tx(rng, s, height, mtp, rate, ready, salt_ctr):
             return tx(0, [vin_typed(buyer)],
                       [carrier(0, e_pay(nm)), spend(1, r.seller, r.price, r.seller_type)])
 
-    elif op == 12:  # TRADE two owned names between two ids
+    elif op == 10:  # TRADE two owned names between two ids
         mine = _names_where(s, idb, ST_OWNED)
         i2 = (i + 1 + rng.bounded(N_IDS - 1)) % N_IDS
         id2 = gen_identity(i2)
@@ -1192,20 +1109,13 @@ def _build_tx(rng, s, height, mtp, rate, ready, salt_ctr):
                 ins = [vin_typed(i), vin_typed(i2)]
                 return tx(0, ins, [carrier(0, e_trade(0, 1, a1, b1))])
 
-    elif op == 0:  # POST (optionally decorated if author owns a name)
-        body = b"post" + _base36(salt_ctr % 1000)
-        if _names_where(s, idb, -1) and rng.bounded(2) == 0:
-            rec = tlv(1 + rng.bounded(20), bytes([rng.bounded(256)]))
-            return _gen_one_in(i, [carrier(0, e_decorate(rec)),
-                                   carrier(1, body, value=1 + rng.bounded(50))])
-        return _gen_one_in(i, [carrier(0, body, value=1 + rng.bounded(50))])
-
-    # VOTE fallback (always valid): target a synthetic earlier post id
-    th = 0 if height == 0 else rng.bounded(height)
-    target = synthetic_txid(th, rng.bounded(8))
-    up = rng.bounded(2) == 0
-    return _gen_one_in(i, [carrier(0, e_vote(up, target, rng.bounded(4)),
-                                   value=1 + rng.bounded(1000))])
+    # COMMIT fallback (always valid)
+    j = rng.bounded(NAME_POOL)
+    name = _name_of(j)
+    salt = _salt_of(salt_ctr)
+    ready.append({"i": i, "name": name, "salt": salt,
+                  "commit_height": height, "commit_time": mtp})
+    return _gen_one_in(i, [carrier(0, e_commit(commitment_of(salt, name, idb)))])
 
 
 def record_chain(seed, count):
@@ -1301,37 +1211,32 @@ def _check_invariants(s, height, mtp):
     for mh in s.muts.values():
         if mh > height:                  # mutation height <= current height
             v += 1
-    if s.overflow:
-        v += 1
     return v
 
 
 def _fingerprint(buf, s):
+    """Pinned property fingerprint (names/market only; mirrors C harness)."""
     n_owned = n_listed = n_offered = n_reserved = 0
-    sum_lease = sum_price = sum_legs = sum_vote = 0
+    sum_lease = sum_price = sum_legs = 0
     for r in s.names.values():
         if r.st == ST_OWNED:
             n_owned += 1
         elif r.st == ST_LISTED:
             n_listed += 1
+            sum_price += r.price
         elif r.st == ST_OFFERED:
             n_offered += 1
+            sum_price += r.price
         elif r.st == ST_RESERVED:
             n_reserved += 1
-        sum_lease += r.lease_expiry
-        if r.st in (ST_LISTED, ST_RESERVED):
             sum_price += r.price
-        if r.st == ST_RESERVED:
             sum_legs += r.burn_leg + r.pay_leg
-    for score in s.votes.values():
-        sum_vote += score
+        sum_lease += r.lease_expiry
     for x in (len(s.names), n_owned, n_listed, n_offered, n_reserved,
-              len(s.commits), len(s.votes), len(s.muts),
-              sum(len(rv) for rv in s.decors.values())):
+              len(s.commits), len(s.muts)):
         buf += (x & 0xFFFFFFFF).to_bytes(4, "little")
-    for x in (sum_lease, sum_price, sum_legs, sum_vote):
+    for x in (sum_lease, sum_price, sum_legs):
         buf += (x & MASK128).to_bytes(16, "little")
-    buf += bytes([1 if s.overflow else 0])
     return buf
 
 
@@ -1351,15 +1256,14 @@ def run_properties(seed, count):
 
 
 def _inert_tx():
-    """A tx whose every carrier is provably IGNORE/dropped/orphaned by the fold:
-    zero-weight vote, malformed RENEW (decodes to IGNORE), orphan DECORATE,
-    zero-value POST (IGNORE). Applying it must leave state_digest unchanged."""
-    malformed_renew = bytes([0xFF, 0x50, 0x4E, OP_RENEW, 0x01, 0x02, 0x03])  # bl=3 -> IGNORE
+    """A tx whose every carrier is provably IGNORE by the fold (mirrors C harness):
+    malformed CLAIM, unknown opcode 0x20, bare UTF-8, overlay 0xD6.
+    Applying it must leave state_digest unchanged."""
     outs = [
-        carrier(0, e_vote(True, synthetic_txid(1, 0), 0), value=0),   # zero-weight vote -> dropped
-        carrier(1, malformed_renew, value=0),                         # decodes to IGNORE
-        carrier(2, e_decorate(tlv(3, b"\x09")), value=0),             # orphan DECORATE -> discarded
-        carrier(3, b"hi", value=0),                                   # zero-value POST -> IGNORE
+        carrier(0, bytes([0xFF, 0x50, 0x4E, OP_CLAIM, 0, 0, 0, 0]), value=0),  # truncated CLAIM
+        carrier(1, bytes([0xFF, 0x50, 0x4E, 0x20]), value=0),                   # unknown opcode
+        carrier(2, b"hello", value=1),                                          # bare UTF-8 noise
+        carrier(3, bytes([0xFF, 0x50, 0x4E, 0xD6, 0x00]), value=0),             # overlay band
     ]
     return tx(0, [vin_typed(0)], outs)
 
@@ -1437,13 +1341,15 @@ def run_reorg(seed, count):
 
 
 def _fuzz_grammar_payload(rng):
-    op = 1 + rng.bounded(15)
-    if op in (OP_VOTE_UP, OP_VOTE_DOWN):
-        body_len = 36
-    elif op == OP_COMMIT:
+    op = 1 + rng.bounded(15)                 # 0x01..0x0F
+    if op == OP_COMMIT:
         body_len = 32
     elif op == OP_CLAIM:
         body_len = 33 + rng.bounded(20)
+    elif op in (OP_RENEW_NAME, OP_RELEASE_NAME):
+        body_len = 1 + rng.bounded(20)
+    elif op == OP_TRANSFER_NAME:
+        body_len = 21 + rng.bounded(31)
     elif op == OP_RENEW:
         body_len = [0, 5, 6 + rng.bounded(71)][rng.bounded(3)]
     elif op == OP_TRANSFER:
@@ -1454,8 +1360,6 @@ def _fuzz_grammar_payload(rng):
         body_len = 1 + rng.bounded(20)
     elif op == OP_RELEASE:
         body_len = 6 + rng.bounded(71)
-    elif op == OP_DECORATE:
-        body_len = rng.bounded(77)
     elif op == OP_SELL_TO:
         body_len = 29 + rng.bounded(20)
     elif op == OP_AS:
@@ -1608,10 +1512,11 @@ def run_decode_demo():
         (e_commit(b"\x00" * 32), 0),
         (e_claim(SALT0, b"alice"), KOINU_PER_DOGE),
         (e_claim(SALT0, b"Alice"), KOINU_PER_DOGE),   # uppercase -> IGNORE
-        (b"hello world", 5),                          # text post
-        (b"hello world", 0),                          # zero-value -> IGNORE
-        (b"\xff\x53\x50\x99", 5),                     # bad opcode -> IGNORE
-        (b"\xff\xfe", 5),                             # invalid utf8, no prefix -> IGNORE
+        (e_claim(SALT0, b"-lead"), KOINU_PER_DOGE),   # leading hyphen -> IGNORE
+        (e_claim(SALT0, b"xn--x"), KOINU_PER_DOGE),   # ACE prefix -> IGNORE
+        (b"hello world", 5),                          # bare UTF-8 -> IGNORE
+        (b"\xff\x53\x50\x20", 5),                     # unknown opcode -> IGNORE
+        (b"\xff\x53\x50\xd6", 5),                     # overlay band -> IGNORE
     ]
     from wire import decode_payload
     for payload, val in cases:
@@ -1802,7 +1707,7 @@ def run_forkvectors():
 # The py port of impls/c `scenario`. Each builds a deterministic, named
 # construction and emits `name <digest>` (canonical §4 state digest) or
 # `name <u64>`; the rolling `combined` hash is the single-line cross-language
-# check. These pin the spec's named edge cases (§6) with auditable outcomes and
+# check. These pin the spec's named edge cases (§5) with auditable outcomes and
 # cover the rare branches the random soak almost never hits (deep displacement,
 # i128 accumulation past 2^64, the fee oracle).
 def run_scenario():
@@ -2038,27 +1943,6 @@ def run_scenario():
     f.apply(tx(1, [vin(0xAA), vin(0xBB)], [carrier(0, e_trade(0, 1, b"aaa", b"bbb"))]))  # anti-rug → drop
     emit_state("25_trade_rug_before", f)
 
-    f = minted(0xAA, b"bob", 300, 1500)
-    f.begin(12, 1600)
-    f.apply(tx(0, [vin(0xAA)], [carrier(0, e_decorate(tlv(7, b"reply"))), carrier(1, b"hello", value=1)]))  # owner → binds
-    f.apply(tx(1, [vin(0xCC)], [carrier(0, e_decorate(tlv(7, b"x"))), carrier(1, b"hello", value=1)]))      # nameless → drop
-    f.apply(tx(2, [vin(0xAA)], [carrier(0, e_decorate(tlv(7, b"orphan")))]))                                # orphan → drop
-    emit_state("26_decorate_gate", f)
-
-    f = F()
-    f.begin(100, 1000)
-    f.apply(tx(0, [vin(0xAA)], [carrier(0, e_vote(True, tgt(0x11), 0), value=5),
-                                carrier(1, e_vote(False, tgt(0x11), 0), value=2),
-                                carrier(2, e_vote(True, tgt(0x11), 0), value=0)]))
-    emit_state("27_vote_score", f)
-
-    # i128 accumulation past 2^64: three max-weight up-votes sum > 2^64 (a u64 impl wraps).
-    f = F()
-    f.begin(100, 1000)
-    for i in range(3):
-        f.apply(tx(i, [vin(0xAA)], [carrier(0, e_vote(True, tgt(0x11), 0), value=U64_MAX)]))
-    emit_state("28_vote_past_u64", f)
-
     # fee oracle (§3.4): signed under-claim clamp + participant filter + MIN_FEE_SAMPLE
     # degrade + lower-median + REF_SIZE scale + clamp. 4 participants < MIN_FEE_SAMPLE
     # ⇒ this small window now degrades to DUST_FLOOR (the big-window vectors are 49–51).
@@ -2139,13 +2023,6 @@ def run_scenario():
     f.begin(12, 865500)
     emit_state("36b_mtp_at_lapsed", f)
 
-    # 37: i128 vote accumulator past −2⁶⁴ (three max down-votes; two's-complement LE).
-    f = F()
-    f.begin(100, 1000)
-    for i in range(3):
-        f.apply(tx(i, [vin(0xAA)], [carrier(0, e_vote(False, tgt(0x11), 0), value=U64_MAX)]))
-    emit_state("37_vote_neg_past_u64", f)
-
     # ── pre-block ordering & intra-block market races ──
     # 38: a same-block RENEW-vs-CLAIM race at the exact lapse tie. The pre-block lapse
     #     returns `bob` to the pool BEFORE any tx runs, so A's renew-all renews only `keep`
@@ -2165,7 +2042,7 @@ def run_scenario():
     emit_state("38_lapse_renew_vs_claim", f)
 
     # 39: a single pre-block tick that crosses reserve_expiry AND offer_expiry at once,
-    #     cascading RESERVED→LISTED→OWNED in one pass (§6 type-order reserve→offer→lease).
+    #     cascading RESERVED→LISTED→OWNED in one pass (§5 type-order reserve→offer→lease).
     f = minted(0xAA, b"w", 300, 1500)                  # lease_expiry = 25,921,500
     f.begin(12, 1600)
     f.apply(tx(0, [vin(0xAA)], [carrier(0, e_sell(20000, 50000, b"w"))]))               # offer_expiry = 51600
@@ -2321,34 +2198,68 @@ def run_scenario():
     commit_then_claim(f, 0xAA, b"shib_p2p",                         0x74, 10, 4000, 16, 4500, 17)
     emit_state("52_charset", f)
 
-    # 53: §1 DECORATE pending-record cap (PEND_DECOR_MAX = 64, pinned 2026-07-03).
-    # Owner posts 65 decoration records (26+26+13) then a body: exactly 64 bind, the
-    # 65th drops. An impl that buffers unbounded binds 65 → a different digest, so this
-    # vector is what forces every port to adopt the cap.
-    def decorate_n(nrec):                        # DECORATE carrier: nrec empty TLVs, tags 1..nrec
-        raw = bytearray()
-        for i in range(nrec):
-            raw += bytes([i + 1, 0, 0])          # [tag=i+1][len_lo=0][len_hi=0]
-        return e_decorate(bytes(raw))
-    f = minted(0xAA, b"d", 10, 1500)
-    f.begin(12, 1600)
-    f.apply(tx(0, [vin(0xAA)], [
-        carrier(0, decorate_n(26)),
-        carrier(1, decorate_n(26)),
-        carrier(2, decorate_n(13)),              # 65 records pending → 64 bind
-        carrier(3, b"hello", value=100),         # body binds them (owner-signed)
-    ]))
-    emit_state("53_decor_pend_cap", f)
+    # 52b: structural name rejects — leading/trailing hyphen and xn-- ACE drop.
+    f = F()
+    commit_then_claim(f, 0xAA, b"-lead",  0x81, 10, 1000, 10, 1500, 11)
+    commit_then_claim(f, 0xAA, b"trail-", 0x82, 10, 2000, 12, 2500, 13)
+    commit_then_claim(f, 0xAA, b"xn--x",  0x83, 10, 3000, 14, 3500, 15)
+    commit_then_claim(f, 0xAA, b"ok-name",0x84, 10, 4000, 16, 4500, 17)
+    emit_state("52b_structural", f)
 
-    # 54: NO per-tx count cap (§0). One tx carries 17 VOTE carriers — past the historical
-    # 16 — plus 17 payee outs; all fold. An impl that caps at 16 either drops the tx or the
-    # 17th carrier → a different vote score. Proves the reference agrees with an unbounded impl.
+    # 54: NO per-tx count cap (§0). One tx carries 17 COMMIT carriers past the
+    # historical 16; all fold. An impl that caps at 16 drops the 17th → different digest.
     f = F()
     f.begin(10, 1000)
-    votes = [carrier(i, e_vote(True, tgt(0x55), 7), value=3) for i in range(17)]  # 17 up-votes ×3
-    payees = [out(i, A, 1) for i in range(17)]                                    # 17 payees
-    f.apply(tx(0, [vin(0xAA)], votes + payees))
+    commits = [carrier(i, e_commit(bytes([i]) + b"\x00" * 31)) for i in range(17)]
+    payees = [out(i, A, 1) for i in range(17)]
+    f.apply(tx(0, [vin(0xAA)], commits + payees))
     emit_state("54_no_txcap", f)
+
+    # 55: a name minted then RELEASEd earlier in the SAME block re-mints fresh on a
+    # later CLAIM in that block (§3.6 "immediately reclaimable"; row existence is
+    # authoritative, the block-local claim scratch never blocks a re-mint).
+    f = F()
+    f.begin(10, 1000)
+    f.apply(tx(0, [vin(0xAA)], [carrier(0, e_commit(commitment_of(salt(0x91), b"foo", A)))]))
+    f.begin(11, 1500)
+    f.apply(tx(0, [vin(0xAA)], [carrier(0, e_claim(salt(0x91), b"foo"), value=10)]))   # mint foo→A
+    f.apply(tx(1, [vin(0xAA)], [carrier(0, e_release(11, b"\x01"))]))                   # release foo
+    f.apply(tx(2, [vin(0xAA)], [carrier(0, e_claim(salt(0x91), b"foo"), value=10)]))    # re-mint foo→A
+    emit_state("55_claim_release_reclaim_sameblock", f)
+
+    # 55b: same, but the re-claim is by a DIFFERENT party B whose backing commit has
+    # LOWER priority than the departed A's — B still mints fresh (a released name's
+    # former owner priority is irrelevant once the row is gone).
+    f = F()
+    f.begin(10, 1000)
+    f.apply(tx(0, [vin(0xAA)], [carrier(0, e_commit(commitment_of(salt(0x91), b"foo", A)))]))
+    f.apply(tx(1, [vin(0xBB)], [carrier(0, e_commit(commitment_of(salt(0x92), b"foo", B)))]))
+    f.begin(11, 1500)
+    f.apply(tx(0, [vin(0xAA)], [carrier(0, e_claim(salt(0x91), b"foo"), value=10)]))    # A mints
+    f.apply(tx(1, [vin(0xAA)], [carrier(0, e_release(11, b"\x01"))]))                   # A releases
+    f.apply(tx(2, [vin(0xBB)], [carrier(0, e_claim(salt(0x92), b"foo"), value=10)]))    # B mints fresh
+    emit_state("55b_reclaim_by_other", f)
+
+    # 56: a self-transfer (TRANSFER-all whose target == the current owner) is a real
+    # move — it bumps last_set_mutation_height (owner's mut goes 11 → 12), NOT a no-op.
+    f = minted(0xAA, b"bar", 10, 1500)
+    f.begin(12, 1600)
+    f.apply(tx(0, [vin(0xAA)], [carrier(0, e_transfer_all(A))]))
+    emit_state("56_self_transfer_bumps_mut", f)
+
+    # 57: fee oracle with block_bytes == 0 — the /0 guard substitutes divisor 1 (NOT
+    # fee-per-byte 0), so the block still participates. 1000 blocks (== MIN_FEE_SAMPLE),
+    # each fee 5000 ⇒ per-byte 5000 ⇒ median 5000 × REF_SIZE 200 = 1_000_000.
+    emit_u64("57_oracle_zero_bytes", oracle_rate([(1_000_000_005_000, 0)] * 1000))
+
+    # 58: CLAIM burn near 2⁶⁴ at rate = DUST_FLOOR (1) — the lease day-count overflows
+    # 64 bits and clamps to MAX_LEASE (365 days): lease_expiry = 1500 + 365·86400.
+    f = F()
+    f.begin(10, 1000)
+    f.s.process_tx(tx(0, [vin(0xAA)], [carrier(0, e_commit(commitment_of(salt(0x95), b"foo", A)))]), 10, 1000, 1)
+    f.begin(11, 1500)
+    f.s.process_tx(tx(0, [vin(0xAA)], [carrier(0, e_claim(salt(0x95), b"foo"), value=U64_MAX)]), 11, 1500, 1)
+    emit_state("58_lease_clamp_huge_burn", f)
 
     print("combined %s" % _hashes.sha256(bytes(feeds)).hex())
     return 0

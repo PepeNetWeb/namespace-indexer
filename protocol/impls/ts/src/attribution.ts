@@ -1,7 +1,7 @@
 // §4 Stateless Identity & Attribution (SPEC-conformance.md §13). raw tx → per-input
 // {status, sighash, identity}. Everything that forks between languages is real byte logic; only the
 // two curve ops (on_curve / verify) are INJECTED stubs, exactly as §13 prescribes (NOT real
-// secp256k1). This is a separate surface from the §6 fold (which is fed already-resolved identity).
+// secp256k1). This is a separate surface from the §5 fold (which is fed already-resolved identity).
 //
 // status (§13): 0 classify-drop · 1 on-curve-drop · 2 verify-drop · 3 found.
 // The sighash+identity are emitted for status ≥ 1 (formed right after classification, before the
@@ -220,19 +220,24 @@ export function parseSig(sig: Bytes): { r: Bytes; s: Bytes } | null {
   // low-S: S ≤ N/2
   const sBig = beToBig(sig.subarray(sOff, sOff + lenS));
   if (sBig > SECP_N_HALF) return null;
-  return { r: leftPad32(sig.subarray(rOff, rOff + lenR)), s: leftPad32(sig.subarray(sOff, sOff + lenS)) };
+  const r32 = beToFixed32(sig.subarray(rOff, rOff + lenR));
+  const s32 = beToFixed32(sig.subarray(sOff, sOff + lenS));
+  if (r32 === null || s32 === null) return null; // R or S ≥ 2^256 → invalid
+  return { r: r32, s: s32 };
 }
 function beToBig(b: Bytes): bigint {
   let v = 0n;
   for (let i = 0; i < b.length; i++) v = (v << 8n) | BigInt(b[i]);
   return v;
 }
-function leftPad32(b: Bytes): Bytes {
-  // strip a single DER sign-pad zero, then left-pad to 32 bytes BE
+function beToFixed32(b: Bytes): Bytes | null {
+  // strip minimal DER sign-pad zeros, then left-pad to 32 bytes BE. An integer that
+  // does NOT fit in 32 bytes is rejected (null), NOT truncated to the low 32 bytes —
+  // truncation would forge a different scalar and diverges from C/Go (which reject).
   let start = 0;
   while (start < b.length - 1 && b[start] === 0x00) start++;
   const trimmed = b.subarray(start);
-  if (trimmed.length > 32) return trimmed.subarray(trimmed.length - 32);
+  if (trimmed.length > 32) return null;
   const out = new Uint8Array(32);
   out.set(trimmed, 32 - trimmed.length);
   return out;

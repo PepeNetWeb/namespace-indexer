@@ -1,13 +1,13 @@
-# pepenet-protocol
+# namespace-protocol
 
-Cross-language reference implementations of the pepenet protocol state machine
-(the §6 fold of [`docs/protocol-spec.md`](docs/protocol-spec.md)), built for
+Cross-language reference implementations of the PepeNet namespace state machine
+(the §5 fold of [`docs/protocol-spec.md`](docs/protocol-spec.md)), built for
 **headless conformance testing**: the same seed-driven action stream is
 regenerated and folded in every language, and they must all produce the
 byte-identical canonical digest.
 
 ```
-pepenet-protocol/
+namespace-protocol/
   docs/protocol-spec.md the protocol specification this state machine implements
   SPEC-conformance.md   the pinned contract (PRNG, integer widths, digest layout, generator)
   SPEC-RATIONALE.md     consolidated rationale for the consensus-critical decisions
@@ -46,7 +46,7 @@ reference; the rationale behind the consensus-critical decisions is consolidated
   regression).
 
 Go has no native 128-bit integer, so its wide computations (the deposit legs, the
-lease-day numerator, the i128 vote accumulator + property sums) use `math/bits` and
+lease-day numerator, and the property sums) use `math/bits` and
 a small two's-complement `i128` helper.
 
 ## The idea
@@ -54,7 +54,7 @@ a small two's-complement `i128` helper.
 Each implementation is one program: `sm random <seed> <count>` →
 
 ```
-seed → SplitMix64 → state-aware generator → the §6 fold → digest
+seed → SplitMix64 → state-aware generator → the §5 fold → digest
                           │                                  │
                           └ input_digest (hash of the         └ state_digest (hash of fold state)
                             generated tx stream)
@@ -78,7 +78,7 @@ cd impls/c && make test          # C self-test (130 unit checks: codec round-tri
 cd impls/c && make sanitize      # UBSan over every mode (signed-overflow / OOB / shift UB)
 cd impls/c && make cover         # assert every generator + decode branch is exercised
 ./impls/c/sm random 42 100000 --cov          # seed-driven soak + coverage report
-./impls/c/sm scenario                        # 51 named adversarial conformance vectors + combined digest
+./impls/c/sm scenario                        # named adversarial conformance vectors + combined digest
 ./impls/c/sm fuzz  42 100000 --cov           # differential fuzz: byte payloads → decode → fold (+coverage)
 ./impls/c/sm bfuzz 42 100000 --cov           # boundary-cluster fuzz: values snapped to the §-constants
 ./impls/c/sm properties 42 100000            # invariant battery + cross-language property_digest
@@ -97,9 +97,9 @@ python3 impls/py/sm.py fuzz 42 100000        # the Python oracle (arbitrary prec
 **Cross-language test layers**, each cross-checked byte-for-byte across every language:
 
 1. **`random`** — a seed-driven soak proving the fold *agrees* over millions of adversarial actions.
-2. **`scenario`** — 51 named, hand-authored edge cases with auditable outcomes: the spec's §6 corners
+2. **`scenario`** — named, hand-authored edge cases with auditable outcomes: the spec's §5 corners
    plus the rare branches the soak almost never hits (deep claim displacement, water-fill `T<count` /
-   all-cap forfeit, i128 accumulation past ±2⁶⁴, the fee oracle, **reorg edge-case pairs**, and the
+   all-cap forfeit, the fee oracle, **reorg edge-case pairs**, and the
    **pre-block ordering / intra-block market races** of 38–41: lapse-vs-renew-vs-claim ties, the
    reserve→offer pre-block cascade, RESERVE option-theft, and consume-once vout-order matching).
 3. **`fuzz`** / **`bfuzz`** — a real byte-level wire decoder (`decode.c`, the strict §1/§2/§3 fail-closed
@@ -109,7 +109,7 @@ python3 impls/py/sm.py fuzz 42 100000        # the Python oracle (arbitrary prec
    divergences hand-written vectors miss.
 4. **`properties`** — the soak stream with a hard invariant battery (conservation, no-double-ownership,
    boundary nesting) and a per-block `property_digest` — invariants *proven* across languages.
-5. **`reorg`** / **`reorgfuzz`** — the §6 reorg story made executable: replay, checkpoint-resume,
+5. **`reorg`** / **`reorgfuzz`** — the §5 reorg story made executable: replay, checkpoint-resume,
    clear-rebuild, and fork-and-return down a divergent branch — once at a fixed fork (`reorg`) and over
    64 PRNG-chosen fork/divergence trials per chain (`reorgfuzz`).
 6. **`meta`** — the metamorphic property that an *ignored* action is provably inert: inject an all-inert
@@ -122,7 +122,7 @@ python3 impls/py/sm.py fuzz 42 100000        # the Python oracle (arbitrary prec
    are **injected** as pinned pseudo-functions of the bytes (exactly as the fold injects identity), so
    the whole layer stays zero-dep and regenerate-from-seed. `attrib-scenario` also pins
    **FindAndDelete** cross-language with explicit KAT + load-bearing-sighash vectors (it is structurally
-   inert on the rigid template, so it would otherwise be omittable), and ships the **§3.10 wallet-preview
+   inert on the rigid template, so it would otherwise be omittable), and ships the **§3.9 wallet-preview
    vectors** (`raw tx → {per-input attribution; per-TRADE (give, get) per party}`) the spec mandates as a
    conformance artifact. Real ECDSA verification (the "B" phase) is deferred. See `SPEC-conformance.md` §13.
 
@@ -134,8 +134,7 @@ goldens of every mode.
 The chain is fully abstracted: identity is injected (`{h160, type, signs-SIGHASH_ALL}`),
 time (MTP) and the CLAIM/RENEW rate are injected per block, payments are a
 concrete output set. No headers, PoW, scripts, ECDSA, or sockets — see
-`SPEC-conformance.md`. §4 ECDSA attribution and the §5 off-chain layer are out of
-scope (the live client owns those).
+`SPEC-conformance.md`. §4 ECDSA attribution is out of scope (the live client owns it).
 
 ## Porting a new language
 

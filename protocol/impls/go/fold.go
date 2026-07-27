@@ -6,7 +6,7 @@ import (
 )
 
 // ---- abstract block/tx model fed to the fold ----
-// The §6 fold consumes already-resolved identities + decoded carriers (§9). §4
+// The §5 fold consumes already-resolved identities + decoded carriers (§9). §4
 // attribution is a separate shell (attrib.go). Identity carries (hash160, scriptType).
 
 type Identity struct {
@@ -41,7 +41,7 @@ type FoldBlock struct {
 	txs    []FoldTx
 }
 
-// applyBlock runs pre-block time transitions then the block's txs (§6).
+// applyBlock runs pre-block time transitions then the block's txs (§5).
 func (s *FoldState) applyBlock(b FoldBlock) {
 	s.curHeight = b.height
 	s.scratch = map[string]claimScratch{} // begin_block: reset, never digested
@@ -102,80 +102,50 @@ func (s *FoldState) sortedNameKeys() []string {
 	return keys
 }
 
-// §1 DECORATE pending-record cap: at most this many decoration records buffer
-// for the next body; records past the cap drop while parsing continues (pinned
-// SM_MAX_PEND_DECOR across all 7 impls).
-const pendDecorMax = 64
-
 // applyTx: a single forward pass over carriers in vout order with the acting
-// identity and a pending DECORATE buffer.
+// identity. Consensus classifies no content — only name-action carriers mutate state.
 func (s *FoldState) applyTx(b FoldBlock, tx FoldTx) {
 	var actor Identity
 	if len(tx.inputs) > 0 {
 		actor = tx.inputs[0]
 	}
-	var pending []DecorRow // buffered records (rec bytes + seq)
-	pendSeq := 0
 	consumed := make([]bool, len(tx.spend))
-
-	flushPending := func() { pending = nil }
 
 	for _, fc := range tx.carriers {
 		c := fc.c
-		switch c.kind {
-		case IGNORE:
-			// inert
-		case POST:
-			// text body: author = actor (if ok) or anonymous.
-			txid := makeSyntheticTxid(b.height, tx.txIndex)
-			if actor.ok && s.ownsAny(actor.h160) {
-				for i := range pending {
-					pending[i].txid = txid
-					pending[i].vout = fc.vout
-					s.decors = append(s.decors, pending[i])
-				}
-			}
-			flushPending() // body always clears the buffer
-		case ACTION:
-			op := c.opcode
-			// forward-only gate (§3.0)
-			if op >= 0x03 && op <= 0x0F && b.height < ACTIVATION_HEIGHT {
-				continue
-			}
-			switch op {
-			case OP_AS:
-				flushPending() // AS flushes buffer (orphan)
-				k := c.asIndex
-				if k >= 0 && k < len(tx.inputs) && tx.inputs[k].ok {
-					actor = tx.inputs[k]
-				} else {
-					actor = Identity{ok: false}
-				}
-				continue
-			case OP_TRADE:
-				// attributed to its own named inputs, NOT the acting identity.
-				s.dispatchTrade(b, tx, c)
-				continue
-			}
-			// every other op: requires a valid acting identity
-			if !actor.ok {
-				continue
-			}
-			s.dispatchAction(b, tx, &fc, actor, &pending, &pendSeq, consumed)
+		if c.kind != ACTION {
+			continue // IGNORE (or anything non-action)
 		}
+		op := c.opcode
+		// forward-only activation gate (§3.0): all ops gate at one height.
+		if b.height < ACTIVATION_HEIGHT {
+			continue
+		}
+		switch op {
+		case OP_AS:
+			k := c.asIndex
+			if k >= 0 && k < len(tx.inputs) && tx.inputs[k].ok {
+				actor = tx.inputs[k]
+			} else {
+				actor = Identity{ok: false}
+			}
+			continue
+		case OP_TRADE:
+			// attributed to its own named inputs, NOT the acting identity.
+			s.dispatchTrade(b, tx, c)
+			continue
+		}
+		// every other op: requires a valid acting identity
+		if !actor.ok {
+			continue
+		}
+		s.dispatchAction(b, tx, &fc, actor, consumed)
 	}
-	// end of tx: pending records with no following body → orphan, discarded
 }
 
-func (s *FoldState) dispatchAction(b FoldBlock, tx FoldTx, fc *FoldCarrier, actor Identity, pending *[]DecorRow, pendSeq *int, consumed []bool) {
+func (s *FoldState) dispatchAction(b FoldBlock, tx FoldTx, fc *FoldCarrier, actor Identity, consumed []bool) {
 	c := fc.c
 	switch c.opcode {
-	case OP_VOTE_UP, OP_VOTE_DOWN:
-		if fc.value < DUST_FLOOR {
-			return
-		}
-		s.applyVote(c.txid, c.vout, fc.value, c.opcode == OP_VOTE_UP)
-
 	case OP_COMMIT:
 		s.commits = append(s.commits, CommitRow{
 			commitment: c.commit, height: b.height, txIndex: tx.txIndex, commitTime: b.mtp,
@@ -193,6 +163,15 @@ func (s *FoldState) dispatchAction(b FoldBlock, tx FoldTx, fc *FoldCarrier, acto
 	case OP_RELEASE:
 		s.applyRelease(b, c, actor)
 
+	case OP_RENEW_NAME:
+		s.applyRenewName(b, fc, actor)
+
+	case OP_TRANSFER_NAME:
+		s.applyTransferName(b, c, actor)
+
+	case OP_RELEASE_NAME:
+		s.applyReleaseName(b, c, actor)
+
 	case OP_SELL:
 		s.applySell(b, c, actor)
 
@@ -207,34 +186,6 @@ func (s *FoldState) dispatchAction(b FoldBlock, tx FoldTx, fc *FoldCarrier, acto
 
 	case OP_PAY:
 		s.applyPay(b, tx, c, actor, consumed)
-
-	case OP_DECORATE:
-		recs := parseTLV(c.decRaw)
-		for _, rb := range recs {
-			if len(*pending) >= pendDecorMax {
-				break // §1 pending-record cap: records past 64 drop (parsing continues)
-			}
-			*pending = append(*pending, DecorRow{rec: rb, seq: *pendSeq})
-			*pendSeq++
-		}
-	}
-}
-
-func (s *FoldState) applyVote(target [32]byte, vout uint32, weight uint64, up bool) {
-	k := voteKey(target, vout)
-	v := s.votes[k]
-	if v == nil {
-		v = &VoteRow{target: target, vout: vout}
-		s.votes[k] = v
-	}
-	delta := i128FromU64(weight)
-	if !up {
-		delta = delta.neg()
-	}
-	ns, ov := v.score.addOverflow(delta)
-	v.score = ns
-	if ov {
-		s.overflow = true
 	}
 }
 
