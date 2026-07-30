@@ -9,3 +9,4 @@ build/
 test_db
 test_sync
 test_codec
+test_serve

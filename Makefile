@@ -91,14 +91,21 @@ test_sync: $(TEST_SRCS) src/test_sync.c $(SECPLIB)
 test_codec: $(TEST_SRCS) src/test_codec.c $(SECPLIB)
 	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ $(TEST_SRCS) src/test_codec.c $(LIBS)
 
-# `make check` = the three suites. Run `make test` for the shipped selftest.
+# test_serve covers src/serve_store.c — the peer-facing getheaders/getblocks/
+# getdata cache + the blockstage mailbox — which no other suite touches. It
+# needs only serve_store.c and sqlite, so it links its own tiny composition
+# rather than the full indexer object set.
+test_serve: src/test_serve.c src/serve_store.c src/serve_store.h
+	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ src/test_serve.c src/serve_store.c $(SQLITE_LIBS)
+
+# `make check` = the four suites. Run `make test` for the shipped selftest.
 # Every suite runs even if an earlier one fails; the target fails if any did.
-check: test_db test_sync test_codec
-	@rc=0; for t in ./test_db ./test_sync ./test_codec; do \
+check: test_db test_sync test_codec test_serve
+	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve; do \
 	  echo "=== $$t ==="; $$t || rc=1; done; \
 	if [ $$rc -eq 0 ]; then echo "check: ALL PASSED"; else echo "check: FAILED"; fi; exit $$rc
 
 check-clean:
-	rm -f test_db test_sync test_codec
+	rm -f test_db test_sync test_codec test_serve
 
 .PHONY: check check-clean
