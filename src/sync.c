@@ -1177,6 +1177,7 @@ static int cmd_sync(int argc, char **argv) {
             fprintf(stderr, "  %s:%u handshake failed\n", host, port);
             close(fd); fd = -1; continue;
         }
+        if (idx_sync_peer_height > 0) idx_db_set_peer_height(db, idx_sync_peer_height);
         net_peer_str(fd, picked, sizeof picked);
         idx_db_peer_seen(db, picked, (int64_t)idx_sync_peer_services,
                          (const char *)idx_sync_peer_agent, (int64_t)time(NULL));
@@ -1208,6 +1209,7 @@ static int cmd_sync(int argc, char **argv) {
         snprintf(picked, sizeof picked, "%s", fb_picked);
         idx_sync_peer_height = fb_h; idx_sync_peer_services = (uint64_t)fb_svc;
         snprintf((char *)idx_sync_peer_agent, sizeof idx_sync_peer_agent, "%s", fb_agent);
+        if (idx_sync_peer_height > 0) idx_db_set_peer_height(db, idx_sync_peer_height);
         fprintf(stderr, "  no archive peer reachable — using limited peer %s\n", picked);
     }
     if (fb_fd >= 0) close(fb_fd);

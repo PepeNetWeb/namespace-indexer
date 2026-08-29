@@ -21,6 +21,10 @@ void     idx_db_close(sqlite3 *db);
 // sync cursor (height + tip hash, wire order) and activation height.
 void idx_db_save_sync(sqlite3 *db, int64_t height, const uint8_t tip_hash[32]);
 int  idx_db_load_sync(sqlite3 *db, int64_t *height, uint8_t tip_hash[32]);   // 1 if present
+// last observed peer start_height from a version handshake — the fail-closed
+// error page (and anything else in another process) reads this; 0 if never seen
+void    idx_db_set_peer_height(sqlite3 *db, int64_t h);
+int64_t idx_db_get_peer_height(sqlite3 *db);
 void idx_db_set_activation(sqlite3 *db, int64_t activation);
 int64_t idx_db_get_activation(sqlite3 *db, int64_t dflt);
 void    idx_db_set_subsidy(sqlite3 *db, int64_t subsidy_koinu);
