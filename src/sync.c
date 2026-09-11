@@ -446,6 +446,8 @@ static int net_recv(int fd, const uint8_t magic[4], char cmd_out[13], uint8_t **
     if (l > 32 * 1024 * 1024) return -1;
     uint8_t *buf = malloc(l ? l : 1);
     if (l && !read_n(fd, buf, l, timeout_ms)) { free(buf); return 0; }
+    uint8_t ck[32]; idx_sha256d(l ? buf : (const uint8_t *)"", l, ck);
+    if (memcmp(hdr + 20, ck, 4) != 0) { free(buf); return -1; }
     *payload = buf; *len = l; return 1;
 }
 // Resolve `host` (name or literal) and connect to the first address that
@@ -550,10 +552,16 @@ static int ver_nonce(const uint8_t *pl, uint32_t pln, uint64_t *out) {
 static char g_self_ip[INET_ADDRSTRLEN] = "";
 // Record our external ip from a received version payload, if it carries a plausible
 // non-local IPv4 in addr_recv (0xFFFF-mapped at offset 38, quad at 40).
+static int ipv4_globally_routable(unsigned a, unsigned b) {
+    if (!a || a == 127 || a == 10 || a >= 224) return 0;
+    if (a == 169 && b == 254) return 0;
+    if (a == 172 && b >= 16 && b <= 31) return 0;
+    if (a == 192 && b == 168) return 0;
+    return 1;
+}
 static void learn_self_ip(const uint8_t *pl, uint32_t pln) {
     if (pln < 46 || pl[38] != 0xFF || pl[39] != 0xFF) return;
-    unsigned a = pl[40];
-    if (!a || a == 127 || a == 10) return;
+    if (!ipv4_globally_routable(pl[40], pl[41])) return;
     snprintf(g_self_ip, sizeof g_self_ip, "%u.%u.%u.%u", pl[40], pl[41], pl[42], pl[43]);
 }
 // serve-loop `self` ("ip:port") is the address we advertise. Keep g_self_ip
@@ -1392,6 +1400,9 @@ invalid_peer:
 // persisted dnet pool — the startup re-dial target. Well under SERVE_MAX_CONN so
 // inbound + chain dial_peers keep ample room.
 #define MESH_DIAL_SEATS 8
+// inbound mesh_handle cap: the mark is a self-asserted user-agent, so a botnet
+// of /pepenet- inbound must not fill SERVE_MAX_CONN and starve outbound seats.
+#define MESH_INBOUND_MAX 16
 // one failure-backoff window for every outbound seat kind (mesh + chain): a
 // failed dial stamps last_try and the addr sits out this long before any
 // topup offers it again (Core's GetChance decay, flattened to one step)
@@ -1666,11 +1677,14 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
     // otherwise getdata/dnaddr/getaddr are a pre-auth bandwidth amp.
     if (!c->up && strcmp(cmd, "version") && strcmp(cmd, "verack")) return;
     if (!strcmp(cmd, "version")) {
+        // a second version on a live conn must not flip the agent to /pepenet-
+        // and steal a mesh slot
+        if (c->up) return;
         // learn our own address from their addr_recv (the ip THEY dialed) —
         // paired with our listen port, this is what we advertise as self
         if (!*self && pln >= 46 && pl[38] == 0xFF && pl[39] == 0xFF) {
             unsigned a = pl[40];
-            if (a && a != 127 && a != 10) {
+            if (ipv4_globally_routable(a, pl[41]) && c->outbound) {
                 snprintf(self, 80, "%u.%u.%u.%u:%u", pl[40], pl[41], pl[42], pl[43], port);
                 note_self_host(self);
                 learn_self_ip(pl, pln);
@@ -1715,7 +1729,14 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         if (mesh && mesh->peer_up && !c->mesh_handle && AGENT_MARKED(c->agent)) {
             char ip[80]; snprintf(ip, sizeof ip, "%s", c->peer);
             { char *col = strrchr(ip, ':'); if (col) *col = 0; }
-            if (!mesh_on_host(conns, c, ip[0] ? ip : c->hip))
+            int in_mesh = 0;
+            if (!c->outbound) {
+                for (int i = 0; i < SERVE_MAX_CONN; i++)
+                    if (conns[i].fd >= 0 && !conns[i].outbound && conns[i].mesh_handle)
+                        in_mesh++;
+            }
+            if ((c->outbound || in_mesh < MESH_INBOUND_MAX) &&
+                !mesh_on_host(conns, c, ip[0] ? ip : c->hip))
                 c->mesh_handle = mesh->peer_up(mesh->ud, c, serve_mesh_send);
         }
         // overlay discovery (mesh-independent): solicit this marked peer's
@@ -1934,8 +1955,7 @@ static int serve_dial(const char *host, uint16_t port, const Coin *coin,
             if (ver_nonce(pl, pn, &vn) && vn == self_nonce()) is_self = 1;
             if (pn >= 12 && services_out) { uint64_t sv = 0; for (int b = 0; b < 8; b++) sv |= (uint64_t)pl[4+b] << (8*b); *services_out = (int64_t)sv; }
             if (self && lport && !*self && pn >= 46 && pl[38] == 0xFF && pl[39] == 0xFF) {
-                unsigned a = pl[40];
-                if (a && a != 127 && a != 10)
+                if (ipv4_globally_routable(pl[40], pl[41]))
                     snprintf(self, 80, "%u.%u.%u.%u:%u", pl[40], pl[41], pl[42], pl[43], lport);
             }
             uint64_t off = 4+8+8+26+26+8, ua;
@@ -2007,6 +2027,7 @@ static void seat_point(SConn *c, const char *host, uint16_t rp) {
     if (inet_pton(AF_INET, host, a4) == 1 || inet_pton(AF_INET6, host, &a6) == 1)
         snprintf(c->hip, sizeof c->hip, "%s", host);
 }
+static int same_group16(const char *a, const char *b);   /* eclipse: one outbound /16 */
 // Keep up to `target` outbound slots pointed at overlay peers from the persisted
 // dnet pool. This is BOTH the startup re-dial (a returning node re-embeds into
 // the mesh from its own memory) and the live reaction to freshly-gossiped
@@ -2038,6 +2059,11 @@ static void mesh_seat_topup(SConn *conns, sqlite3 *db, const Coin *coin, int tar
         // build) live until the TTL prune — without this they get re-seated every
         // tick, and the dial loop's drop leaves the seat free for the same row.
         if (host_is_self(host, self)) continue;
+        int clash = 0;
+        for (int k = 0; k < SERVE_MAX_CONN && !clash; k++)
+            if (conns[k].mesh_seat && conns[k].host[0] && same_group16(conns[k].host, host))
+                clash = 1;
+        if (clash) continue;
         memset(&conns[slot], 0, sizeof conns[slot]);
         conns[slot].fd = -1; conns[slot].outbound = 1; conns[slot].mesh_seat = 1;
         seat_point(&conns[slot], host, rp);
@@ -2473,6 +2499,8 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                 uint32_t plen = (uint32_t)h[16] | (uint32_t)h[17] << 8 | (uint32_t)h[18] << 16 | (uint32_t)h[19] << 24;
                 if (plen > SERVE_MSG_MAX) { serve_drop(c, mesh); dead = 1; break; }
                 if (c->len - off < 24u + plen) break;
+                uint8_t ck[32]; idx_sha256d(plen ? h + 24 : (const uint8_t *)"", plen, ck);
+                if (memcmp(h + 20, ck, 4) != 0) { serve_drop(c, mesh); dead = 1; break; }
                 char cmd[13]; memcpy(cmd, h + 4, 12); cmd[12] = 0;
                 serve_dispatch(c, conns, coin, db, ss, services, cmd, h + 24, plen, self, port, mesh);
                 if (c->fd < 0) { dead = 1; break; }   // dispatch dropped us
