@@ -1624,6 +1624,8 @@ static void serve_announce_self(const SConn *c, const Coin *coin,
     fprintf(stderr, "serve: announced self %s to %s\n", self, c->peer);
 }
 
+static int mesh_on_host(SConn *conns, const SConn *except, const char *host);
+
 static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db, ServeStore *ss,
                            int64_t services, const char *cmd, uint8_t *pl, uint32_t pln,
                            char self[80], uint16_t port, const IdxMeshHooks *mesh) {
@@ -1654,9 +1656,15 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         }
         net_send(c->fd, coin->magic, "verack", NULL, 0);
         c->up = 1;
-        // a marked peer + a mesh embedder → hand it up so the carrier gossips
-        if (mesh && mesh->peer_up && !c->mesh_handle && AGENT_MARKED(c->agent))
-            c->mesh_handle = mesh->peer_up(mesh->ud, c, serve_mesh_send);
+        // a marked peer + a mesh embedder → hand it up so the carrier gossips.
+        // One mesh slot per host: a second inbound (sync pass / NAT) to an IP
+        // that already gossips would send_inv_all again and double the storm.
+        if (mesh && mesh->peer_up && !c->mesh_handle && AGENT_MARKED(c->agent)) {
+            char ip[80]; snprintf(ip, sizeof ip, "%s", c->peer);
+            { char *col = strrchr(ip, ':'); if (col) *col = 0; }
+            if (!mesh_on_host(conns, c, ip[0] ? ip : c->hip))
+                c->mesh_handle = mesh->peer_up(mesh->ud, c, serve_mesh_send);
+        }
         // overlay discovery (mesh-independent): solicit this marked peer's
         // overlay peer list, once per connection
         if (!c->dn_asked && AGENT_MARKED(c->agent)) {
@@ -1891,6 +1899,20 @@ static int serve_dial(const char *host, uint16_t port, const Coin *coin,
 // CNetAddr): if a peer is connected — EITHER direction — we don't also dial
 // it. That's what keeps an outbound-only (NAT'd) peer that dialed us in from
 // being redialed forever off its own dnaddr self-announce.
+// 1 iff another live conn to this host already carries the mesh (peer_up).
+// Extra sockets to the same IP (sync-pass inbound while a mesh seat is parked)
+// must not each get a gossip slot — that multiplied dnzinv/dnzdat storms.
+static int mesh_on_host(SConn *conns, const SConn *except, const char *host) {
+    if (!host || !*host) return 0;
+    size_t hl = strlen(host);
+    for (int i = 0; i < SERVE_MAX_CONN; i++) {
+        SConn *c = &conns[i];
+        if (c == except || c->fd < 0 || !c->mesh_handle) continue;
+        if (c->hip[0] && !strcmp(c->hip, host)) return 1;
+        if (c->peer[0] && !strncmp(c->peer, host, hl) && c->peer[hl] == ':') return 1;
+    }
+    return 0;
+}
 static int conn_host_live(SConn *conns, const SConn *except, const char *host) {
     for (int i = 0; i < SERVE_MAX_CONN; i++) {
         SConn *c = &conns[i];
@@ -2279,7 +2301,8 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                 }
                 fprintf(stderr, "serve: dialed %s (agent %s)%s%s\n", c->peer, agent,
                         c->mesh_seat ? "  [mesh]" : "", c->chain_seat ? "  [chain]" : "");
-                if (mesh && mesh->peer_up && !c->mesh_handle && is_dn)
+                if (mesh && mesh->peer_up && !c->mesh_handle && is_dn &&
+                    !mesh_on_host(conns, c, pip))
                     c->mesh_handle = mesh->peer_up(mesh->ud, c, serve_mesh_send);
                 if (!c->dn_asked && is_dn) {          // solicit its overlay peer list
                     net_send(fd, coin->magic, "dngetaddr", NULL, 0);
