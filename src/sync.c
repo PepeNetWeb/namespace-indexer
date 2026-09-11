@@ -1662,6 +1662,9 @@ static int mesh_on_host(SConn *conns, const SConn *except, const char *host);
 static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db, ServeStore *ss,
                            int64_t services, const char *cmd, uint8_t *pl, uint32_t pln,
                            char self[80], uint16_t port, const IdxMeshHooks *mesh) {
+    // nothing but the handshake until both version and verack have landed —
+    // otherwise getdata/dnaddr/getaddr are a pre-auth bandwidth amp.
+    if (!c->up && strcmp(cmd, "version") && strcmp(cmd, "verack")) return;
     if (!strcmp(cmd, "version")) {
         // learn our own address from their addr_recv (the ip THEY dialed) —
         // paired with our listen port, this is what we advertise as self
@@ -1732,8 +1735,13 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
     } else if (!strcmp(cmd, "verack")) {
         c->up = 1;
     } else if (!strcmp(cmd, "dngetaddr")) {
-        serve_send_dnaddr(c, coin, db, self, port);          // answer with our pepenet peers
+        // overlay addr gossip is not chain-authenticated. Only a marked peer
+        // (the same gate as mesh_handle) may ask or vouch — a random
+        // pepetoshi otherwise poisons dnet=1 and we re-gossip the poison.
+        if (!AGENT_MARKED(c->agent)) return;
+        serve_send_dnaddr(c, coin, db, self, port);
     } else if (!strcmp(cmd, "dnaddr")) {
+        if (!AGENT_MARKED(c->agent)) return;
         int n = addr_harvest(db, pl, pln, 1);                // vouched pepenet peers → dnet pool
         if (!c->got_dnaddr || n != c->last_dnaddr_n) {
             fprintf(stderr, "serve: dnaddr %d overlay peer(s) from %s\n", n, c->peer);
