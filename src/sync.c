@@ -672,13 +672,14 @@ static int cand_add(char (*cand)[80], int n, int max, const char *s) {
 // pass draws on, and slice 2's crawl frontier. Bounds-checked like inv (peer bytes).
 // `dnet`: this came over dnaddr (a pepenet peer vouched for these) → mark the rows
 // so the overlay dialer re-seats from them; plain chain addr passes dnet=0.
-static void addr_harvest(sqlite3 *db, const uint8_t *pl, uint32_t pl_len, int dnet) {
-    if (!db || pl_len < 1) return;
+static int addr_harvest(sqlite3 *db, const uint8_t *pl, uint32_t pl_len, int dnet) {
+    if (!db || pl_len < 1) return 0;
     uint32_t po = 0; uint64_t cnt = pl[po++];
-    if (cnt == 0xFD) { if (pl_len < 3) return; cnt = pl[po] | ((uint64_t)pl[po+1] << 8); po += 2; }
-    else if (cnt >= 0xFE) return;
+    if (cnt == 0xFD) { if (pl_len < 3) return 0; cnt = pl[po] | ((uint64_t)pl[po+1] << 8); po += 2; }
+    else if (cnt >= 0xFE) return 0;
     if (cnt > 1000) cnt = 1000;                  // MAX_ADDR_TO_SEND
     int64_t now = (int64_t)time(NULL);
+    int kept = 0;
     for (uint64_t i = 0; i < cnt && po + 30 <= pl_len; i++, po += 30) {
         const uint8_t *e = pl + po;
         int64_t svc = 0; for (int b = 0; b < 8; b++) svc |= (int64_t)e[4 + b] << (8 * b);
@@ -697,7 +698,9 @@ static void addr_harvest(sqlite3 *db, const uint8_t *pl, uint32_t pl_len, int dn
         if (addr_is_self(addr)) continue;
         if (dnet) idx_db_peer_dnet_note(db, addr, svc, now);
         else      idx_db_peer_note(db, addr, svc, now);
+        kept++;
     }
+    return kept;
 }
 
 // ── block validation (peer bytes are hostile until proven) ───────────────────
@@ -1384,6 +1387,10 @@ invalid_peer:
 // failed dial stamps last_try and the addr sits out this long before any
 // topup offers it again (Core's GetChance decay, flattened to one step)
 #define DIAL_RETRY_S    600
+// re-ask a live marked peer for its overlay list this often. Handshake sends
+// one dngetaddr; without a refresh the dnet pool freezes at that first answer
+// and newly-discovered mesh peers never get a seat.
+#define DNADDR_REFRESH_S 60
 // liveness: a conn that never handshakes is cut at SHAKE; an established conn
 // quiet past PING gets pinged; silent past DEAD it's dropped (Core: 2 min ping
 // interval / 20 min timeout — tightened for a desktop node whose Peers page
@@ -1421,6 +1428,7 @@ typedef struct {
     time_t last_rx;                   // last byte received (liveness clock)
     time_t last_ping;                 // last ping we originated (idle probe)
     time_t last_pull;                 // last mesh getblocks we sent (tip pull)
+    time_t last_dnget;                // last dngetaddr we sent (overlay refresh)
     char agent[128];                  // peer subver ("/pepenet-" ⇒ a mesh peer)
     int64_t peer_h;                   // peer's claimed start_height at handshake (0 unknown)
     void *mesh_handle;                // embedder's per-peer handle (NULL till peer_up)
@@ -1444,6 +1452,7 @@ static void sconn_reset(SConn *c) {   // wipe transient state, keep outbound red
     c->fd = -1; c->buf = NULL; c->len = c->cap = 0; c->up = c->sent_ver = 0;
     c->peer[0] = 0; c->agent[0] = 0; c->hip[0] = 0; c->peer_h = 0; c->mesh_handle = NULL; c->dn_asked = 0; c->mesh_seat = 0;
     c->self_sent = 0; c->chain_seat = 0; c->last_rx = 0; c->last_ping = 0; c->last_pull = 0;
+    c->last_dnget = 0;
     c->outbound = ob; if (ob) { c->mesh_seat = ms; c->chain_seat = cs; memcpy(c->host, host, sizeof c->host); memcpy(c->hip, hip, sizeof c->hip); c->rport = rp; c->redial_at = time(NULL) + 15; }
 }
 // close + notify the mesh (peer_down) if this was a live mesh peer
@@ -1656,6 +1665,10 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         }
         net_send(c->fd, coin->magic, "verack", NULL, 0);
         c->up = 1;
+        if (!c->outbound)
+            fprintf(stderr, "serve: inbound %s (agent %s)%s\n", c->peer,
+                    c->agent[0] ? c->agent : "(none)",
+                    AGENT_MARKED(c->agent) ? "  [mesh]" : "");
         // a marked peer + a mesh embedder → hand it up so the carrier gossips.
         // One mesh slot per host: a second inbound (sync pass / NAT) to an IP
         // that already gossips would send_inv_all again and double the storm.
@@ -1666,10 +1679,13 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
                 c->mesh_handle = mesh->peer_up(mesh->ud, c, serve_mesh_send);
         }
         // overlay discovery (mesh-independent): solicit this marked peer's
-        // overlay peer list, once per connection
+        // overlay peer list. Handshake fires immediately; the serve loop
+        // re-asks every DNADDR_REFRESH_S so a peer that later learns more
+        // names actually grows our dnet pool.
         if (!c->dn_asked && AGENT_MARKED(c->agent)) {
             net_send(c->fd, coin->magic, "dngetaddr", NULL, 0);
             c->dn_asked = 1;
+            c->last_dnget = time(NULL);
         }
         // self-announcement (see serve_announce_self) — once per connection
         if (port && *self && !c->self_sent) {
@@ -1681,7 +1697,8 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
     } else if (!strcmp(cmd, "dngetaddr")) {
         serve_send_dnaddr(c, coin, db, self, port);          // answer with our pepenet peers
     } else if (!strcmp(cmd, "dnaddr")) {
-        addr_harvest(db, pl, pln, 1);                        // vouched pepenet peers → dnet pool
+        int n = addr_harvest(db, pl, pln, 1);                // vouched pepenet peers → dnet pool
+        fprintf(stderr, "serve: dnaddr %d overlay peer(s) from %s\n", n, c->peer);
     } else if (!strncmp(cmd, "dn", 2) && cmd[2] && mesh && mesh->peer_msg && c->mesh_handle) {
         mesh->peer_msg(mesh->ud, c->mesh_handle, cmd + 2, pl, (int)pln);   // carrier dn* command
     } else if (!strcmp(cmd, "ping")) {
@@ -1702,7 +1719,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         net_send(c->fd, coin->magic, "addr", out, o);
         free(out); free(rows);
     } else if (!strcmp(cmd, "addr")) {
-        addr_harvest(db, pl, pln, 0);
+        addr_harvest(db, pl, pln, 0);   // chain addr gossip — no overlay mark
     } else if (!strcmp(cmd, "getheaders") && ss) {
         // version(4) + varint nloc + nloc*32 locator (newest→oldest) + hash_stop(32)
         if (pln < 5) return;
@@ -1855,9 +1872,12 @@ static int serve_dial(const char *host, uint16_t port, const Coin *coin,
     serve_send_version(fd, coin, our_h, services);
     agent_out[0] = 0; if (services_out) *services_out = 0; if (height_out) *height_out = 0;
     int gv = 0, gvk = 0, is_self = 0;
-    for (int i = 0; i < 12 && !(gv && gvk) && !is_self; i++) {
+    // version+verack arrive immediately on a live peer. 12×8s used to freeze
+    // the serve thread for 96s on a TCP-accepting blackhole (and mesh_seat_topup
+    // used to queue eight of those in one tick).
+    for (int i = 0; i < 5 && !(gv && gvk) && !is_self; i++) {
         char cmd[13]; uint8_t *pl; uint32_t pn;
-        int r = net_recv(fd, coin->magic, cmd, &pl, &pn, 8000);
+        int r = net_recv(fd, coin->magic, cmd, &pl, &pn, 3000);
         if (r != 1) { if (r == -1) continue; close(fd); return -1; }
         if (!strcmp(cmd, "version")) {
             gv = 1;
@@ -1941,23 +1961,24 @@ static void seat_point(SConn *c, const char *host, uint16_t rp) {
 // Keep up to `target` outbound slots pointed at overlay peers from the persisted
 // dnet pool. This is BOTH the startup re-dial (a returning node re-embeds into
 // the mesh from its own memory) and the live reaction to freshly-gossiped
-// dnaddr peers. Idempotent: seats only addrs not already connected/seated, only
-// into free (fd<0, non-outbound) slots. Newly seated slots dial on the next tick.
+// dnaddr peers. ONE candidate per tick — same discipline as chain_topup:
+// serve_dial is blocking on this thread, and seating a swamp of dead vouched
+// addrs at once stalled gossip and hid new discoveries behind minutes of
+// connect/handshake timeouts.
 static void mesh_seat_topup(SConn *conns, sqlite3 *db, const Coin *coin, int target,
                             const char *self) {
-    int seated = 0;
-    for (int i = 0; i < SERVE_MAX_CONN; i++) if (conns[i].mesh_seat) seated++;
-    if (seated >= target) return;
+    int seated = 0, slot = -1;
+    for (int i = 0; i < SERVE_MAX_CONN; i++) {
+        if (conns[i].mesh_seat) seated++;
+        else if (slot < 0 && conns[i].fd < 0 && !conns[i].outbound) slot = i;
+    }
+    if (seated >= target || slot < 0) return;
     // pool query excludes rows in failure backoff — a mesh addr whose dial just
     // failed (e.g. an outbound-only peer announcing a port it can't serve) sits
     // out DIAL_RETRY_S instead of being re-seated on the very next tick
     char pool[64][80];
     int n = idx_db_peers_dnet(db, pool, 64, (int64_t)time(NULL) - DIAL_RETRY_S);
-    for (int i = 0; i < n && seated < target; i++) {
-        int slot = -1;
-        for (int s = 0; s < SERVE_MAX_CONN; s++)
-            if (conns[s].fd < 0 && !conns[s].outbound) { slot = s; break; }
-        if (slot < 0) break;                              // no room — inbound has priority
+    for (int i = 0; i < n; i++) {
         char host[80]; uint16_t rp; peer_split(pool[i], host, sizeof host, &rp, coin->port);
         // one connection per host, either direction: a peer already connected
         // (a NAT'd node that dialed US in) or already seated is never dialed again
@@ -1970,7 +1991,8 @@ static void mesh_seat_topup(SConn *conns, sqlite3 *db, const Coin *coin, int tar
         memset(&conns[slot], 0, sizeof conns[slot]);
         conns[slot].fd = -1; conns[slot].outbound = 1; conns[slot].mesh_seat = 1;
         seat_point(&conns[slot], host, rp);
-        seated++;
+        fprintf(stderr, "serve: seating mesh %s:%u\n", host, rp);
+        return;
     }
 }
 
@@ -2202,6 +2224,16 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
             next_dial = now + 5;
             // pick up pepenet peers learned via dnaddr since the last tick
             mesh_seat_topup(conns, db, coin, MESH_DIAL_SEATS, self);
+            // re-ask live marked peers so the dnet pool tracks their view, not
+            // just the handshake-time snapshot
+            for (int i = 0; i < SERVE_MAX_CONN; i++) {
+                SConn *pc = &conns[i];
+                if (pc->fd < 0 || !pc->up || !AGENT_MARKED(pc->agent)) continue;
+                if (pc->last_dnget && now - pc->last_dnget < DNADDR_REFRESH_S) continue;
+                net_send(pc->fd, coin->magic, "dngetaddr", NULL, 0);
+                pc->dn_asked = 1;
+                pc->last_dnget = now;
+            }
             // and keep ~8 outbound chain peers seated addrman-style
             chain_topup(conns, db, coin, self);
             for (int i = 0; i < SERVE_MAX_CONN; i++) {
@@ -2307,6 +2339,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                 if (!c->dn_asked && is_dn) {          // solicit its overlay peer list
                     net_send(fd, coin->magic, "dngetaddr", NULL, 0);
                     c->dn_asked = 1;
+                    c->last_dnget = now;
                 }
                 // self-announcement (see serve_announce_self) — once per connection
                 if (port && *self && !c->self_sent) {
