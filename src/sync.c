@@ -556,6 +556,15 @@ static void learn_self_ip(const uint8_t *pl, uint32_t pln) {
     if (!a || a == 127 || a == 10) return;
     snprintf(g_self_ip, sizeof g_self_ip, "%u.%u.%u.%u", pl[40], pl[41], pl[42], pl[43]);
 }
+// serve-loop `self` ("ip:port") is the address we advertise. Keep g_self_ip
+// in lockstep so addr_harvest / addr_is_self see it even when pepenet
+// versions leave addr_recv empty.
+static void note_self_host(const char *self) {
+    if (!self || !*self) return;
+    char sip[64]; snprintf(sip, sizeof sip, "%s", self);
+    { char *c = strrchr(sip, ':'); if (c) *c = 0; }
+    if (sip[0]) snprintf(g_self_ip, sizeof g_self_ip, "%s", sip);
+}
 // True when `host` resolves to the IPv4 we advertise as ourselves. `self` is the
 // serve loop's own learned addr ("ip:port", from an inbound peer); if it's NULL
 // or empty we fall back to g_self_ip (learned by whichever thread first reached
@@ -1523,13 +1532,17 @@ volatile int64_t idx_serve_stage_seq = 0;   // indexer.h — bumps per newly sta
 // push/pull, stage-side reorgs, mempool inv relay).
 int idx_serve_peer_held(const char *target) {
     if (!target || !*target) return 0;
+    char host[80]; snprintf(host, sizeof host, "%s", target);
+    char *col = strrchr(host, ':');
+    if (col && col[1] && strspn(col + 1, "0123456789") == strlen(col + 1)) *col = 0;
+    size_t hl = strlen(host);
     IdxServeConn c[SERVE_MAX_CONN];
     int n = idx_serve_conns(c, SERVE_MAX_CONN);
-    size_t tl = strlen(target);
     for (int i = 0; i < n; i++) {
-        if (c[i].connected && !strncmp(c[i].peer, target, tl) && c[i].peer[tl] == ':')
+        if (c[i].connected && c[i].peer[0] &&
+            !strncmp(c[i].peer, host, hl) && c[i].peer[hl] == ':')
             return 1;
-        if (c[i].outbound && c[i].host[0] && !strcmp(c[i].host, target))
+        if (c[i].outbound && c[i].host[0] && !strcmp(c[i].host, host))
             return 1;
     }
     return 0;
@@ -1605,7 +1618,12 @@ static void serve_send_dnaddr(SConn *c, const Coin *coin, sqlite3 *db,
     // advertise ourselves iff we listen and learned our external ip (a dial-only
     // node has neither, and correctly stays out of everyone's dnaddr)
     int adv_self = (port && self && *self) ? 1 : 0;
-    int total = n + adv_self; if (total > SERVE_DNADDR_MAX) total = SERVE_DNADDR_MAX;
+    int total = adv_self;
+    for (int i = 0; i < n; i++) {
+        if (self && *self && !strcmp(pool[i], self)) continue;
+        total++;
+    }
+    if (total > SERVE_DNADDR_MAX) total = SERVE_DNADDR_MAX;
     uint8_t *out = malloc(3 + (size_t)SERVE_DNADDR_MAX * 30);
     if (!out) return;
     int vo = 0; put_varint(out, &vo, (uint64_t)total);
@@ -1651,6 +1669,8 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             unsigned a = pl[40];
             if (a && a != 127 && a != 10) {
                 snprintf(self, 80, "%u.%u.%u.%u:%u", pl[40], pl[41], pl[42], pl[43], port);
+                note_self_host(self);
+                learn_self_ip(pl, pln);
                 char sip[64]; snprintf(sip, sizeof sip, "%s", self);
                 { char *sc = strrchr(sip, ':'); if (sc) *sc = 0; }
                 idx_db_peers_drop_host(db, sip);
@@ -2133,9 +2153,9 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
             conns[slot].outbound = 1; seat_point(&conns[slot], host, rp); slot++;
         }
     }
-    // startup re-dial: seat the pepenet peers we remember from prior runs so the
-    // node re-embeds into the mesh immediately instead of by chain-crawl luck
-    mesh_seat_topup(conns, db, coin, MESH_DIAL_SEATS, self);
+    // first mesh_seat_topup waits for the 5s dial grace: by then the sync
+    // thread (or an inbound) may have filled g_self_ip, so a persisted self
+    // row is not seated into a blocking self-connect.
     // hold the first outbound dial a few seconds: lets the sync thread reach a real
     // peer and learn our external ip (g_self_ip) first, so if the seed points back
     // at us the dial loop skips it up front instead of blocking on a self-connect.
@@ -2301,6 +2321,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                 int fd = serve_dial(c->hip, c->rport, coin, services, our_h, agent, &psvc,
                                     self, port, &ph);
                 if (self[0]) {
+                    note_self_host(self);
                     char sip[64]; snprintf(sip, sizeof sip, "%s", self);
                     { char *sc = strrchr(sip, ':'); if (sc) *sc = 0; }
                     idx_db_peers_drop_host(db, sip);
@@ -2392,10 +2413,13 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                     rport = ntohs(pa.sin_port);
                 }
                 int from_host = 0;
-                for (int i = 0; i < SERVE_MAX_CONN; i++)
-                    if (conns[i].fd >= 0 && !conns[i].outbound && ip[0] &&
-                        !strncmp(conns[i].peer, ip, strlen(ip)) &&
-                        conns[i].peer[strlen(ip)] == ':') from_host++;
+                for (int i = 0; i < SERVE_MAX_CONN; i++) {
+                    if (conns[i].fd < 0 || !ip[0]) continue;
+                    size_t il = strlen(ip);
+                    if (conns[i].hip[0] && !strcmp(conns[i].hip, ip)) from_host++;
+                    else if (conns[i].peer[0] && !strncmp(conns[i].peer, ip, il) &&
+                             conns[i].peer[il] == ':') from_host++;
+                }
                 int slot = -1;
                 for (int i = 0; i < SERVE_MAX_CONN; i++) if (conns[i].fd < 0 && !conns[i].outbound) { slot = i; break; }
                 if (slot < 0 || from_host >= SERVE_INBOUND_PER_HOST) {
