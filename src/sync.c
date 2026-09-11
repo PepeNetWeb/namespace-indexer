@@ -1387,6 +1387,10 @@ invalid_peer:
 // failed dial stamps last_try and the addr sits out this long before any
 // topup offers it again (Core's GetChance decay, flattened to one step)
 #define DIAL_RETRY_S    600
+// never-connected dnet vouches (last_good=0) sit out this long after a fail.
+// The 14-odd NAT/dead hints from a dnaddr used to re-seat every DIAL_RETRY_S
+// and block the serve thread on 5s connects.
+#define VOUCH_RETRY_S   3600
 // re-ask a live marked peer for its overlay list this often. Handshake sends
 // one dngetaddr; without a refresh the dnet pool freezes at that first answer
 // and newly-discovered mesh peers never get a seat.
@@ -1433,6 +1437,8 @@ typedef struct {
     int64_t peer_h;                   // peer's claimed start_height at handshake (0 unknown)
     void *mesh_handle;                // embedder's per-peer handle (NULL till peer_up)
     int  dn_asked;                    // we sent this pepenet peer a dngetaddr already
+    int  got_dnaddr;                  // logged at least one dnaddr from this conn
+    int  last_dnaddr_n;               // last harvested count (log only on change)
     int  self_sent;                   // we announced our own addr on this conn already
     int  mesh_seat;                   // outbound slot seated by overlay discovery
                                       // (idx_db_peers_dnet) — released if not pepenet
@@ -1452,7 +1458,7 @@ static void sconn_reset(SConn *c) {   // wipe transient state, keep outbound red
     c->fd = -1; c->buf = NULL; c->len = c->cap = 0; c->up = c->sent_ver = 0;
     c->peer[0] = 0; c->agent[0] = 0; c->hip[0] = 0; c->peer_h = 0; c->mesh_handle = NULL; c->dn_asked = 0; c->mesh_seat = 0;
     c->self_sent = 0; c->chain_seat = 0; c->last_rx = 0; c->last_ping = 0; c->last_pull = 0;
-    c->last_dnget = 0;
+    c->last_dnget = 0; c->got_dnaddr = 0; c->last_dnaddr_n = 0;
     c->outbound = ob; if (ob) { c->mesh_seat = ms; c->chain_seat = cs; memcpy(c->host, host, sizeof c->host); memcpy(c->hip, hip, sizeof c->hip); c->rport = rp; c->redial_at = time(NULL) + 15; }
 }
 // close + notify the mesh (peer_down) if this was a live mesh peer
@@ -1595,7 +1601,7 @@ static void serve_send_version(int fd, const Coin *coin, int64_t our_height, int
 static void serve_send_dnaddr(SConn *c, const Coin *coin, sqlite3 *db,
                               const char *self, uint16_t port) {
     char pool[SERVE_DNADDR_MAX][80];
-    int n = idx_db_peers_dnet(db, pool, SERVE_DNADDR_MAX, 0);
+    int n = idx_db_peers_dnet(db, pool, SERVE_DNADDR_MAX, 0, 0);
     // advertise ourselves iff we listen and learned our external ip (a dial-only
     // node has neither, and correctly stays out of everyone's dnaddr)
     int adv_self = (port && self && *self) ? 1 : 0;
@@ -1643,8 +1649,12 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         // paired with our listen port, this is what we advertise as self
         if (!*self && pln >= 46 && pl[38] == 0xFF && pl[39] == 0xFF) {
             unsigned a = pl[40];
-            if (a && a != 127 && a != 10)
+            if (a && a != 127 && a != 10) {
                 snprintf(self, 80, "%u.%u.%u.%u:%u", pl[40], pl[41], pl[42], pl[43], port);
+                char sip[64]; snprintf(sip, sizeof sip, "%s", self);
+                { char *sc = strrchr(sip, ':'); if (sc) *sc = 0; }
+                idx_db_peers_drop_host(db, sip);
+            }
         }
         // capture the peer's subver (agent) — "/pepenet-" marks a mesh peer —
         // and its claimed start_height (the varstr's tail), the serve plane's
@@ -1669,6 +1679,13 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             fprintf(stderr, "serve: inbound %s (agent %s)%s\n", c->peer,
                     c->agent[0] ? c->agent : "(none)",
                     AGENT_MARKED(c->agent) ? "  [mesh]" : "");
+        // inbound marked: stamp agent on the listen-port row (not the ephemeral).
+        // last_good stays 0 so we don't prefer dialing a NAT'd peer that found us.
+        if (!c->outbound && AGENT_MARKED(c->agent) && c->peer[0]) {
+            char ip[80]; snprintf(ip, sizeof ip, "%s", c->peer);
+            { char *col = strrchr(ip, ':'); if (col) *col = 0; }
+            if (ip[0]) idx_db_peer_touch_agent(db, ip, c->agent, (int64_t)time(NULL));
+        }
         // a marked peer + a mesh embedder → hand it up so the carrier gossips.
         // One mesh slot per host: a second inbound (sync pass / NAT) to an IP
         // that already gossips would send_inv_all again and double the storm.
@@ -1698,7 +1715,11 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         serve_send_dnaddr(c, coin, db, self, port);          // answer with our pepenet peers
     } else if (!strcmp(cmd, "dnaddr")) {
         int n = addr_harvest(db, pl, pln, 1);                // vouched pepenet peers → dnet pool
-        fprintf(stderr, "serve: dnaddr %d overlay peer(s) from %s\n", n, c->peer);
+        if (!c->got_dnaddr || n != c->last_dnaddr_n) {
+            fprintf(stderr, "serve: dnaddr %d overlay peer(s) from %s\n", n, c->peer);
+            c->got_dnaddr = 1;
+            c->last_dnaddr_n = n;
+        }
     } else if (!strncmp(cmd, "dn", 2) && cmd[2] && mesh && mesh->peer_msg && c->mesh_handle) {
         mesh->peer_msg(mesh->ud, c->mesh_handle, cmd + 2, pl, (int)pln);   // carrier dn* command
     } else if (!strcmp(cmd, "ping")) {
@@ -1973,11 +1994,12 @@ static void mesh_seat_topup(SConn *conns, sqlite3 *db, const Coin *coin, int tar
         else if (slot < 0 && conns[i].fd < 0 && !conns[i].outbound) slot = i;
     }
     if (seated >= target || slot < 0) return;
-    // pool query excludes rows in failure backoff — a mesh addr whose dial just
-    // failed (e.g. an outbound-only peer announcing a port it can't serve) sits
-    // out DIAL_RETRY_S instead of being re-seated on the very next tick
+    // pool query excludes rows in failure backoff — proven mesh addrs sit out
+    // DIAL_RETRY_S; never-connected vouches sit out VOUCH_RETRY_S so a swamp
+    // of NAT/dead hints doesn't re-block the serve thread every ten minutes.
     char pool[64][80];
-    int n = idx_db_peers_dnet(db, pool, 64, (int64_t)time(NULL) - DIAL_RETRY_S);
+    int64_t now = (int64_t)time(NULL);
+    int n = idx_db_peers_dnet(db, pool, 64, now - DIAL_RETRY_S, now - VOUCH_RETRY_S);
     for (int i = 0; i < n; i++) {
         char host[80]; uint16_t rp; peer_split(pool[i], host, sizeof host, &rp, coin->port);
         // one connection per host, either direction: a peer already connected
@@ -2278,6 +2300,11 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                 char agent[128]; int64_t psvc = 0, ph = 0;
                 int fd = serve_dial(c->hip, c->rport, coin, services, our_h, agent, &psvc,
                                     self, port, &ph);
+                if (self[0]) {
+                    char sip[64]; snprintf(sip, sizeof sip, "%s", self);
+                    { char *sc = strrchr(sip, ':'); if (sc) *sc = 0; }
+                    idx_db_peers_drop_host(db, sip);
+                }
                 if (fd == -2) {   // handshake proved the peer is us — drop it for good
                     fprintf(stderr, "serve: %s:%u is ourselves (self-connect) — dropping self-seed\n", c->host, c->rport);
                     if (!c->chain_seat) idx_self_seed = 1;
@@ -2293,8 +2320,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                         char addr[96]; snprintf(addr, sizeof addr, "%s:%u", c->host, c->rport);
                         idx_db_peer_tried(db, addr, (int64_t)now);
                         if (c->mesh_seat)   // small curated pool — one line per backoff window
-                            fprintf(stderr, "serve: dial %s failed — backing off %ds  [mesh]\n",
-                                    addr, DIAL_RETRY_S);
+                            fprintf(stderr, "serve: dial %s failed  [mesh]\n", addr);
                         c->outbound = 0; c->mesh_seat = 0; c->chain_seat = 0; c->host[0] = 0; c->hip[0] = 0;
                         continue;
                     }

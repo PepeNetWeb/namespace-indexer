@@ -246,28 +246,50 @@ void idx_db_peer_dnet_note(sqlite3 *db, const char *addr, int64_t services, int6
     sqlite3_bind_int64(st, 2, services); sqlite3_bind_int64(st, 3, now);
     sqlite3_step(st); sqlite3_finalize(st);
 }
-int idx_db_peers_dnet(sqlite3 *db, char (*out)[80], int max, int64_t retry_cut) {
+int idx_db_peers_dnet(sqlite3 *db, char (*out)[80], int max,
+                      int64_t retry_cut, int64_t vouch_cut) {
     // the overlay dial pool: peers we handshaked as marked (IDX_DNET_MARK
     // agent prefix) OR that a marked peer vouched for (dnet=1). Confirmed-agent
     // first (freshest handshake), then vouched hints by sighting recency — so a
     // node that ran before re-embeds into the mesh from its own memory at startup.
-    // retry_cut > 0 = the dialer's failure backoff: skip rows whose last dial
-    // failed (last_try > last_good) after the cutoff. 0 = no filter — the dnaddr
-    // gossip answer vouches for peers regardless of our own dial luck (they may
-    // be reachable from where the asker sits even if not from here).
+    // retry_cut > 0 = proven-peer failure backoff. vouch_cut > 0 = never-
+    // connected dnet vouches sit out longer — a swamp of NAT/dead hints used
+    // to re-seat every DIAL_RETRY_S and stall the serve thread. 0 = no filter.
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(db,
             "SELECT addr FROM peers WHERE (dnet=1 OR agent LIKE '" IDX_DNET_MARK "%')"
-            " AND NOT (?2 > 0 AND last_try > last_good AND last_try > ?2)"
+            " AND NOT (?2 > 0 AND last_good > 0 AND last_try > last_good AND last_try > ?2)"
+            " AND NOT (?3 > 0 AND last_good = 0 AND last_try > 0 AND last_try > ?3)"
             " ORDER BY (agent LIKE '" IDX_DNET_MARK "%') DESC, last_good DESC, last_seen DESC LIMIT ?1",
             -1, &st, NULL) != SQLITE_OK) return 0;
     sqlite3_bind_int(st, 1, max);
     sqlite3_bind_int64(st, 2, retry_cut);
+    sqlite3_bind_int64(st, 3, vouch_cut);
     int n = 0;
     while (n < max && sqlite3_step(st) == SQLITE_ROW)
         snprintf(out[n++], 80, "%s", sqlite3_column_text(st, 0));
     sqlite3_finalize(st);
     return n;
+}
+void idx_db_peers_drop_host(sqlite3 *db, const char *host) {
+    if (!db || !host || !*host) return;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM peers WHERE addr = ?1 OR addr LIKE ?1 || ':%'",
+            -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, host, -1, SQLITE_STATIC);
+    sqlite3_step(st); sqlite3_finalize(st);
+}
+void idx_db_peer_touch_agent(sqlite3 *db, const char *host, const char *agent, int64_t now) {
+    if (!db || !host || !*host || !agent || !*agent) return;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db,
+            "UPDATE peers SET agent = ?2, last_seen = ?3 WHERE addr = ?1 OR addr LIKE ?1 || ':%'",
+            -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, host, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, agent, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 3, now);
+    sqlite3_step(st); sqlite3_finalize(st);
 }
 int idx_db_peers_best(sqlite3 *db, char (*out)[80], int max) {
     // proven peers first (freshest handshake), then harvested block-servers

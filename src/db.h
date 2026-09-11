@@ -56,9 +56,17 @@ int  idx_db_peers_agent(sqlite3 *db, const char *prefix, char (*out)[80], int ma
 // then vouched-only hints — so a restarting node re-embeds into the mesh from
 // its own persisted memory instead of re-discovering it by chain-crawl luck.
 void idx_db_peer_dnet_note(sqlite3 *db, const char *addr, int64_t services, int64_t now);
-// retry_cut > 0: skip rows in dial-failure backoff (last_try > last_good and
-// newer than the cutoff); 0 disables the filter (gossip answers vouch anyway)
-int  idx_db_peers_dnet(sqlite3 *db, char (*out)[80], int max, int64_t retry_cut);
+// retry_cut > 0: skip proven (last_good>0) rows in dial-failure backoff
+// (last_try > last_good and newer than the cutoff). vouch_cut > 0: skip
+// never-connected vouches (last_good=0, last_try>0) newer than that cutoff.
+// 0 disables that filter (gossip answers vouch regardless of our dial luck).
+int  idx_db_peers_dnet(sqlite3 *db, char (*out)[80], int max,
+                       int64_t retry_cut, int64_t vouch_cut);
+// drop every peers row for this IPv4 (self, after we learn our external ip)
+void idx_db_peers_drop_host(sqlite3 *db, const char *host);
+// stamp agent on existing rows for this IPv4 (inbound marked handshake —
+// listen-port row, not the ephemeral). Does not set last_good.
+void idx_db_peer_touch_agent(sqlite3 *db, const char *host, const char *agent, int64_t now);
 // full rows for addr advertisement (freshest sighting first)
 typedef struct { char addr[80]; int64_t services, last_seen; } IdxPeerRow;
 int  idx_db_peers_rows(sqlite3 *db, IdxPeerRow *out, int max);
