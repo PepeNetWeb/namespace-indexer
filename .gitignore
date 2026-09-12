@@ -10,3 +10,4 @@ test_db
 test_sync
 test_codec
 test_serve
+test_net_policy

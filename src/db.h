@@ -62,11 +62,19 @@ void idx_db_peer_dnet_note(sqlite3 *db, const char *addr, int64_t services, int6
 // 0 disables that filter (gossip answers vouch regardless of our dial luck).
 int  idx_db_peers_dnet(sqlite3 *db, char (*out)[80], int max,
                        int64_t retry_cut, int64_t vouch_cut);
+/* tried / dnaddr: agent LIKE IDX_DNET_MARK '%', regardless of dnet. */
+int  idx_db_peers_dnet_confirmed(sqlite3 *db, char (*out)[80], int max,
+                                 int64_t retry_cut);
+/* new / feeler: dnet=1 AND agent NOT LIKE mark. vouch_cut skips last_try. */
+int  idx_db_peers_dnet_new(sqlite3 *db, char (*out)[80], int max,
+                           int64_t vouch_cut);
 // drop every peers row for this IPv4 (self, after we learn our external ip)
 void idx_db_peers_drop_host(sqlite3 *db, const char *host);
 // stamp agent on existing rows for this IPv4 (inbound marked handshake —
-// listen-port row, not the ephemeral). Does not set last_good.
-void idx_db_peer_touch_agent(sqlite3 *db, const char *host, const char *agent, int64_t now);
+// listen-port row, not the ephemeral). Does not set last_good. If no row
+// exists, INSERT host:<port> so the observation can enter dnaddr.
+void idx_db_peer_touch_agent(sqlite3 *db, const char *host, uint16_t port,
+                             const char *agent, int64_t now);
 // full rows for addr advertisement (freshest sighting first)
 typedef struct { char addr[80]; int64_t services, last_seen; } IdxPeerRow;
 int  idx_db_peers_rows(sqlite3 *db, IdxPeerRow *out, int max);

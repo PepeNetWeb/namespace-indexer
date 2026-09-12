@@ -151,7 +151,13 @@ typedef struct {
     void  (*peer_down)(void *ud, void *handle);
     void  (*tick)(void *ud);   // ~1 Hz on the serve thread (publish drain / housekeeping)
     void   *ud;
+    /* optional: overlay reports local-policy strikes against this SConn */
+    void  (*peer_misbehave)(void *peer, int score, const char *why);
 } IdxMeshHooks;
+
+/* Overlay / serve local-policy strike: add `n` to this SConn's score; at 100
+ * ban the IPv4 24 h and drop the conn. `peer` is the SConn* from peer_up. */
+void serve_conn_misbehave(void *peer, int n, const char *why);
 
 // The chain-wire presence (peer-discovery slice 3). Listen on `port` (0 =
 // dial-only, no bind — for a NAT'd node), maintain outbound connections to

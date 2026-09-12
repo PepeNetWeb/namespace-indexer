@@ -13,6 +13,7 @@
 #include "serve_store.h"
 #include "mempool.h"
 #include "txcheck.h"
+#include "net_policy.h"
 #include "sm.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -443,7 +444,7 @@ static int net_recv(int fd, const uint8_t magic[4], char cmd_out[13], uint8_t **
     if (memcmp(hdr, magic, 4) != 0) return -1;
     memcpy(cmd_out, hdr + 4, 12); cmd_out[12] = 0;
     uint32_t l = (uint32_t)hdr[16] | (uint32_t)hdr[17] << 8 | (uint32_t)hdr[18] << 16 | (uint32_t)hdr[19] << 24;
-    if (l > 32 * 1024 * 1024) return -1;
+    if (l > IDX_MSG_MAX) return -1;
     uint8_t *buf = malloc(l ? l : 1);
     if (l && !read_n(fd, buf, l, timeout_ms)) { free(buf); return 0; }
     uint8_t ck[32]; idx_sha256d(l ? buf : (const uint8_t *)"", l, ck);
@@ -1395,7 +1396,7 @@ invalid_peer:
 // onto this same poll loop in later steps; for now services is advertised 0
 // (honest: we serve no blocks yet — the agent string is the dns-aware marker).
 #define SERVE_MAX_CONN 64
-#define SERVE_MSG_MAX  (2 * 1024 * 1024)
+#define SERVE_MSG_MAX  IDX_MSG_MAX
 // outbound slots we keep pointed at overlay (pepenet) peers drawn from the
 // persisted dnet pool — the startup re-dial target. Well under SERVE_MAX_CONN so
 // inbound + chain dial_peers keep ample room.
@@ -1465,21 +1466,51 @@ typedef struct {
     int  chain_seat;                  // outbound slot seated by addrman-style selection
                                       // (chain_topup) — released on dial failure so the
                                       // next tick tries a different candidate
+    int  feeler;                      // mesh seat probing a dnet=1 unconfirmed vouch
+    int  score;                       // per-conn misbehavior; 100 → ban the IPv4
+    time_t   gd_win_t;                // getdata 10 s window start
+    int      gd_blocks;
+    uint32_t gd_bytes;
 } SConn;
+static const IdxMeshHooks *g_serve_mesh;
+static void conn_ip(const SConn *c, char *ip, size_t n) {
+    if (c->hip[0]) { snprintf(ip, n, "%s", c->hip); return; }
+    snprintf(ip, n, "%s", c->peer);
+    char *col = strrchr(ip, ':'); if (col) *col = 0;
+}
 // the mesh send fn handed to peer_up: emit a dn* command on this peer's conn
 static void serve_mesh_send(void *peer, const char *cmd, const uint8_t *pay, size_t n) {
     SConn *sc = (SConn *)peer;
     if (sc->fd >= 0) net_send(sc->fd, sc->magic, cmd, pay, (uint32_t)n);
 }
+static void serve_drop(SConn *c, const IdxMeshHooks *mesh);
 static void sconn_reset(SConn *c) {   // wipe transient state, keep outbound redial info
     free(c->buf);
-    int ob = c->outbound, ms = c->mesh_seat, cs = c->chain_seat; char host[80], hip[46]; uint16_t rp = c->rport;
+    int ob = c->outbound, ms = c->mesh_seat, cs = c->chain_seat, fl = c->feeler;
+    char host[80], hip[46]; uint16_t rp = c->rport;
     memcpy(host, c->host, sizeof host); memcpy(hip, c->hip, sizeof hip);
     c->fd = -1; c->buf = NULL; c->len = c->cap = 0; c->up = c->sent_ver = 0;
     c->peer[0] = 0; c->agent[0] = 0; c->hip[0] = 0; c->peer_h = 0; c->mesh_handle = NULL; c->dn_asked = 0; c->mesh_seat = 0;
-    c->self_sent = 0; c->chain_seat = 0; c->last_rx = 0; c->last_ping = 0; c->last_pull = 0;
+    c->self_sent = 0; c->chain_seat = 0; c->feeler = 0; c->score = 0;
+    c->gd_win_t = 0; c->gd_blocks = 0; c->gd_bytes = 0;
+    c->last_rx = 0; c->last_ping = 0; c->last_pull = 0;
     c->last_dnget = 0; c->got_dnaddr = 0; c->last_dnaddr_n = 0;
-    c->outbound = ob; if (ob) { c->mesh_seat = ms; c->chain_seat = cs; memcpy(c->host, host, sizeof c->host); memcpy(c->hip, hip, sizeof c->hip); c->rport = rp; c->redial_at = time(NULL) + 15; }
+    c->outbound = ob; if (ob) { c->mesh_seat = ms; c->chain_seat = cs; c->feeler = fl;
+        memcpy(c->host, host, sizeof c->host); memcpy(c->hip, hip, sizeof c->hip); c->rport = rp; c->redial_at = time(NULL) + 15; }
+}
+void serve_conn_misbehave(void *peer, int n, const char *why) {
+    SConn *c = (SConn *)peer;
+    if (!c || n <= 0) return;
+    char ip[46]; conn_ip(c, ip, sizeof ip);
+    if (!net_policy_score_add(&c->score, n)) {
+        fprintf(stderr, "serve: misbehave %s +%d -> %d (%s)\n",
+                ip[0] ? ip : c->peer, n, c->score, why ? why : "");
+        return;
+    }
+    fprintf(stderr, "serve: ban %s score %d (%s)\n",
+            ip[0] ? ip : c->peer, c->score, why ? why : "");
+    if (ip[0]) net_policy_ban(ip, time(NULL));
+    serve_drop(c, g_serve_mesh);
 }
 // close + notify the mesh (peer_down) if this was a live mesh peer
 static void serve_drop(SConn *c, const IdxMeshHooks *mesh) {
@@ -1625,7 +1656,7 @@ static void serve_send_version(int fd, const Coin *coin, int64_t our_height, int
 static void serve_send_dnaddr(SConn *c, const Coin *coin, sqlite3 *db,
                               const char *self, uint16_t port) {
     char pool[SERVE_DNADDR_MAX][80];
-    int n = idx_db_peers_dnet(db, pool, SERVE_DNADDR_MAX, 0, 0);
+    int n = idx_db_peers_dnet_confirmed(db, pool, SERVE_DNADDR_MAX, 0);
     // advertise ourselves iff we listen and learned our external ip (a dial-only
     // node has neither, and correctly stays out of everyone's dnaddr)
     int adv_self = (port && self && *self) ? 1 : 0;
@@ -1721,7 +1752,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         if (!c->outbound && AGENT_MARKED(c->agent) && c->peer[0]) {
             char ip[80]; snprintf(ip, sizeof ip, "%s", c->peer);
             { char *col = strrchr(ip, ':'); if (col) *col = 0; }
-            if (ip[0]) idx_db_peer_touch_agent(db, ip, c->agent, (int64_t)time(NULL));
+            if (ip[0]) idx_db_peer_touch_agent(db, ip, coin->port, c->agent, (int64_t)time(NULL));
         }
         // a marked peer + a mesh embedder → hand it up so the carrier gossips.
         // One mesh slot per host: a second inbound (sync pass / NAT) to an IP
@@ -1763,6 +1794,9 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         serve_send_dnaddr(c, coin, db, self, port);
     } else if (!strcmp(cmd, "dnaddr")) {
         if (!AGENT_MARKED(c->agent)) return;
+        { uint64_t cnt; uint32_t o;
+          if (!net_policy_read_count(pl, pln, &cnt, &o)) return;
+          if (cnt > IDX_MAX_ADDR) { serve_conn_misbehave(c, 20, "dnaddr count"); return; } }
         int n = addr_harvest(db, pl, pln, 1);                // vouched pepenet peers → dnet pool
         if (!c->got_dnaddr || n != c->last_dnaddr_n) {
             fprintf(stderr, "serve: dnaddr %d overlay peer(s) from %s\n", n, c->peer);
@@ -1789,6 +1823,9 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         net_send(c->fd, coin->magic, "addr", out, o);
         free(out); free(rows);
     } else if (!strcmp(cmd, "addr")) {
+        { uint64_t cnt; uint32_t o;
+          if (!net_policy_read_count(pl, pln, &cnt, &o)) return;
+          if (cnt > IDX_MAX_ADDR) { serve_conn_misbehave(c, 20, "addr count"); return; } }
         addr_harvest(db, pl, pln, 0);   // chain addr gossip — no overlay mark
     } else if (!strcmp(cmd, "getheaders") && ss) {
         // version(4) + varint nloc + nloc*32 locator (newest→oldest) + hash_stop(32)
@@ -1796,7 +1833,8 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         uint32_t o = 4; uint64_t nloc = pl[o++];
         if (nloc == 0xFD) { if (pln < o + 2) return; nloc = pl[o] | (pl[o+1] << 8); o += 2; }
         else if (nloc >= 0xFE) return;
-        if (nloc > 2000 || o + nloc * 32 + 32 > pln) return;
+        if (nloc > 2000) { serve_conn_misbehave(c, 10, "getheaders nloc"); return; }
+        if (o + nloc * 32 + 32 > pln) return;
         int64_t start = serve_store_locate(ss, pl + o, (int)nloc);   // -1 → from earliest
         uint8_t *out = malloc(3 + 2000u * 81);
         if (!out) return;
@@ -1821,7 +1859,8 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         uint32_t o = 4; uint64_t nloc = pl[o++];
         if (nloc == 0xFD) { if (pln < o + 2) return; nloc = pl[o] | (pl[o+1] << 8); o += 2; }
         else if (nloc >= 0xFE) return;
-        if (nloc > 2000 || o + nloc * 32 + 32 > pln) return;
+        if (nloc > 2000) { serve_conn_misbehave(c, 10, "getblocks nloc"); return; }
+        if (o + nloc * 32 + 32 > pln) return;
         int64_t start = serve_store_locate(ss, pl + o, (int)nloc);   // -1 = no common block: stay silent
         int64_t wfloor = serve_store_win_floor(ss);
         if (start < 0 || wfloor < 0 || start + 1 < wfloor) return;
@@ -1843,21 +1882,43 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         }
         free(hs);
     } else if (!strcmp(cmd, "getdata")) {
-        if (pln < 1) return;
-        uint32_t o = 0; uint64_t cnt = pl[o++];
-        if (cnt == 0xFD) { if (pln < 3) return; cnt = pl[o] | (pl[o+1] << 8); o += 2; }
-        else if (cnt >= 0xFE) return;
+        uint64_t cnt; uint32_t o;
+        if (!net_policy_read_count(pl, pln, &cnt, &o)) return;
+        if (cnt > IDX_MAX_INV_SZ) { serve_conn_misbehave(c, 20, "getdata count"); return; }
+        int examined = 0;
+        time_t now = time(NULL);
+        int skip_log = 0;
         for (uint64_t i = 0; i < cnt && o + 36 <= pln; i++, o += 36) {
+            if (!net_policy_getdata_items_ok(examined)) break;
+            examined++;
             uint32_t type = pl[o] | (pl[o+1]<<8) | (pl[o+2]<<16) | ((uint32_t)pl[o+3]<<24);
             if (type == 2 && ss) {                         // block (type 2) — from the serve store
                 uint8_t *raw; size_t rl;
                 if (serve_store_block(ss, pl + o + 4, &raw, &rl)) {
+                    if (!net_policy_getdata_ok(&c->gd_blocks, &c->gd_bytes, &c->gd_win_t,
+                                              now, 1, (uint32_t)rl)) {
+                        free(raw);
+                        if (!skip_log) {
+                            fprintf(stderr, "serve: getdata budget %s blocks=%d bytes=%u\n",
+                                    c->peer, c->gd_blocks, c->gd_bytes);
+                            skip_log = 1;
+                        }
+                        break;
+                    }
                     net_send(c->fd, coin->magic, "block", raw, (uint32_t)rl);
                     free(raw);
                 }
             } else if (type == 1) {                        // tx (type 1) — from the mempool
                 size_t rl; uint8_t *raw = mempool_get_copy(pl + o + 4, &rl);
-                if (raw) { net_send(c->fd, coin->magic, "tx", raw, (uint32_t)rl); free(raw); }
+                if (raw) {
+                    if (!net_policy_getdata_ok(&c->gd_blocks, &c->gd_bytes, &c->gd_win_t,
+                                              now, 0, (uint32_t)rl)) {
+                        free(raw);
+                        break;
+                    }
+                    net_send(c->fd, coin->magic, "tx", raw, (uint32_t)rl);
+                    free(raw);
+                }
             }
         }
     } else if (!strcmp(cmd, "inv")) {
@@ -1866,10 +1927,9 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         // blockstage for the sync pass (sync-over-one-connection): the fold
         // stays on the sync side, this thread only ferries bytes off the
         // mesh line so no second socket is ever needed to follow the tip.
-        if (pln < 1) return;
-        uint32_t o = 0; uint64_t cnt = pl[o++];
-        if (cnt == 0xFD) { if (pln < 3) return; cnt = pl[o] | (pl[o+1] << 8); o += 2; }
-        else if (cnt >= 0xFE) return;
+        uint64_t cnt; uint32_t o;
+        if (!net_policy_read_count(pl, pln, &cnt, &o)) return;
+        if (cnt > IDX_MAX_INV_SZ) { serve_conn_misbehave(c, 20, "inv count"); return; }
         uint8_t want[128][32]; int nreq = 0;
         uint8_t wblk[16][32]; int nblk = 0;
         for (uint64_t i = 0; i < cnt && o + 36 <= pln; i++, o += 36) {
@@ -2035,30 +2095,14 @@ static int same_group16(const char *a, const char *b);   /* eclipse: one outboun
 // serve_dial is blocking on this thread, and seating a swamp of dead vouched
 // addrs at once stalled gossip and hid new discoveries behind minutes of
 // connect/handshake timeouts.
-static void mesh_seat_topup(SConn *conns, sqlite3 *db, const Coin *coin, int target,
-                            const char *self) {
-    int seated = 0, slot = -1;
-    for (int i = 0; i < SERVE_MAX_CONN; i++) {
-        if (conns[i].mesh_seat) seated++;
-        else if (slot < 0 && conns[i].fd < 0 && !conns[i].outbound) slot = i;
-    }
-    if (seated >= target || slot < 0) return;
-    // pool query excludes rows in failure backoff — proven mesh addrs sit out
-    // DIAL_RETRY_S; never-connected vouches sit out VOUCH_RETRY_S so a swamp
-    // of NAT/dead hints doesn't re-block the serve thread every ten minutes.
-    char pool[64][80];
-    int64_t now = (int64_t)time(NULL);
-    int n = idx_db_peers_dnet(db, pool, 64, now - DIAL_RETRY_S, now - VOUCH_RETRY_S);
+static int mesh_try_seat(SConn *conns, int slot, const Coin *coin, const char *self,
+                         char pool[][80], int n, int feeler) {
+    time_t now = time(NULL);
     for (int i = 0; i < n; i++) {
         char host[80]; uint16_t rp; peer_split(pool[i], host, sizeof host, &rp, coin->port);
-        // one connection per host, either direction: a peer already connected
-        // (a NAT'd node that dialed US in) or already seated is never dialed again
         if (conn_host_live(conns, NULL, host)) continue;
-        // never seat ourselves. addr_harvest keeps our addr out of the pool going
-        // forward, but rows persisted before we learned our ip (or by an older
-        // build) live until the TTL prune — without this they get re-seated every
-        // tick, and the dial loop's drop leaves the seat free for the same row.
         if (host_is_self(host, self)) continue;
+        if (net_policy_banned(host, now)) continue;
         int clash = 0;
         for (int k = 0; k < SERVE_MAX_CONN && !clash; k++)
             if (conns[k].mesh_seat && conns[k].host[0] && same_group16(conns[k].host, host))
@@ -2066,9 +2110,34 @@ static void mesh_seat_topup(SConn *conns, sqlite3 *db, const Coin *coin, int tar
         if (clash) continue;
         memset(&conns[slot], 0, sizeof conns[slot]);
         conns[slot].fd = -1; conns[slot].outbound = 1; conns[slot].mesh_seat = 1;
+        conns[slot].feeler = feeler ? 1 : 0;
         seat_point(&conns[slot], host, rp);
-        fprintf(stderr, "serve: seating mesh %s:%u\n", host, rp);
-        return;
+        fprintf(stderr, "serve: seating %s %s:%u\n", feeler ? "feeler" : "mesh", host, rp);
+        return 1;
+    }
+    return 0;
+}
+static void mesh_seat_topup(SConn *conns, sqlite3 *db, const Coin *coin, int target,
+                            const char *self) {
+    int seated = 0, tried = 0, feeler = 0, slot = -1;
+    for (int i = 0; i < SERVE_MAX_CONN; i++) {
+        if (conns[i].mesh_seat) {
+            seated++;
+            if (conns[i].feeler) feeler++;
+            else tried++;
+        } else if (slot < 0 && conns[i].fd < 0 && !conns[i].outbound) slot = i;
+    }
+    if (seated >= target || slot < 0) return;
+    char pool[64][80];
+    int64_t now = (int64_t)time(NULL);
+    /* fill tried first (up to 7); never occupy every seat with unconfirmed vouches */
+    if (tried < MESH_DIAL_SEATS - 1) {
+        int n = idx_db_peers_dnet_confirmed(db, pool, 64, now - DIAL_RETRY_S);
+        if (mesh_try_seat(conns, slot, coin, self, pool, n, 0)) return;
+    }
+    if (!feeler) {
+        int n = idx_db_peers_dnet_new(db, pool, 64, now - VOUCH_RETRY_S);
+        mesh_try_seat(conns, slot, coin, self, pool, n, 1);
     }
 }
 
@@ -2114,6 +2183,7 @@ static void chain_topup(SConn *conns, sqlite3 *db, const Coin *coin, const char 
             char host[80]; uint16_t rp; peer_split(p->addr, host, sizeof host, &rp, coin->port);
             if (conn_host_live(conns, NULL, host)) continue;
             if (host_is_self(host, self)) continue;
+            if (net_policy_banned(host, now)) continue;
             int clash = 0;
             for (int k = 0; k < SERVE_MAX_CONN && !clash; k++)
                 if (conns[k].outbound && conns[k].host[0] && same_group16(conns[k].host, host)) clash = 1;
@@ -2132,6 +2202,7 @@ static void chain_topup(SConn *conns, sqlite3 *db, const Coin *coin, const char 
 int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
               const char *dial_peers, volatile int *stop, const IdxMeshHooks *mesh) {
     const Coin *coin = coin_by_name(coinname); if (!coin) return -1;
+    g_serve_mesh = mesh;
     (void)self_nonce();                      // generate the version nonce now (before threads race)
     sqlite3 *db = idx_db_open(dbpath); if (!db) return -1;
     idx_db_peers_scrub(db);                  // drop pre-fix hostname addr rows
@@ -2351,6 +2422,15 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                     if (!c->chain_seat) idx_self_seed = 1;   // a looping configured seed = we ARE the seed
                     c->outbound = 0; c->mesh_seat = 0; c->chain_seat = 0; c->host[0] = 0; c->hip[0] = 0; continue;
                 }
+                if (c->hip[0] && net_policy_banned(c->hip, now)) {
+                    if (c->mesh_seat || c->chain_seat) {
+                        char addr[96]; snprintf(addr, sizeof addr, "%s:%u", c->host, c->rport);
+                        idx_db_peer_tried(db, addr, (int64_t)now);
+                        c->outbound = 0; c->mesh_seat = 0; c->chain_seat = 0; c->feeler = 0;
+                        c->host[0] = 0; c->hip[0] = 0;
+                    } else c->redial_at = now + 60;
+                    continue;
+                }
                 char agent[128]; int64_t psvc = 0, ph = 0;
                 int fd = serve_dial(c->hip, c->rport, coin, services, our_h, agent, &psvc,
                                     self, port, &ph);
@@ -2403,15 +2483,19 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                 }
                 snprintf(c->agent, sizeof c->agent, "%s", agent);
                 int is_dn = AGENT_MARKED(agent);
-                // persist the handshake so a restart re-seats this peer from memory
-                idx_db_peer_seen(db, c->peer, psvc, agent, (int64_t)now);
-                // an overlay-seated slot whose peer isn't (any longer) marked was a
-                // stale vouch — free the seat for a real one rather than redial forever
+                // unmarked feeler: stamp last_try only (do not persist a non-pepenet
+                // agent / last_good — that would drop the row out of the new table)
                 if (c->mesh_seat && !is_dn) {
-                    fprintf(stderr, "serve: %s lacks the " IDX_DNET_MARK " mark (agent %s) — releasing mesh seat\n", c->peer, *agent ? agent : "(none)");
-                    close(fd); c->fd = -1; c->outbound = 0; c->mesh_seat = 0; c->host[0] = 0; c->hip[0] = 0; c->up = 0;
+                    idx_db_peer_tried(db, c->peer, (int64_t)now);
+                    fprintf(stderr, "serve: feeler unmarked — release %s (agent %s)\n",
+                            c->peer, *agent ? agent : "(none)");
+                    close(fd); c->fd = -1; c->outbound = 0; c->mesh_seat = 0; c->feeler = 0;
+                    c->host[0] = 0; c->hip[0] = 0; c->up = 0;
                     continue;
                 }
+                // persist the handshake so a restart re-seats this peer from memory
+                idx_db_peer_seen(db, c->peer, psvc, agent, (int64_t)now);
+                if (c->feeler) c->feeler = 0;   // observed mark → tried seat
                 fprintf(stderr, "serve: dialed %s (agent %s)%s%s\n", c->peer, agent,
                         c->mesh_seat ? "  [mesh]" : "", c->chain_seat ? "  [chain]" : "");
                 if (mesh && mesh->peer_up && !c->mesh_handle && is_dn &&
@@ -2446,6 +2530,9 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                     inet_ntop(AF_INET, &pa.sin_addr, ip, sizeof ip);
                     rport = ntohs(pa.sin_port);
                 }
+                if (ip[0] && net_policy_banned(ip, now)) {
+                    close(cfd);
+                } else {
                 int from_host = 0;
                 for (int i = 0; i < SERVE_MAX_CONN; i++) {
                     if (conns[i].fd < 0 || !ip[0]) continue;
@@ -2470,7 +2557,11 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                     memset(&conns[slot], 0, sizeof conns[slot]);
                     conns[slot].fd = cfd; conns[slot].magic = coin->magic;
                     conns[slot].last_rx = time(NULL);   // handshake clock starts now
-                    if (ip[0]) snprintf(conns[slot].peer, 80, "%s:%u", ip, rport);
+                    if (ip[0]) {
+                        snprintf(conns[slot].peer, 80, "%s:%u", ip, rport);
+                        snprintf(conns[slot].hip, sizeof conns[slot].hip, "%s", ip);
+                    }
+                }
                 }
             }
         }

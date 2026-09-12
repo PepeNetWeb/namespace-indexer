@@ -271,6 +271,39 @@ int idx_db_peers_dnet(sqlite3 *db, char (*out)[80], int max,
     sqlite3_finalize(st);
     return n;
 }
+int idx_db_peers_dnet_confirmed(sqlite3 *db, char (*out)[80], int max,
+                                int64_t retry_cut) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db,
+            "SELECT addr FROM peers WHERE agent LIKE '" IDX_DNET_MARK "%'"
+            " AND NOT (?2 > 0 AND last_good > 0 AND last_try > last_good AND last_try > ?2)"
+            " ORDER BY last_good DESC, last_seen DESC LIMIT ?1",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, max);
+    sqlite3_bind_int64(st, 2, retry_cut);
+    int n = 0;
+    while (n < max && sqlite3_step(st) == SQLITE_ROW)
+        snprintf(out[n++], 80, "%s", sqlite3_column_text(st, 0));
+    sqlite3_finalize(st);
+    return n;
+}
+int idx_db_peers_dnet_new(sqlite3 *db, char (*out)[80], int max,
+                          int64_t vouch_cut) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db,
+            "SELECT addr FROM peers WHERE dnet=1"
+            " AND (agent IS NULL OR agent NOT LIKE '" IDX_DNET_MARK "%')"
+            " AND NOT (?2 > 0 AND last_try > 0 AND last_try > ?2)"
+            " ORDER BY last_seen DESC LIMIT ?1",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int(st, 1, max);
+    sqlite3_bind_int64(st, 2, vouch_cut);
+    int n = 0;
+    while (n < max && sqlite3_step(st) == SQLITE_ROW)
+        snprintf(out[n++], 80, "%s", sqlite3_column_text(st, 0));
+    sqlite3_finalize(st);
+    return n;
+}
 void idx_db_peers_drop_host(sqlite3 *db, const char *host) {
     if (!db || !host || !*host) return;
     sqlite3_stmt *st;
@@ -280,7 +313,8 @@ void idx_db_peers_drop_host(sqlite3 *db, const char *host) {
     sqlite3_bind_text(st, 1, host, -1, SQLITE_STATIC);
     sqlite3_step(st); sqlite3_finalize(st);
 }
-void idx_db_peer_touch_agent(sqlite3 *db, const char *host, const char *agent, int64_t now) {
+void idx_db_peer_touch_agent(sqlite3 *db, const char *host, uint16_t port,
+                             const char *agent, int64_t now) {
     if (!db || !host || !*host || !agent || !*agent) return;
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(db,
@@ -289,6 +323,18 @@ void idx_db_peer_touch_agent(sqlite3 *db, const char *host, const char *agent, i
     sqlite3_bind_text(st, 1, host, -1, SQLITE_STATIC);
     sqlite3_bind_text(st, 2, agent, -1, SQLITE_STATIC);
     sqlite3_bind_int64(st, 3, now);
+    sqlite3_step(st); sqlite3_finalize(st);
+    if (sqlite3_changes(db) > 0) return;
+    if (!port) return;
+    char addr[80];
+    snprintf(addr, sizeof addr, "%s:%u", host, (unsigned)port);
+    if (sqlite3_prepare_v2(db,
+            "INSERT INTO peers(addr,services,last_seen,last_good,agent) VALUES(?,0,?,0,?)"
+            " ON CONFLICT(addr) DO UPDATE SET agent=excluded.agent, last_seen=excluded.last_seen",
+            -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, addr, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 2, now);
+    sqlite3_bind_text(st, 3, agent, -1, SQLITE_STATIC);
     sqlite3_step(st); sqlite3_finalize(st);
 }
 int idx_db_peers_best(sqlite3 *db, char (*out)[80], int max) {

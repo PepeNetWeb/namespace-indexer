@@ -37,7 +37,7 @@ ENGINE_CURVE_SRCS := $(addprefix $(SMDIR)/,$(addsuffix .c,$(ENGINE_CURVE)))
 # Indexer sources.
 IDX_SRCS := src/main.c src/attrib.c src/adapter.c src/oracle_feed.c \
             src/db.c src/chain.c src/base58.c src/sync.c src/pow.c src/serve_store.c \
-            src/txcheck.c src/mempool.c $(SHIM) src/test_chain.c
+            src/txcheck.c src/mempool.c src/net_policy.c $(SHIM) src/test_chain.c
 
 SQLITE_CFLAGS := $(shell pkg-config --cflags sqlite3 2>/dev/null)
 SQLITE_LIBS   := $(shell pkg-config --libs sqlite3 2>/dev/null || echo -lsqlite3)
@@ -98,14 +98,17 @@ test_codec: $(TEST_SRCS) src/test_codec.c $(SECPLIB)
 test_serve: src/test_serve.c src/serve_store.c src/serve_store.h
 	$(CC) $(CFLAGS) $(INCLUDES) $(SQLITE_CFLAGS) -o $@ src/test_serve.c src/serve_store.c $(SQLITE_LIBS)
 
-# `make check` = the four suites. Run `make test` for the shipped selftest.
+test_net_policy: src/test_net_policy.c src/net_policy.c src/net_policy.h
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ src/test_net_policy.c src/net_policy.c
+
+# `make check` = the five suites. Run `make test` for the shipped selftest.
 # Every suite runs even if an earlier one fails; the target fails if any did.
-check: test_db test_sync test_codec test_serve
-	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve; do \
+check: test_db test_sync test_codec test_serve test_net_policy
+	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve ./test_net_policy; do \
 	  echo "=== $$t ==="; $$t || rc=1; done; \
 	if [ $$rc -eq 0 ]; then echo "check: ALL PASSED"; else echo "check: FAILED"; fi; exit $$rc
 
 check-clean:
-	rm -f test_db test_sync test_codec test_serve
+	rm -f test_db test_sync test_codec test_serve test_net_policy
 
 .PHONY: check check-clean
