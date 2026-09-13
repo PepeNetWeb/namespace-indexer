@@ -29,6 +29,9 @@
 #include <pthread.h>
 #include <sys/random.h>
 #include <time.h>
+#ifndef _WIN32
+#include <signal.h>
+#endif
 
 // subver classifier: does this agent carry the overlay discovery mark?
 // (IDX_DNET_MARK, indexer.h — build-time per deployment, "/pepenet-" default)
@@ -410,10 +413,25 @@ static int cmd_watch(int argc, char **argv) {
 }
 
 // ── minimal Dogecoin P2P (self-contained; framing on protocol-sm SHA-256) ─────
+static void ignore_sigpipe(void) {
+#ifndef _WIN32
+    signal(SIGPIPE, SIG_IGN);
+#endif
+}
+static void sock_nosigpipe(int fd) {
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+}
 static int write_all(int fd, const uint8_t *b, size_t n) {
     size_t off = 0;
     while (off < n) {
+#ifdef MSG_NOSIGNAL
+        ssize_t w = send(fd, b + off, n - off, MSG_NOSIGNAL);
+#else
         ssize_t w = write(fd, b + off, n - off);
+#endif
         if (w <= 0) { if (w < 0 && errno == EINTR) continue; return 0; }
         off += (size_t)w;
     }
@@ -465,6 +483,7 @@ static int net_connect(const char *host, uint16_t port) {
     for (struct addrinfo *ai = res; ai && !idx_sync_stop; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
+        sock_nosigpipe(fd);
         int fl = fcntl(fd, F_GETFL, 0);
         fcntl(fd, F_SETFL, fl | O_NONBLOCK);
         int r = connect(fd, ai->ai_addr, ai->ai_addrlen);
@@ -926,6 +945,7 @@ static time_t s_parity;
 static int cmd_sync(int argc, char **argv) {
     // sync <coin> <db> [peers] [activation] — peers: comma-separated host[:port]
     // list tried first (hostnames ok), or "auto" for cache+seeds only.
+    ignore_sigpipe();
     if (argc < 4) { fprintf(stderr, "usage: sync <doge|pep|testnet|regtest> <db> [peers=127.0.0.1|auto] [activation]\n"); return 2; }
     const Coin *coin = coin_by_name(argv[2]); if (!coin) { fprintf(stderr, "unknown coin %s\n", argv[2]); return 2; }
     const char *dbpath = argv[3]; const char *ip = argc > 4 ? argv[4] : "127.0.0.1";
@@ -2201,6 +2221,7 @@ static void chain_topup(SConn *conns, sqlite3 *db, const Coin *coin, const char 
 // as dn* commands on pepenet peers.
 int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
               const char *dial_peers, volatile int *stop, const IdxMeshHooks *mesh) {
+    ignore_sigpipe();
     const Coin *coin = coin_by_name(coinname); if (!coin) return -1;
     g_serve_mesh = mesh;
     (void)self_nonce();                      // generate the version nonce now (before threads race)
@@ -2210,6 +2231,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
     if (port) {
         lfd = socket(AF_INET, SOCK_STREAM, 0);
         if (lfd < 0) { idx_db_close(db); return -1; }
+        sock_nosigpipe(lfd);
         int yes = 1; setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
         struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET; sa.sin_addr.s_addr = INADDR_ANY; sa.sin_port = htons(port);
@@ -2524,6 +2546,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
         if (lfd >= 0 && (pfd[0].revents & POLLIN)) {
             int cfd = accept(lfd, NULL, NULL);
             if (cfd >= 0) {
+                sock_nosigpipe(cfd);
                 char ip[INET_ADDRSTRLEN] = ""; unsigned rport = 0;
                 struct sockaddr_in pa; socklen_t pl2 = sizeof pa;
                 if (getpeername(cfd, (struct sockaddr *)&pa, &pl2) == 0) {
@@ -2663,6 +2686,7 @@ static int probe_connect_start(const char *host, uint16_t port) {
     }
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+    sock_nosigpipe(fd);
     int fl = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
     if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0 && errno != EINPROGRESS) {
@@ -2674,6 +2698,7 @@ static int probe_connect_start(const char *host, uint16_t port) {
 
 int idx_crawl(const char *coinname, const char *dbpath, const char *extra,
               int max_dials, volatile int *stop) {
+    ignore_sigpipe();
     const Coin *coin = coin_by_name(coinname); if (!coin) return -1;
     sqlite3 *db = idx_db_open(dbpath); if (!db) return -1;
     char cand[128][80]; int nc = 0;
