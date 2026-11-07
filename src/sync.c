@@ -14,17 +14,21 @@
 #include "mempool.h"
 #include "txcheck.h"
 #include "net_policy.h"
+#include "snapshot.h"
+#include "sha256.h"
 #include "sm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "dbcheck.h"
 #include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/random.h>
@@ -48,7 +52,7 @@ typedef struct {
     const char *name; uint8_t magic[4]; uint16_t port; int64_t activation;
     int64_t start; uint8_t start_hash[32];
     int64_t subsidy;         // §3.4 flat-tail subsidy (koinu/block); consensus-critical per host
-    const char *seeds[3];    // the host chain's own DNS seeds (Core's vSeeds hosts),
+    const char *seeds[4];    // the host chain's own DNS seeds (Core's vSeeds hosts),
                              // NULL-terminated — the last-resort sync candidates
     // PoW validation profile (pow.h): powlimit == 0 skips validation entirely
     // (test profiles sync synthetic fixture chains). start_bits/start_time/
@@ -57,18 +61,24 @@ typedef struct {
     // scripts/fetchblk-style, when the checkpoint was pinned).
     uint32_t powlimit, aux_chain_id, start_bits;
     int64_t  start_time, start_prev_time;
+    uint8_t  onchain_magic[2];   // name-carrier prefix after 0xFF (per chain)
 } Coin;
 #define SUBSIDY_10K  (10000LL * SM_KOINU_PER_DOGE)
 static const Coin COINS[] = {
-    { "doge",    { 0xC0, 0xC0, 0xC0, 0xC0 }, 22556, 0, 6264000,  // checkpoint re-pinned near tip
-      // (block 6,264,000 = edd25ca2…fdb6, 2026-06-25) for a live-rate reading; activation
-      // passed on the CLI (= start + FEE_WINDOW + 1). Internal (little-endian) byte order.
-      { 0xb6, 0xfd, 0xb0, 0xe4, 0xb9, 0x79, 0xe2, 0x88, 0x01, 0x7a, 0x39, 0x8a, 0x2c, 0x5f, 0xca, 0xc8,
-        0x53, 0x53, 0x3e, 0x93, 0xd5, 0xa3, 0xc9, 0xe4, 0x7a, 0x05, 0x37, 0x07, 0xa2, 0x5c, 0xd2, 0xed }, SUBSIDY_10K,
-      { "seed.multidoge.org", "seed2.multidoge.org", NULL },
-      0x1e0fffff, 0x62, 0x1a00969d, 1782425940, 1782425922 },
+    // Dogecoin mainnet (DogeNet). Names activate at block 6,429,500 (target
+    // wall-clock 2026-10-25 ~04:40 UTC; re-pinned 2026-10-24 for live
+    // testing, keeping the 11,000 gap). Prefix 0xFF 'D' 'N'.
+    // Fold checkpoint (start) is 6,418,500 (header baebf7e7…df7ad1, 2026-10-17)
+    // — 11,000 below activation so the §3.4 oracle window (FEE_WINDOW 10,081,
+    // fed from start+1) is FULL from block 6,428,582. Internal (LE) byte order.
+    // onchain magic is 'D' 'N'. (dane-07: matches namespace-indexer ce68a5c.)
+    { "doge",    { 0xC0, 0xC0, 0xC0, 0xC0 }, 22556, 6429500, 6418500,
+      { 0xd1, 0x7a, 0xdf, 0xfc, 0xa8, 0x67, 0x30, 0x68, 0xbf, 0xbc, 0x7d, 0x95, 0x36, 0x9c, 0xec, 0x17,
+        0x1c, 0x12, 0x3f, 0xa4, 0xe6, 0xf0, 0x42, 0xa6, 0x6a, 0xe4, 0x7d, 0x5b, 0xe7, 0xf7, 0xeb, 0xba }, SUBSIDY_10K,
+      { "seed.dogecoin.surf", "seed.multidoge.org", "seed2.multidoge.org", NULL },
+      0x1e0fffff, 0x62, 0x19547b37, 1792213564, 1792213486, { 0x44, 0x4E } },
     // Pepecoin mainnet (Dogecoin 1.14 fork; same 1-min blocks + flat 10k tail subsidy).
-    // Names activate at block 1,130,000 (re-pinned 2026-07-20 for the 0xFF 'P' 'N'
+    // Names activate at block 1,130,000 (re-pinned 2026-07-20 for the PN
     // prefix relaunch); the fold checkpoint (start) is pinned at 1,119,000 (header
     // cda615cf…fad1bb, 2026-07-11 — genesis-walked and chain-linked up to the
     // prior 1,122,000 pin before adoption). start sits 11,000 blocks below
@@ -77,20 +87,20 @@ static const Coin COINS[] = {
     // is a full-window rate; no partial-window launch case. Re-pinning start
     // ORPHANS dbs synced from the old 1,122,000 pin (their rates at
     // 1,130,000..1,132,081 were partial-window): delete the db and resync.
-    // Internal (little-endian) byte order.
+    // Internal (little-endian) byte order. onchain magic is 'P' 'N'.
     { "pep",     { 0xC0, 0xA0, 0xF0, 0xE0 }, 33874, 1130000, 1119000,
       { 0xbb,0xd1,0xfa,0xd7,0x7f,0xd3,0xf2,0x40,0x05,0xfc,0x5f,0x62,0xc4,0x1d,0xb7,0x8b,
         0xc2,0xf2,0x19,0x0e,0x44,0x2c,0x45,0xbd,0xb7,0x57,0xe5,0x68,0xcf,0x15,0xa6,0xcd }, SUBSIDY_10K,
       { "seeds.pepecoin.org", "seeds.pepeblocks.com", NULL },
-      0x1e0fffff, 0x3f, 0x196ac0dc, 1783774438, 1783774393 },
+      0x1e0fffff, 0x3f, 0x196ac0dc, 1783774438, 1783774393, { 0x50, 0x4E } },
     { "testnet", { 0xFC, 0xC1, 0xB7, 0xDC }, 44556, 0, 0,
       { 0x9e,0x55,0x50,0x73,0xd0,0xc4,0xf3,0x64,0x56,0xdb,0x89,0x51,0xf4,0x49,0x70,0x4d,
         0x54,0x4d,0x28,0x26,0xd9,0xaa,0x60,0x63,0x6b,0x40,0x37,0x46,0x26,0x78,0x0a,0xbb }, SUBSIDY_10K,
-      { NULL }, 0, 0, 0, 0, 0 },       // powlimit 0 = validation off (fixtures)
+      { NULL }, 0, 0, 0, 0, 0, { 0x50, 0x4E } },       // powlimit 0 = validation off (fixtures); PN magic
     { "regtest", { 0xFA, 0xBF, 0xB5, 0xDA }, 18444, 0, 0,
       { 0xa5,0x73,0xe9,0x1c,0x17,0x72,0x07,0x6c,0x0d,0x40,0xf7,0x0e,0x44,0x08,0xc8,0x3a,
         0x31,0x70,0x5f,0x29,0x6a,0xe6,0xe7,0x62,0x9d,0x4a,0xdc,0xb5,0xa3,0x60,0x21,0x3d }, SUBSIDY_10K,
-      { NULL }, 0, 0, 0, 0, 0 },       // powlimit 0 = validation off (fixtures)
+      { NULL }, 0, 0, 0, 0, 0, { 0x50, 0x4E } },       // powlimit 0 = validation off (fixtures); PN magic
 };
 static const Coin *coin_by_name(const char *n) {
     for (unsigned i = 0; i < sizeof COINS / sizeof COINS[0]; i++) if (!strcmp(COINS[i].name, n)) return &COINS[i];
@@ -100,6 +110,94 @@ static const Coin *coin_by_name(const char *n) {
 uint16_t idx_coin_port(const char *coin) {
     const Coin *c = coin_by_name(coin);
     return c ? c->port : 0;
+}
+
+int idx_coin_onchain_magic(const char *name, uint8_t out[2]) {
+    const Coin *c = coin_by_name(name);
+    if (!c || !out) return 0;
+    memcpy(out, c->onchain_magic, 2);
+    return 1;
+}
+
+// idx-10: which on-chain prefix a db folds under. Never guesses pep.
+//   1. an explicit coin (--coin / the snapshot coin arg) wins; a stored magic
+//      that disagrees is refused (refold may override it: it rebuilds all);
+//   2. else the stored meta onchain_magic, unless the db's activation/start
+//      pins identify a coin with a DIFFERENT magic (a poisoned db, e.g. the
+//      old doge db a pre-idx-10 refold stamped 'PN') -> refuse;
+//   3. else inferred from meta activation, or from the first stored block
+//      height, matching a coin profile pin (every matching profile must agree:
+//      activation 0 = testnet/regtest, both 'PN');
+//   4. else refuse with a clear error.
+// Returns 1 = explicit/stored (safe to persist), 2 = inferred (do not
+// persist), 0 = refused (message printed).
+static void stamp_magic(SmState *s, const uint8_t mag[2]) {
+    if (s && mag) memcpy(s->onchain_magic, mag, 2);
+}
+static int infer_magic(sqlite3 *db, uint8_t out[2], char *why, size_t cap) {
+    int64_t act = idx_db_get_activation(db, -1), first = -1;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT MIN(height) FROM blocks", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL)
+        first = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    int found = 0; const char *who = NULL;
+    for (unsigned i = 0; i < sizeof COINS / sizeof COINS[0]; i++) {
+        const Coin *c = &COINS[i];
+        int hit = (act >= 0 && act == c->activation) ||
+                  (act < 0 && first >= 0 && c->start > 0 && (first == c->start || first == c->start + 1));
+        if (!hit) continue;
+        if (found && memcmp(out, c->onchain_magic, 2)) return -1;     // ambiguous
+        memcpy(out, c->onchain_magic, 2); found = 1; who = c->name;
+    }
+    if (found) snprintf(why, cap, "inferred from %s pins (%s %lld)", who,
+                        act >= 0 ? "activation" : "first block", (long long)(act >= 0 ? act : first));
+    return found;
+}
+static int resolve_magic(SmState *s, sqlite3 *db, const char *coin, int allow_override, const char *cmd) {
+    uint8_t stored[2], inf[2], use[2]; char why[96] = "";
+    int has = db && idx_db_get_onchain_magic(db, stored);
+    int ih = db ? infer_magic(db, inf, why, sizeof why) : 0;
+    const Coin *c = coin ? coin_by_name(coin) : NULL;
+    if (coin && !c) { fprintf(stderr, "%s: REFUSED: unknown coin '%s'\n", cmd, coin); return 0; }
+    if (c) {
+        memcpy(use, c->onchain_magic, 2);
+        if (has && memcmp(stored, use, 2)) {
+            if (!allow_override) {
+                fprintf(stderr, "%s: REFUSED: db onchain_magic %c%c does not match coin %s (%c%c)\n",
+                        cmd, stored[0], stored[1], coin, use[0], use[1]);
+                return 0;
+            }
+            fprintf(stderr, "%s: note: db onchain_magic %c%c replaced by %s's %c%c\n",
+                    cmd, stored[0], stored[1], coin, use[0], use[1]);
+        }
+        stamp_magic(s, use); return 1;
+    }
+    if (has) {
+        if (ih == 1 && memcmp(inf, stored, 2)) {
+            fprintf(stderr, "%s: REFUSED: db onchain_magic %c%c contradicts its pins (%s -> %c%c); "
+                            "pass --coin <name> explicitly\n", cmd, stored[0], stored[1], why, inf[0], inf[1]);
+            return 0;
+        }
+        stamp_magic(s, stored); return 1;
+    }
+    if (ih == 1) { stamp_magic(s, inf); fprintf(stderr, "%s: note: db has no onchain_magic; %s\n", cmd, why); return 2; }
+    fprintf(stderr, "%s: REFUSED: db has no onchain_magic and its activation/start pins %s; "
+                    "pass --coin <doge|pep|testnet|regtest>\n", cmd,
+            ih < 0 ? "match coins with different prefixes" : "match no known coin");
+    return 0;
+}
+// strip "--coin NAME" from argv (any position); returns NAME or NULL
+static const char *take_coin_opt(int *argc, char **argv) {
+    const char *coin = NULL;
+    for (int i = 2; i < *argc; i++)
+        if (!strcmp(argv[i], "--coin")) {
+            if (i + 1 >= *argc) { argv[i] = NULL; (*argc)--; return ""; }   // dangling: "" = unknown coin
+            coin = argv[i + 1];
+            for (int j = i; j + 2 <= *argc; j++) argv[j] = argv[j + 2];
+            *argc -= 2; i--;
+        }
+    return coin;
 }
 
 // ── fold-block context (shared by offline + P2P) ─────────────────────────────
@@ -173,7 +271,51 @@ static int connect_block(FoldCtx *fc, int64_t height, const uint8_t *raw, size_t
         if (fc->folded > folded_before || fc->s->ev[SM_EV_LAPSE] != lapses_before)
             idx_db_epochs_update(fc->db, fc->s, height);
         idx_db_save_sync(fc->db, height, meta.block_hash);
+        idx_test_crash_point(height);
     }
+    return 1;
+}
+
+// idx-03 test-only fault injection: IDX_TEST_CRASH_AT=<height> makes the process
+// SIGKILL itself right after block <height>'s autocommitted rows land and BEFORE the
+// batch projection — the exact crash window recovery has to heal. Unset = no-op
+// (one getenv per process).
+void idx_test_crash_point(int64_t height) {
+    const char *e = getenv("IDX_TEST_CRASH_AT");   // one getenv per block: negligible
+    if (!e || !*e) return;
+    int64_t at = strtoll(e, NULL, 10);
+    if (at >= 0 && height == at) { kill(getpid(), SIGKILL); _exit(137); }
+}
+
+// idx-03 crash recovery, shared by sync and index. The fold state loads from the
+// projection (proj_height); per-block rows (blocks/raw_blocks/epochs/utxos/meta
+// cursor) autocommit ahead of it. If the cursor is ahead of the projection, rewind
+// the cursor to it AND drop every height-keyed row above it — re-folding the gap
+// re-derives them, and if the chain moved while we were down, stale rows from the
+// abandoned branch (utxo spend marks, epochs, block hashes the fork search would
+// match) must not survive. A cursor with NO projection at all (crash before the
+// first batch committed) rewinds to `start` when the projection is empty.
+// Returns 1 if it rewound (caller must also roll its oracle back to *height+1 and
+// prune any serve cache above *height), 0 if the db was consistent.
+int idx_sync_recover(sqlite3 *db, int64_t start, const uint8_t start_hash[32],
+                     int64_t *height, uint8_t tip[32]) {
+    int64_t proj_h = idx_db_projected_height(db), to;
+    if (proj_h < 0) {
+        int64_t rows = 0; sqlite3_stmt *st;
+        if (sqlite3_prepare_v2(db, "SELECT (SELECT COUNT(*) FROM names)+(SELECT COUNT(*) FROM commits)+(SELECT COUNT(*) FROM muts)", -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW) rows = sqlite3_column_int64(st, 0);
+            sqlite3_finalize(st);
+        }
+        if (rows || *height <= start) return 0;   // legacy pre-sentinel db: trust it
+        to = start;
+    } else if (proj_h < *height) to = proj_h < start ? start : proj_h;
+    else return 0;
+    fprintf(stderr, "recovery: sync height %lld is ahead of the projection %lld (prior crash) — resuming from %lld\n",
+            (long long)*height, (long long)proj_h, (long long)to);
+    idx_db_block_prune_above(db, to);
+    *height = to;
+    if (to <= start || !idx_db_block_get(db, to, tip)) memcpy(tip, start_hash, 32);
+    idx_db_save_sync(db, to, tip);
     return 1;
 }
 
@@ -196,27 +338,52 @@ static int rollback_replay_cb(void *u, int64_t height, const uint8_t *raw, size_
     return 1;
 }
 // Roll the fold back to `to_height` (kept): prune every height-keyed projection
-// above it, drop its oracle rows, and rebuild the state by replaying the stored
-// raw blocks ≤ to_height in order (carrier blocks + wallet-touching blocks) — a
-// byte-identical refold, because the skipped blocks touch no state and their
-// oracle rows (all heights) are already in the feed. The wallet blocks in the
-// substrate re-mark spends the replayed carrier funds would otherwise shed.
+// above it, drop its oracle rows, and rebuild the state from local data.
+// idx-13 (PROPOSAL): the rebuild is the idx-12 exact replay — every blocks row
+// <= to_height gets the sm_begin_block the live fold gave it (raw rows replay
+// their txs), so expiry pruning, lease lapses, lapse epochs and lapse-stamped
+// muts land at the live heights. The old carrier-only replay moved them to the
+// next carrier block (or dropped them after the last one), so a reorg could
+// leave a node's state diverged from a fresh sync of the winning branch.
 // Replaces *s (old state freed). Returns 1, 0 on failure.
+static int refold_replay_exact(SmState **s, sqlite3 *db, OracleFeed *oracle,
+                               int64_t activation, int64_t to_height, int use_ckpt);
+// Test-only fault hook: called inside the rollback transaction just before
+// COMMIT. NULL in every production path.
+void (*idx_sync_rollback_test_hook)(sqlite3 *db, int64_t to_height) = NULL;
+// The prune (blocks/raw_blocks/checkpoints above to_height), the replay's db
+// side effects (utxo/epoch rows) and the projection + proj_height run in ONE
+// BEGIN IMMEDIATE..COMMIT: a crash or failure anywhere in between leaves the
+// pre-reorg db exactly as it was (blocks, projection and cursor still agree),
+// never a pruned chain under a stale projection. oracle_rollback is in-RAM
+// only; on failure the oracle and *s are reloaded from the untouched db, so the
+// caller sees the committed pre-rollback state. Nested inside a caller's open
+// transaction it uses a SAVEPOINT instead.
 int idx_sync_rollback(SmState **s, sqlite3 *db, OracleFeed *oracle,
                       int64_t activation, int64_t to_height) {
-    idx_db_block_prune_above(db, to_height);
-    oracle_rollback(oracle, to_height + 1);
+    int outer = sqlite3_get_autocommit(db) != 0;
+    if (sqlite3_exec(db, outer ? "BEGIN IMMEDIATE" : "SAVEPOINT idx_rollback", NULL, NULL, NULL) != SQLITE_OK)
+        return 0;
+    int ok = refold_replay_exact(s, db, oracle, activation, to_height, 1);
+    if (ok && idx_sync_rollback_test_hook) idx_sync_rollback_test_hook(db, to_height);
+    if (ok) ok = sqlite3_exec(db, outer ? "COMMIT" : "RELEASE idx_rollback", NULL, NULL, NULL) == SQLITE_OK;
+    if (ok) return 1;
+    if (outer) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    else { sqlite3_exec(db, "ROLLBACK TO idx_rollback", NULL, NULL, NULL); sqlite3_exec(db, "RELEASE idx_rollback", NULL, NULL, NULL); }
+    // restore RAM from the unchanged db
+    uint8_t mag[2] = { 0, 0 };
+    if (*s) memcpy(mag, (*s)->onchain_magic, 2);
     sm_free(*s);
     *s = sm_new((uint64_t)activation);
-    FoldCtx fc = { .s = *s, .db = db, .oracle = oracle };
-    fold_load_watch(&fc);
-    if (idx_db_rawblock_iter(db, to_height, rollback_replay_cb, &fc) < 0) return 0;
-    // The replayed state stands at to_height (carrier-less blocks past the last
-    // carrier touch nothing) — stamp the cursor so the projection records that,
-    // not the last carrier's height (or 0 for a carrier-less range).
-    (*s)->cur_height = to_height;
-    idx_db_project(db, *s);
-    return 1;
+    if (*s) {
+        memcpy((*s)->onchain_magic, mag, 2);
+        idx_db_load_state(db, *s);
+        int64_t ph = idx_db_projected_height(db);
+        if (ph >= 0) (*s)->cur_height = ph;
+    }
+    oracle_rollback(oracle, INT64_MIN);
+    idx_db_oracle_warm(db, oracle);
+    return 0;
 }
 
 // ── file helpers ──────────────────────────────────────────────────────────────
@@ -261,16 +428,25 @@ static void print_digest(SmState *s) {
 }
 
 static int cmd_index(int argc, char **argv) {
-    // index <db> <activation> <blockfile> [blockfile...]   (heights start at 0)
-    if (argc < 5) { fprintf(stderr, "usage: index <db> <activation_height> <blockfile> [more...]\n"); return 2; }
+    // index <db> <activation> <blockfile> [blockfile...] [--coin NAME]  (heights start at 0)
+    const char *coin = take_coin_opt(&argc, argv);
+    if (coin && !coin_by_name(coin)) { fprintf(stderr, "unknown coin %s\n", coin); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: index <db> <activation_height> <blockfile> [more...] [--coin NAME]\n"); return 2; }
     const char *dbpath = argv[2]; int64_t activation = strtoll(argv[3], NULL, 10);
     sqlite3 *db = idx_db_open(dbpath); if (!db) { fprintf(stderr, "cannot open %s\n", dbpath); return 1; }
     idx_db_set_activation(db, activation);
     SmState *s = sm_new((uint64_t)activation);
+    int rm = resolve_magic(s, db, coin, 0, "index");
+    if (!rm) { sm_free(s); idx_db_close(db); return 1; }
+    if (rm == 1) idx_db_set_onchain_magic(db, s->onchain_magic);   // never persist an inference
     OracleFeed *oracle = oracle_new();
     idx_db_load_state(db, s); idx_db_oracle_warm(db, oracle); oracle_set_subsidy(oracle, idx_db_get_subsidy(db, SUBSIDY_10K));
     int64_t height = 0; uint8_t tip[32];
-    if (idx_db_load_sync(db, &height, tip)) height++;   // resume after stored tip
+    if (idx_db_load_sync(db, &height, tip)) {           // resume after stored tip
+        static const uint8_t z[32];
+        if (idx_sync_recover(db, -1, z, &height, tip)) oracle_rollback(oracle, height + 1);
+        height++;
+    }
     else idx_db_epochs_mark(db, 0);                     // fresh DB: coverage from genesis
     FoldCtx fc = { .s = s, .db = db, .oracle = oracle };
     fold_load_watch(&fc);
@@ -287,9 +463,10 @@ static int cmd_index(int argc, char **argv) {
     return 0;
 }
 
-static SmState *open_state(const char *dbpath, sqlite3 **db_out) {
+static SmState *open_state(const char *dbpath, const char *coin, sqlite3 **db_out) {
     sqlite3 *db = idx_db_open(dbpath); if (!db) return NULL;
     SmState *s = sm_new((uint64_t)idx_db_get_activation(db, 0));
+    if (!resolve_magic(s, db, coin, 0, "open")) { sm_free(s); idx_db_close(db); return NULL; }
     idx_db_load_state(db, s);
     *db_out = db; return s;
 }
@@ -305,7 +482,8 @@ static void print_ts(const char *label, int64_t t) {
     printf("  %-15s %lld  (%s)\n", label, (long long)t, when);
 }
 static int cmd_resolve(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: resolve <db> <name>\n"); return 2; }
+    (void)take_coin_opt(&argc, argv);   // accepted for symmetry; resolve reads projected rows only
+    if (argc < 4) { fprintf(stderr, "usage: resolve <db> <name> [--coin NAME]\n"); return 2; }
     sqlite3 *db = idx_db_open(argv[2]); if (!db) { fprintf(stderr, "cannot open db\n"); return 1; }
     IdxNameRow r;
     if (idx_db_name_row(db, argv[3], &r)) {
@@ -336,16 +514,18 @@ static int cmd_resolve(int argc, char **argv) {
 
 static void owned_cb(void *u, const char *name, int64_t lease, int st) { (void)u; (void)st; printf("  %-20s lease_expiry=%lld\n", name, (long long)lease); }
 static int cmd_owned(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: owned <db> <hash160hex>\n"); return 2; }
-    sqlite3 *db; SmState *s = open_state(argv[2], &db); if (!s) { fprintf(stderr, "cannot open db\n"); return 1; }
+    const char *coin = take_coin_opt(&argc, argv);
+    if (argc < 4) { fprintf(stderr, "usage: owned <db> <hash160hex> [--coin NAME]\n"); return 2; }
+    sqlite3 *db; SmState *s = open_state(argv[2], coin, &db); if (!s) { fprintf(stderr, "cannot open db\n"); return 1; }
     int n = idx_db_owned(db, argv[3], owned_cb, NULL);
     if (!n) printf("  (no names)\n");
     sm_free(s); idx_db_close(db); return 0;
 }
 
 static int cmd_digest(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: digest <db>\n"); return 2; }
-    sqlite3 *db; SmState *s = open_state(argv[2], &db); if (!s) { fprintf(stderr, "cannot open db\n"); return 1; }
+    const char *coin = take_coin_opt(&argc, argv);
+    if (argc < 3) { fprintf(stderr, "usage: digest <db> [--coin NAME]\n"); return 2; }
+    sqlite3 *db; SmState *s = open_state(argv[2], coin, &db); if (!s) { fprintf(stderr, "cannot open db\n"); return 1; }
     int64_t h = 0; uint8_t tip[32];
     if (idx_db_load_sync(db, &h, tip)) {
         printf("height %lld\n", (long long)h);
@@ -365,22 +545,139 @@ static int cmd_digest(int argc, char **argv) {
 // rules: the oracle re-warmed from the blocks table, the state replayed from the
 // stored raw carrier blocks. The consensus-change tool: after a rule re-pin the
 // projection is rebuilt in seconds without touching the network.
+// idx-10: refold replays raw_blocks only. A height that commits / muts / an
+// owned epoch row points at but raw_blocks lacks would silently vanish from the
+// rebuilt state. Count them (lapse epochs, owner NULL, are excluded: the live
+// fold records those at non-carrier heights and refold re-derives them; so are
+// commits already expired at the tip, which no later claim can use).
+// Returns the number missing (-1 on query error); first few into `first`.
+static long long refold_missing_heights(sqlite3 *db, char *first, size_t cap) {
+    const char *q =
+        "SELECT h FROM (SELECT commit_height AS h FROM commits"
+        // expired, unclaimed commits are dead state a refold prunes anyway
+        " WHERE commit_time + ?1 >= coalesce((SELECT max(time) FROM blocks), 0)"
+        " UNION SELECT start_height FROM epochs WHERE owner IS NOT NULL"
+        // idx-12: a mut stamped by a lapse at a non-carrier height is re-derived
+        // exactly (refold now runs the per-block preblock on every blocks row)
+        " UNION SELECT height FROM muts WHERE height NOT IN"
+        "   (SELECT start_height FROM epochs WHERE owner IS NULL)) WHERE h IS NOT NULL"
+        " AND h NOT IN (SELECT height FROM raw_blocks) ORDER BY h";
+    sqlite3_stmt *st = NULL; long long n = 0; size_t off = 0; first[0] = 0;
+    if (sqlite3_prepare_v2(db, q, -1, &st, NULL) != SQLITE_OK) return -1;
+    // +7200 s: max(block time) can run ahead of the MTP the expiry rule uses
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)SM_COMMIT_EXPIRY + 7200);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (n < 8 && off + 24 < cap)
+            off += (size_t)snprintf(first + off, cap - off, "%s%lld", n ? "," : "", (long long)sqlite3_column_int64(st, 0));
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+// idx-12: exact refold replay. The live fold calls sm_begin_block (→ sm_preblock:
+// lease lapses + COMMIT_EXPIRY pruning, both keyed on MTP) on EVERY connected
+// block; the reorg replay (idx_sync_rollback) only sees stored raw blocks, so
+// pruning and lapses land at the next carrier height. Refold walks every blocks
+// row ≤ to_height instead: raw rows replay through rollback_replay_cb exactly as
+// before; non-raw rows get the same begin_block the live fold gave them (a block
+// with no carrier tx folds nothing else). MTP comes from the blocks table — the
+// same rows idx_db_oracle_warm feeds the oracle — via an 11-deep ring (O(1) per
+// height; oracle_for_height's rate scan is O(n) and the rate is unused by
+// preblock). Lapse epochs are then recorded at the exact live height.
+// Live sync and idx_sync_rollback are unchanged. Returns 1, 0 on failure.
+static int refold_replay_exact(SmState **s, sqlite3 *db, OracleFeed *oracle,
+                               int64_t activation, int64_t to_height, int use_ckpt) {
+    idx_db_block_prune_above(db, to_height);
+    if (!idx_db_ckpt_prune_above(db, to_height)) return 0;
+    oracle_rollback(oracle, to_height + 1);
+    uint8_t mag[2] = { 0, 0 };
+    if (*s) memcpy(mag, (*s)->onchain_magic, 2);
+    sm_free(*s);
+    *s = sm_new((uint64_t)activation);
+    memcpy((*s)->onchain_magic, mag, 2);
+    // checkpoint: start from the newest stored state <= to_height (or from
+    // activation when there is none). Heights <= base were folded into it.
+    int64_t base = use_ckpt ? idx_db_ckpt_load(db, to_height, *s) : -1;
+    if (base < 0) base = INT64_MIN;
+    FoldCtx fc = { .s = *s, .db = db, .oracle = oracle };
+    fold_load_watch(&fc);
+    sqlite3_stmt *st = NULL;
+    int64_t ring[11]; int nr = 0, ok = 1;
+    if (base != INT64_MIN) {                 // MTP ring = the 11 blocks-row times <= base
+        if (sqlite3_prepare_v2(db, "SELECT time FROM (SELECT height,time FROM blocks WHERE height<=?1"
+                                   " AND time IS NOT NULL ORDER BY height DESC LIMIT 11) ORDER BY height",
+                               -1, &st, NULL) != SQLITE_OK) return 0;
+        sqlite3_bind_int64(st, 1, base);
+        while (sqlite3_step(st) == SQLITE_ROW) ring[nr++] = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st); st = NULL;
+    }
+    // raw rows without a blocks row are still replayed (ordered merge via UNION)
+    if (sqlite3_prepare_v2(db,
+            "SELECT u.h, b.time, r.raw FROM (SELECT height AS h FROM blocks WHERE height<=?1 AND height>?2"
+            " UNION SELECT height FROM raw_blocks WHERE height<=?1 AND height>?2) u"
+            " LEFT JOIN blocks b ON b.height=u.h LEFT JOIN raw_blocks r ON r.height=u.h ORDER BY u.h",
+            -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, to_height);
+    sqlite3_bind_int64(st, 2, base);
+    while (ok && sqlite3_step(st) == SQLITE_ROW) {
+        int64_t h = sqlite3_column_int64(st, 0);
+        if (sqlite3_column_type(st, 2) != SQLITE_NULL) {
+            ok = rollback_replay_cb(&fc, h, (const uint8_t *)sqlite3_column_blob(st, 2),
+                                    (size_t)sqlite3_column_bytes(st, 2));
+        } else {
+            int64_t mtp = sm_mtp(ring, nr);
+            int64_t lapses_before = (*s)->ev[SM_EV_LAPSE];
+            sm_begin_block(*s, h, mtp, (*s)->cur_rate);   // preblock is rate-free
+            if ((*s)->ev[SM_EV_LAPSE] != lapses_before) idx_db_epochs_update(db, *s, h);
+        }
+        if (sqlite3_column_type(st, 1) != SQLITE_NULL) {   // oracle feed = blocks rows only
+            if (nr == 11) { memmove(ring, ring + 1, 10 * sizeof *ring); nr = 10; }
+            ring[nr++] = sqlite3_column_int64(st, 1);
+        }
+    }
+    sqlite3_finalize(st);
+    if (!ok) return 0;
+    (*s)->cur_height = to_height;
+    return idx_db_project(db, *s);
+}
 static int cmd_refold(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: refold <db>\n"); return 2; }
+    int force = 0;
+    const char *coin = take_coin_opt(&argc, argv);
+    if (coin && !coin_by_name(coin)) { fprintf(stderr, "unknown coin %s\n", coin); return 2; }
+    for (int i = 2; i < argc; i++)
+        if (!strcmp(argv[i], "--force")) { for (int j = i; j + 1 <= argc; j++) argv[j] = argv[j + 1]; argc--; i--; force = 1; }
+    if (argc < 3) { fprintf(stderr, "usage: refold <db> [--coin NAME] [--force]\n"); return 2; }
     sqlite3 *db = idx_db_open(argv[2]); if (!db) { fprintf(stderr, "cannot open db\n"); return 1; }
     int64_t height = 0; uint8_t tip[32];
     if (!idx_db_load_sync(db, &height, tip)) { fprintf(stderr, "db has no sync state\n"); idx_db_close(db); return 1; }
+    {
+        char first[256]; long long miss = refold_missing_heights(db, first, sizeof first);
+        if (miss < 0) { fprintf(stderr, "refold: REFUSED: cannot check raw_blocks coverage\n"); idx_db_close(db); return 1; }
+        if (miss > 0 && !force) {
+            fprintf(stderr, "refold: REFUSED: %lld height(s) referenced by commits/epochs/muts are missing from raw_blocks"
+                            " (first: %s%s) — a refold would silently drop that state. Nothing changed."
+                            " Re-sync those blocks, or pass --force to refold anyway.\n", miss, first, miss > 8 ? ",..." : "");
+            idx_db_close(db); return 1;
+        }
+        if (miss > 0)
+            fprintf(stderr, "refold: WARNING (--force): %lld referenced height(s) missing from raw_blocks (first: %s%s);"
+                            " the rebuilt state will be SMALLER than the recorded one\n", miss, first, miss > 8 ? ",..." : "");
+    }
     int64_t activation = idx_db_get_activation(db, 0);
     SmState *s = sm_new((uint64_t)activation);
+    int rm = resolve_magic(s, db, coin, 1, "refold");
+    if (!rm) { fprintf(stderr, "refold: nothing changed\n"); sm_free(s); idx_db_close(db); return 1; }
+    if (rm == 1) idx_db_set_onchain_magic(db, s->onchain_magic);   // never persist an inference
     OracleFeed *oracle = oracle_new();
     idx_db_oracle_warm(db, oracle); oracle_set_subsidy(oracle, idx_db_get_subsidy(db, SUBSIDY_10K));
     // refold = the rules may have changed: recorded epochs could be wrong under the
     // new fold. Wipe and re-derive the whole history from the raw carrier blocks
-    // (complete coverage — mark from genesis; lapse edges land at carrier-block
-    // granularity, see rollback_replay_cb).
+    // (complete coverage — mark from genesis; idx-12: every blocks row gets its
+    // preblock, so expiry pruning and lapse edges land at the exact live heights).
     idx_db_epochs_wipe(db);
     idx_db_epochs_mark(db, 0);
-    if (!idx_sync_rollback(&s, db, oracle, activation, height)) {
+    idx_db_ckpt_wipe(db);                    // rules may have changed: old states are void
+    if (!refold_replay_exact(&s, db, oracle, activation, height, 0)) {
         fprintf(stderr, "refold failed\n");
         oracle_free(oracle); sm_free(s); idx_db_close(db); return 1;
     }
@@ -448,11 +745,25 @@ static int net_send(int fd, const uint8_t magic[4], const char *cmd, const uint8
     if (len && !write_all(fd, payload, len)) return 0;
     return 1;
 }
+// Wait up to timeout_ms for `ev` on fd in short slices, giving up early when
+// the embedding host sets idx_sync_stop: a stop must not sit behind a 15 s
+// peer timeout. Local timing only; nothing on the wire changes.
+static int stop_poll(int fd, short ev, int timeout_ms) {
+    int left = timeout_ms;
+    while (left > 0 && !idx_sync_stop) {
+        int slice = left < 100 ? left : 100;
+        struct pollfd p = { fd, ev, 0 };
+        int pr = poll(&p, 1, slice);
+        if (pr > 0) return 1;
+        if (pr < 0 && errno != EINTR) return 0;
+        left -= slice;
+    }
+    return 0;
+}
 static int read_n(int fd, uint8_t *buf, size_t n, int timeout_ms) {
     size_t got = 0;
     while (got < n) {
-        struct pollfd p = { fd, POLLIN, 0 };
-        int pr = poll(&p, 1, timeout_ms); if (pr <= 0) return 0;
+        if (!stop_poll(fd, POLLIN, timeout_ms)) return 0;
         ssize_t r = read(fd, buf + got, n - got); if (r <= 0) return 0; got += (size_t)r;
     }
     return 1;
@@ -488,9 +799,8 @@ static int net_connect(const char *host, uint16_t port) {
         fcntl(fd, F_SETFL, fl | O_NONBLOCK);
         int r = connect(fd, ai->ai_addr, ai->ai_addrlen);
         if (r != 0 && errno == EINPROGRESS) {
-            struct pollfd p = { fd, POLLOUT, 0 };
             int err = 0; socklen_t el = sizeof err;
-            if (poll(&p, 1, 5000) == 1 &&
+            if (stop_poll(fd, POLLOUT, 5000) &&
                 getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0) r = 0;
         }
         if (r == 0) { fcntl(fd, F_SETFL, fl); break; }
@@ -684,6 +994,50 @@ static int p2p_handshake(int fd, const uint8_t magic[4], int64_t our_height) {
 
 volatile int idx_sync_stop = 0;                 // embedding hosts only (indexer.h)
 volatile int idx_self_seed = 0;                 // set when a seed dial loops home (indexer.h)
+static pthread_mutex_t g_ph_mu = PTHREAD_MUTEX_INITIALIZER;
+static int64_t g_ph_best = 0, g_ph_disk = 0, g_ph_at = 0;
+// Seed in-memory high-water from the DB so a post-restart note/handshake cannot
+// transiently set g_ph_disk below the stored value (raise alone keeps the DB safe;
+// load keeps the rate-limit cursor honest).
+void idx_peer_height_load(sqlite3 *db) {
+    int64_t h = db ? idx_db_get_peer_height(db) : 0;
+    if (h <= 0) return;
+    pthread_mutex_lock(&g_ph_mu);
+    if (h > g_ph_best) g_ph_best = h;
+    if (h > g_ph_disk) g_ph_disk = h;
+    pthread_mutex_unlock(&g_ph_mu);
+}
+int64_t idx_peer_height_note(sqlite3 *db, int64_t h, int64_t now, int force) {
+    int64_t w = 0, best;
+    pthread_mutex_lock(&g_ph_mu);
+    if (h > g_ph_best) g_ph_best = h;
+    if (db && g_ph_best > g_ph_disk && (force || now - g_ph_at >= IDX_PH_WRITE_MIN_S)) {
+        w = g_ph_best; g_ph_at = now;            // g_ph_disk updated after raise from DB
+    }
+    best = g_ph_best;
+    pthread_mutex_unlock(&g_ph_mu);
+    if (w) {
+        idx_db_raise_peer_height(db, w);         // monotonic vs the stored value too
+        int64_t got = idx_db_get_peer_height(db);
+        pthread_mutex_lock(&g_ph_mu);
+        if (got > g_ph_disk) g_ph_disk = got;
+        if (got > g_ph_best) g_ph_best = got;
+        best = g_ph_best;
+        pthread_mutex_unlock(&g_ph_mu);
+    }
+    return best;
+}
+void idx_peer_height_reset(void) {
+    pthread_mutex_lock(&g_ph_mu); g_ph_best = g_ph_disk = g_ph_at = 0; pthread_mutex_unlock(&g_ph_mu);
+}
+// a serve peer announced (or pushed) a block we can place at height h: it has
+// at least that chain. Raise its live claim and the persisted peer_height.
+static void serve_peer_announced(void *conn_peer_h, sqlite3 *db, int64_t h) {
+    int64_t *ph = conn_peer_h;
+    if (h <= 0) return;
+    if (h > *ph) *ph = h;
+    idx_peer_height_note(db, h, (int64_t)time(NULL), 0);
+}
 volatile int64_t idx_sync_peer_height = 0;      // embedding hosts only (indexer.h)
 const char *idx_sync_agent = IDX_DNET_MARK "indexer:0.1/";   // hosts override (indexer.h)
 volatile char idx_sync_peer_agent[128] = "";    // this pass's peer subver (indexer.h)
@@ -950,6 +1304,7 @@ static int cmd_sync(int argc, char **argv) {
     const Coin *coin = coin_by_name(argv[2]); if (!coin) { fprintf(stderr, "unknown coin %s\n", argv[2]); return 2; }
     const char *dbpath = argv[3]; const char *ip = argc > 4 ? argv[4] : "127.0.0.1";
     sqlite3 *db = idx_db_open(dbpath); if (!db) { fprintf(stderr, "cannot open %s\n", dbpath); return 1; }
+    idx_peer_height_load(db);                 // seed g_ph_* from meta before any handshake/note
     // A stored activation always wins (changing it mid-state would fork the fold);
     // the CLI value only seeds a fresh DB.
     int64_t cli_act = argc > 5 ? strtoll(argv[5], NULL, 10) : coin->activation;
@@ -957,6 +1312,8 @@ static int cmd_sync(int argc, char **argv) {
     if (argc > 5 && activation != cli_act)
         fprintf(stderr, "note: db pins activation %lld; ignoring CLI %lld\n", (long long)activation, (long long)cli_act);
     SmState *s = sm_new((uint64_t)activation);
+    stamp_magic(s, coin->onchain_magic);
+    idx_db_set_onchain_magic(db, coin->onchain_magic);
     OracleFeed *oracle = oracle_new();
     oracle_set_subsidy(oracle, coin->subsidy); idx_db_set_subsidy(db, coin->subsidy);   // profile → feed + db pin
     idx_db_load_state(db, s); idx_db_oracle_warm(db, oracle); oracle_set_subsidy(oracle, idx_db_get_subsidy(db, SUBSIDY_10K));
@@ -971,15 +1328,8 @@ static int cmd_sync(int argc, char **argv) {
     // prior run died after advancing the (autocommitted) sync height past the last
     // committed projection, resume from proj_height and re-fold the gap — never from a
     // height ahead of the state, which would silently skip those blocks' actions.
-    int64_t proj_h = idx_db_projected_height(db);
-    if (proj_h >= 0 && proj_h < height) {
-        fprintf(stderr, "recovery: sync height %lld is ahead of the projection %lld (prior crash) — resuming from %lld\n",
-                (long long)height, (long long)proj_h, (long long)proj_h);
-        height = proj_h;
-        if (height <= coin->start) { height = coin->start; memcpy(tip, coin->start_hash, 32); }
-        else if (!idx_db_block_get(db, height, tip)) memcpy(tip, coin->start_hash, 32);
-        idx_db_save_sync(db, height, tip);
-    }
+    int recovered = idx_sync_recover(db, coin->start, coin->start_hash, &height, tip);
+    if (recovered) oracle_rollback(oracle, height + 1);
     // One-time wallet re-walk ("wallet_rewalk_v1"): earlier builds' rollback
     // replay re-INSERTed watched outputs with spent_height=NULL (OR REPLACE),
     // so an accepted reorg could resurrect an output whose spend sat in a
@@ -1012,6 +1362,8 @@ static int cmd_sync(int argc, char **argv) {
     // would stamp proj_height=0 at pass end — which the NEXT boot reads as a
     // crash gap and "recovers" a synced db all the way back to the checkpoint.
     s->cur_height = height;
+    if (idx_db_ckpt_seed(db, s) == 1)
+        fprintf(stderr, "rb_ckpt: first checkpoint taken on open at height %lld\n", (long long)height);
     FoldCtx fc = { .s = s, .db = db, .oracle = oracle };
     fold_load_watch(&fc);
     // serve cache: the header chain + rolling block window, a separate aux db
@@ -1023,6 +1375,7 @@ static int cmd_sync(int argc, char **argv) {
                           (int)(slash - dbpath), dbpath, coin->name);
       else snprintf(serve_path, sizeof serve_path, "serve-%s.db", coin->name); }
     fc.serve = serve_store_open(serve_path);
+    if (recovered) serve_store_prune_above(fc.serve, height);
 
     // ── phase 0: fold off the stage (sync-over-one-connection) ────────────────
     // The serve thread getdatas every unknown block inv on its (mesh) conns
@@ -1218,7 +1571,10 @@ static int cmd_sync(int argc, char **argv) {
             fprintf(stderr, "  %s:%u handshake failed\n", host, port);
             close(fd); fd = -1; continue;
         }
-        if (idx_sync_peer_height > 0) idx_db_set_peer_height(db, idx_sync_peer_height);
+        if (idx_sync_peer_height > 0) {   // a handshake claim, never below announced evidence
+            int64_t ev = idx_peer_height_note(NULL, 0, 0, 0);
+            idx_db_raise_peer_height(db, idx_sync_peer_height > ev ? idx_sync_peer_height : ev);  // db-monotonic
+        }
         net_peer_str(fd, picked, sizeof picked);
         idx_db_peer_seen(db, picked, (int64_t)idx_sync_peer_services,
                          (const char *)idx_sync_peer_agent, (int64_t)time(NULL));
@@ -1250,7 +1606,10 @@ static int cmd_sync(int argc, char **argv) {
         snprintf(picked, sizeof picked, "%s", fb_picked);
         idx_sync_peer_height = fb_h; idx_sync_peer_services = (uint64_t)fb_svc;
         snprintf((char *)idx_sync_peer_agent, sizeof idx_sync_peer_agent, "%s", fb_agent);
-        if (idx_sync_peer_height > 0) idx_db_set_peer_height(db, idx_sync_peer_height);
+        if (idx_sync_peer_height > 0) {   // a handshake claim, never below announced evidence
+            int64_t ev = idx_peer_height_note(NULL, 0, 0, 0);
+            idx_db_raise_peer_height(db, idx_sync_peer_height > ev ? idx_sync_peer_height : ev);  // db-monotonic
+        }
         fprintf(stderr, "  no archive peer reachable — using limited peer %s\n", picked);
     }
     if (fb_fd >= 0) close(fb_fd);
@@ -1378,6 +1737,9 @@ static int cmd_sync(int argc, char **argv) {
             }
             if (connect_block(&fc, height + 1, pl, pl_len)) {
                 height++;
+                // the sync peer served this block: it is at least this high
+                if (height > idx_sync_peer_height) idx_sync_peer_height = height;
+                idx_peer_height_note(db, height, (int64_t)time(NULL), 0);
                 int64_t hh; idx_db_load_sync(db, &hh, tip);   // refresh tip hash (hh == height)
                 got_any = 1;
             }
@@ -1388,6 +1750,7 @@ static int cmd_sync(int argc, char **argv) {
         else idle++;
     }
     fprintf(stderr, "sync idle — caught up at height %lld\n", (long long)height);
+    idx_peer_height_note(db, idx_sync_peer_height, (int64_t)time(NULL), 1);   // flush the rate-limited write
     if (idx_sync_peer_height > 0 && height >= idx_sync_peer_height)
         s_parity = time(NULL);          // hard parity, measured on a live socket
     idx_db_project(db, s);
@@ -1455,11 +1818,20 @@ invalid_peer:
 // mesh conn dropped and the two planes flapped forever. Still strict enough
 // that one looping host can't eat the table (64 slots, 3 per host).
 #define SERVE_INBOUND_PER_HOST 3
+// outbound TCP connect budget (was blocking stop_poll 5000ms inside net_connect)
+#define SERVE_CONNECT_S    5
+// outbound version/verack budget after TCP is up (was serve_dial's 5×3000ms)
+#define SERVE_DIAL_SHAKE_S 15
 
 typedef struct {
     int fd;
     uint8_t *buf; size_t len, cap;    // accumulated inbound bytes (frames span reads)
     int up, sent_ver;
+    int got_ver, got_verack;          // both required before up (legacy serve_dial)
+    int connecting;                   // 1 = nonblocking TCP connect in progress
+    time_t shake_by;                  // connect or outbound-handshake deadline
+    uint8_t *out; size_t out_len, out_off, out_cap;  // queued complete frames
+    int64_t peer_svc;                 // services from their version (applied at up)
     char peer[80];                    // remote ip:port (log + self-learn source)
     const uint8_t *magic;             // coin magic (the mesh send fn needs it)
     int  outbound;                    // dialed → keep the slot + redial
@@ -1498,18 +1870,143 @@ static void conn_ip(const SConn *c, char *ip, size_t n) {
     snprintf(ip, n, "%s", c->peer);
     char *col = strrchr(ip, ':'); if (col) *col = 0;
 }
+static int serve_send(SConn *c, const uint8_t *magic, const char *cmd,
+                      const uint8_t *payload, uint32_t len);
 // the mesh send fn handed to peer_up: emit a dn* command on this peer's conn
 static void serve_mesh_send(void *peer, const char *cmd, const uint8_t *pay, size_t n) {
     SConn *sc = (SConn *)peer;
-    if (sc->fd >= 0) net_send(sc->fd, sc->magic, cmd, pay, (uint32_t)n);
+    if (sc->fd >= 0) serve_send(sc, sc->magic, cmd, pay, (uint32_t)n);
 }
 static void serve_drop(SConn *c, const IdxMeshHooks *mesh);
+/* Serve sockets stay O_NONBLOCK. write_all/net_send must not be used on them:
+ * EAGAIN after a partial send tears a header/payload on the wire. Queue whole
+ * frames, flush on POLLOUT, drop the peer on hard error or overflow.
+ *
+ * SERVE_OUT_MAX is the userspace TX queue ceiling (not RSS):
+ *   SERVE_MSG_MAX (2 MiB) + 24 + 64 KiB = 2162712 bytes (~2.06 MiB) per conn.
+ * Arithmetic aggregate if all 64 seats held a full queue at once:
+ *   64 * 2162712 ≈ 132 MiB of TX queue buffers. That is a worst-case
+ * allocation ceiling, not measured resident set and not "free." Queues
+ * grow via realloc only as bytes are actually queued, and are freed on
+ * drop. Plus inbound recv buffers (capped at SERVE_MSG_MAX+1024 before
+ * drop): a delayed slow reader can pin a large TX queue and an RX buffer
+ * until overflow or timeout. Overflow / hard send failure drops that
+ * peer. A legal multi-block reply that does not fit the remaining queue
+ * therefore drops the peer rather than blocking accept or scheduling the
+ * extra frames — compatibility with this queue design, not a new policy. */
+#define SERVE_OUT_MAX (SERVE_MSG_MAX + 24u + 64u * 1024u)
+int idx_serve_send_eagain;
+int idx_serve_send_partial;
+#ifdef IDX_SERVE_TEST
+/* Compile-time test hook: production dnsd/indexerd are built without
+ * IDX_SERVE_TEST, so startup cannot activate a send-buffer override.
+ * The test binary passes -DIDX_SERVE_TEST and may set IDX_SERVE_TEST_SNDBUF. */
+const char *idx_serve_inject_fail_cmd;
+static void serve_apply_test_sndbuf(int fd) {
+    const char *e = getenv("IDX_SERVE_TEST_SNDBUF");
+    if (!e || !*e || fd < 0) return;
+    int sz = atoi(e);
+    if (sz > 0) setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
+}
+#else
+static void serve_apply_test_sndbuf(int fd) { (void)fd; }
+#endif
+static void serve_bufs_clear(SConn *c) {
+    if (!c) return;
+    free(c->buf); c->buf = NULL; c->len = c->cap = 0;
+    free(c->out); c->out = NULL; c->out_len = c->out_off = c->out_cap = 0;
+}
+static void serve_release_fd(SConn *c) {
+    if (!c) return;
+    if (c->fd >= 0) close(c->fd);
+    c->fd = -1;
+    c->connecting = 0; c->up = 0; c->sent_ver = 0; c->got_ver = 0; c->got_verack = 0;
+    c->shake_by = 0; c->peer_svc = 0;
+    serve_bufs_clear(c);
+}
+static void serve_release_seat(SConn *c) {
+    /* close + free in/out buffers; do not retain an outbound/feeler seat for redial */
+    serve_release_fd(c);
+    c->outbound = 0; c->mesh_seat = 0; c->chain_seat = 0; c->feeler = 0;
+    c->host[0] = 0; c->hip[0] = 0; c->peer[0] = 0; c->agent[0] = 0;
+    c->mesh_handle = NULL; c->peer_svc = 0;
+}
+static int serve_out_pending(const SConn *c) {
+    return c && c->out_off < c->out_len;
+}
+static int serve_out_flush(SConn *c) {
+    if (!c || c->fd < 0) return 0;
+    while (c->out_off < c->out_len) {
+        size_t left = c->out_len - c->out_off;
+#ifdef MSG_NOSIGNAL
+        ssize_t w = send(c->fd, c->out + c->out_off, left, MSG_NOSIGNAL);
+#else
+        ssize_t w = send(c->fd, c->out + c->out_off, left, 0);
+#endif
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            idx_serve_send_eagain++;
+            return 1;
+        }
+        if (w <= 0) return 0;
+        if ((size_t)w < left) idx_serve_send_partial++;
+        c->out_off += (size_t)w;
+    }
+    c->out_len = c->out_off = 0;
+    return 1;
+}
+static int serve_out_append(SConn *c, const uint8_t *b, size_t n) {
+    if (!c || !b || !n) return 0;
+    if (c->out_off) {
+        size_t pending = c->out_len - c->out_off;
+        memmove(c->out, c->out + c->out_off, pending);
+        c->out_len = pending; c->out_off = 0;
+    }
+    if (c->out_len + n > SERVE_OUT_MAX) return 0;
+    if (c->out_len + n > c->out_cap) {
+        size_t nc = c->out_cap ? c->out_cap : 2048;
+        while (nc < c->out_len + n) nc *= 2;
+        if (nc > SERVE_OUT_MAX) nc = SERVE_OUT_MAX;
+        if (c->out_len + n > nc) return 0;
+        uint8_t *nb = realloc(c->out, nc);
+        if (!nb) return 0;
+        c->out = nb; c->out_cap = nc;
+    }
+    memcpy(c->out + c->out_len, b, n);
+    c->out_len += n;
+    return 1;
+}
+static int serve_send(SConn *c, const uint8_t *magic, const char *cmd,
+                      const uint8_t *payload, uint32_t len) {
+    if (!c || c->fd < 0 || !magic || !cmd) return 0;
+#ifdef IDX_SERVE_TEST
+    if (idx_serve_inject_fail_cmd && !strcmp(cmd, idx_serve_inject_fail_cmd)) {
+        idx_serve_inject_fail_cmd = NULL;
+        serve_drop(c, g_serve_mesh);
+        return 0;   /* same caller-visible result as overflow / hard fail */
+    }
+#endif
+    size_t total = 24u + (size_t)len;
+    size_t pending = c->out_len - c->out_off;
+    if (pending + total > SERVE_OUT_MAX) { serve_drop(c, g_serve_mesh); return 0; }
+    uint8_t hdr[24]; memset(hdr, 0, 24); memcpy(hdr, magic, 4);
+    strncpy((char *)hdr + 4, cmd, 12);
+    hdr[16] = (uint8_t)len; hdr[17] = (uint8_t)(len >> 8);
+    hdr[18] = (uint8_t)(len >> 16); hdr[19] = (uint8_t)(len >> 24);
+    uint8_t ck[32]; idx_sha256d(payload ? payload : (const uint8_t *)"", len, ck);
+    memcpy(hdr + 20, ck, 4);
+    if (!serve_out_append(c, hdr, 24)) { serve_drop(c, g_serve_mesh); return 0; }
+    if (len && !serve_out_append(c, payload, len)) { serve_drop(c, g_serve_mesh); return 0; }
+    if (!serve_out_flush(c)) { serve_drop(c, g_serve_mesh); return 0; }
+    return 1;
+}
 static void sconn_reset(SConn *c) {   // wipe transient state, keep outbound redial info
-    free(c->buf);
+    serve_bufs_clear(c);
     int ob = c->outbound, ms = c->mesh_seat, cs = c->chain_seat, fl = c->feeler;
     char host[80], hip[46]; uint16_t rp = c->rport;
     memcpy(host, c->host, sizeof host); memcpy(hip, c->hip, sizeof hip);
-    c->fd = -1; c->buf = NULL; c->len = c->cap = 0; c->up = c->sent_ver = 0;
+    c->fd = -1; c->up = c->sent_ver = c->got_ver = c->got_verack = 0;
+    c->connecting = 0; c->shake_by = 0; c->peer_svc = 0;
     c->peer[0] = 0; c->agent[0] = 0; c->hip[0] = 0; c->peer_h = 0; c->mesh_handle = NULL; c->dn_asked = 0; c->mesh_seat = 0;
     c->self_sent = 0; c->chain_seat = 0; c->feeler = 0; c->score = 0;
     c->gd_win_t = 0; c->gd_blocks = 0; c->gd_bytes = 0;
@@ -1649,8 +2146,8 @@ static int addr_entry(uint8_t *out, uint32_t *o, uint32_t cap,
     return 1;
 }
 
-static void serve_send_version(int fd, const Coin *coin, int64_t our_height, int64_t services) {
-    uint8_t v[256]; int o = 0;
+static int serve_build_version(uint8_t *v, int64_t our_height, int64_t services) {
+    int o = 0;
     for (int i = 0; i < 4; i++) v[o++] = (70015 >> (8*i)) & 0xff;
     for (int i = 0; i < 8; i++) v[o++] = (services >> (8*i)) & 0xff;
     int64_t now = (int64_t)time(NULL); for (int i = 0; i < 8; i++) v[o++] = (now >> (8*i)) & 0xff;
@@ -1661,7 +2158,15 @@ static void serve_send_version(int fd, const Coin *coin, int64_t our_height, int
     v[o++] = (uint8_t)ual; memcpy(v + o, idx_sync_agent, ual); o += (int)ual;
     for (int i = 0; i < 4; i++) v[o++] = (our_height >> (8*i)) & 0xff;
     v[o++] = 1;                                                      // relay: we accept tx invs (mempool)
+    return o;
+}
+static void serve_send_version(int fd, const Coin *coin, int64_t our_height, int64_t services) {
+    uint8_t v[256]; int o = serve_build_version(v, our_height, services);
     net_send(fd, coin->magic, "version", v, (uint32_t)o);
+}
+static int serve_send_version_conn(SConn *c, const Coin *coin, int64_t our_height, int64_t services) {
+    uint8_t v[256]; int o = serve_build_version(v, our_height, services);
+    return serve_send(c, coin->magic, "version", v, (uint32_t)o);
 }
 
 // Overlay peer discovery (peer-discovery follow-up #1): dngetaddr / dnaddr.
@@ -1696,7 +2201,7 @@ static void serve_send_dnaddr(SConn *c, const Coin *coin, sqlite3 *db,
         if (self && *self && !strcmp(pool[i], self)) continue;   // don't echo self twice
         put += addr_entry(out, &o, 3 + SERVE_DNADDR_MAX*30u, pool[i], 0, now);
     }
-    net_send(c->fd, coin->magic, "dnaddr", out, o);
+    serve_send(c, coin->magic, "dnaddr", out, o);
     free(out);
 }
 
@@ -1708,29 +2213,43 @@ static void serve_send_dnaddr(SConn *c, const Coin *coin, sqlite3 *db,
 // chain port → reads the "/pepenet-" subver → the mesh finds itself. Gated
 // on listening (port) + a learned external ip (version.addr_recv); actually
 // REACHING the announced port is still the operator's port-forward.
-static void serve_announce_self(const SConn *c, const Coin *coin,
+static void serve_announce_self(SConn *c, const Coin *coin,
                                 const char *self, int64_t services) {
     uint8_t out[3 + 30];
     int vo = 0;
     put_varint(out, &vo, 1);
     uint32_t o = (uint32_t)vo;
     if (!addr_entry(out, &o, sizeof out, self, services, (int64_t)time(NULL))) return;
-    net_send(c->fd, coin->magic, "addr", out, o);
+    serve_send(c, coin->magic, "addr", out, o);
     fprintf(stderr, "serve: announced self %s to %s\n", self, c->peer);
 }
 
-static int mesh_on_host(SConn *conns, const SConn *except, const char *host);
+static void serve_try_mesh_up(SConn *c, SConn *conns, const IdxMeshHooks *mesh, const char *via);
 
 static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db, ServeStore *ss,
                            int64_t services, const char *cmd, uint8_t *pl, uint32_t pln,
                            char self[80], uint16_t port, const IdxMeshHooks *mesh) {
-    // nothing but the handshake until both version and verack have landed —
-    // otherwise getdata/dnaddr/getaddr are a pre-auth bandwidth amp.
+    // nothing but the handshake until both version and verack have landed
+    // (c->up is set only when got_ver && got_verack) — otherwise
+    // getdata/dnaddr/getaddr are a pre-auth bandwidth amp.
     if (!c->up && strcmp(cmd, "version") && strcmp(cmd, "verack")) return;
     if (!strcmp(cmd, "version")) {
         // a second version on a live conn must not flip the agent to /pepenet-
         // and steal a mesh slot
-        if (c->up) return;
+        if (c->up || c->got_ver) return;
+        { uint64_t vn = 0;
+          if (ver_nonce(pl, pln, &vn) && vn == self_nonce()) {
+              fprintf(stderr, "serve: %s is ourselves (self-connect) — dropping self-seed\n",
+                      c->peer[0] ? c->peer : (c->host[0] ? c->host : "(unknown)"));
+              if (c->outbound && !c->chain_seat) idx_self_seed = 1;
+              serve_release_seat(c);
+              return;
+          } }
+        c->peer_svc = 0;
+        if (pln >= 12) {
+            uint64_t sv = 0; for (int b = 0; b < 8; b++) sv |= (uint64_t)pl[4 + b] << (8 * b);
+            c->peer_svc = (int64_t)sv;
+        }
         // learn our own address from their addr_recv (the ip THEY dialed) —
         // paired with our listen port, this is what we advertise as self
         if (!*self && pln >= 46 && pl[38] == 0xFF && pl[39] == 0xFF) {
@@ -1758,11 +2277,34 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
               } } }
         if (!c->sent_ver) {
             int64_t h = 0; uint8_t tip[32]; idx_db_load_sync(db, &h, tip);
-            serve_send_version(c->fd, coin, h, services);
+            if (!serve_send_version_conn(c, coin, h, services)) return;
             c->sent_ver = 1;
         }
-        net_send(c->fd, coin->magic, "verack", NULL, 0);
+        if (!serve_send(c, coin->magic, "verack", NULL, 0)) return;
+        c->got_ver = 1;
+        c->connecting = 0;
+        /* peer_seen / mesh / dngetaddr / self-announce / unmarked-feeler only after verack too */
+    } else if (!strcmp(cmd, "verack")) {
+        c->got_verack = 1;
+    }
+    if ((!strcmp(cmd, "version") || !strcmp(cmd, "verack")) &&
+        c->got_ver && c->got_verack && !c->up) {
+        if (c->outbound && c->mesh_seat && !AGENT_MARKED(c->agent)) {
+            idx_db_peer_tried(db, c->peer[0] ? c->peer : c->host, (int64_t)time(NULL));
+            fprintf(stderr, "serve: feeler unmarked — release %s (agent %s)\n",
+                    c->peer[0] ? c->peer : c->host, c->agent[0] ? c->agent : "(none)");
+            serve_release_seat(c);
+            return;
+        }
         c->up = 1;
+        c->connecting = 0;
+        if (c->outbound) {
+            if (c->peer[0]) idx_db_peer_seen(db, c->peer, c->peer_svc, c->agent, (int64_t)time(NULL));
+            if (c->feeler) c->feeler = 0;
+            fprintf(stderr, "serve: dialed %s (agent %s)%s%s\n", c->peer,
+                    c->agent[0] ? c->agent : "(none)",
+                    c->mesh_seat ? "  [mesh]" : "", c->chain_seat ? "  [chain]" : "");
+        }
         if (!c->outbound)
             fprintf(stderr, "serve: inbound %s (agent %s)%s\n", c->peer,
                     c->agent[0] ? c->agent : "(none)",
@@ -1774,46 +2316,56 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             { char *col = strrchr(ip, ':'); if (col) *col = 0; }
             if (ip[0]) idx_db_peer_touch_agent(db, ip, coin->port, c->agent, (int64_t)time(NULL));
         }
-        // a marked peer + a mesh embedder → hand it up so the carrier gossips.
-        // One mesh slot per host: a second inbound (sync pass / NAT) to an IP
-        // that already gossips would send_inv_all again and double the storm.
-        if (mesh && mesh->peer_up && !c->mesh_handle && AGENT_MARKED(c->agent)) {
-            char ip[80]; snprintf(ip, sizeof ip, "%s", c->peer);
-            { char *col = strrchr(ip, ':'); if (col) *col = 0; }
-            int in_mesh = 0;
-            if (!c->outbound) {
-                for (int i = 0; i < SERVE_MAX_CONN; i++)
-                    if (conns[i].fd >= 0 && !conns[i].outbound && conns[i].mesh_handle)
-                        in_mesh++;
-            }
-            if ((c->outbound || in_mesh < MESH_INBOUND_MAX) &&
-                !mesh_on_host(conns, c, ip[0] ? ip : c->hip))
-                c->mesh_handle = mesh->peer_up(mesh->ud, c, serve_mesh_send);
-        }
+        // Outbound overlay dials may peer_up immediately: we opened this
+        // socket from idx_serve, so it speaks dnz*. Inbound must wait until
+        // the peer speaks dn* (see serve_try_mesh_up). A dual-instance
+        // desktop's engine sync plane also presents a marked agent on a
+        // dedicated inbound that has no overlay traffic; binding gossip to
+        // that socket used to starve a later overlay inbound of dnzinv.
+        // Unique-IP seating is intentionally not applied: two legitimate
+        // overlay clients behind the same NAT are distinct admitted
+        // connections. Gossip seats are bounded by MESH_INBOUND_MAX and by
+        // already-accepted sockets (SERVE_INBOUND_PER_HOST), not by collapsing
+        // every same-IP overlay peer into one slot.
+        if (c->outbound)
+            serve_try_mesh_up(c, conns, mesh, "dial");
+        if (c->fd < 0) return;
         // overlay discovery (mesh-independent): solicit this marked peer's
         // overlay peer list. Handshake fires immediately; the serve loop
         // re-asks every DNADDR_REFRESH_S so a peer that later learns more
         // names actually grows our dnet pool.
         if (!c->dn_asked && AGENT_MARKED(c->agent)) {
-            net_send(c->fd, coin->magic, "dngetaddr", NULL, 0);
-            c->dn_asked = 1;
-            c->last_dnget = time(NULL);
+            if (serve_send(c, coin->magic, "dngetaddr", NULL, 0)) {
+                c->dn_asked = 1;
+                c->last_dnget = time(NULL);
+            }
+            if (c->fd < 0) return;   /* drop reset the seat; do not stamp it */
         }
         // self-announcement (see serve_announce_self) — once per connection
         if (port && *self && !c->self_sent) {
             serve_announce_self(c, coin, self, services);
             c->self_sent = 1;
         }
-    } else if (!strcmp(cmd, "verack")) {
-        c->up = 1;
-    } else if (!strcmp(cmd, "dngetaddr")) {
+        return;
+    }
+    if (!strcmp(cmd, "version") || !strcmp(cmd, "verack")) return;
+    if (!strcmp(cmd, "dngetaddr")) {
         // overlay addr gossip is not chain-authenticated. Only a marked peer
         // (the same gate as mesh_handle) may ask or vouch — a random
         // pepetoshi otherwise poisons dnet=1 and we re-gossip the poison.
         if (!AGENT_MARKED(c->agent)) return;
+        // Mark is an advertised subver prefix, not an authenticated identity.
+        // Seating here (and on any other dn*) happens before zone-payload
+        // ECDSA; dnaddr harvest is similarly mark-gated only. Existing bounded
+        // risk: a peer that forges the prefix can take a mesh slot and inject
+        // overlay addrs. Zone ops still fail admit without a valid signature.
+        serve_try_mesh_up(c, conns, mesh, "dngetaddr");
+        if (c->fd < 0) return;
         serve_send_dnaddr(c, coin, db, self, port);
     } else if (!strcmp(cmd, "dnaddr")) {
         if (!AGENT_MARKED(c->agent)) return;
+        serve_try_mesh_up(c, conns, mesh, "dnaddr");
+        if (c->fd < 0) return;
         { uint64_t cnt; uint32_t o;
           if (!net_policy_read_count(pl, pln, &cnt, &o)) return;
           if (cnt > IDX_MAX_ADDR) { serve_conn_misbehave(c, 20, "dnaddr count"); return; } }
@@ -1823,10 +2375,13 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             c->got_dnaddr = 1;
             c->last_dnaddr_n = n;
         }
-    } else if (!strncmp(cmd, "dn", 2) && cmd[2] && mesh && mesh->peer_msg && c->mesh_handle) {
-        mesh->peer_msg(mesh->ud, c->mesh_handle, cmd + 2, pl, (int)pln);   // carrier dn* command
+    } else if (!strncmp(cmd, "dn", 2) && cmd[2] && mesh && mesh->peer_msg) {
+        if (!c->mesh_handle) serve_try_mesh_up(c, conns, mesh, cmd);
+        if (c->fd < 0) return;
+        if (c->mesh_handle)
+            mesh->peer_msg(mesh->ud, c->mesh_handle, cmd + 2, pl, (int)pln);   // carrier dn* command
     } else if (!strcmp(cmd, "ping")) {
-        net_send(c->fd, coin->magic, "pong", pl, pln);
+        serve_send(c, coin->magic, "pong", pl, pln);
     } else if (!strcmp(cmd, "getaddr")) {
         IdxPeerRow *rows = malloc(sizeof(IdxPeerRow) * 1000);
         if (!rows) return;
@@ -1840,7 +2395,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         if (*self && put < total) put += addr_entry(out, &o, 3 + 1001u*30, self, 0, now);
         for (int i = 0; i < n && put < total; i++)
             put += addr_entry(out, &o, 3 + 1001u*30, rows[i].addr, rows[i].services, rows[i].last_seen);
-        net_send(c->fd, coin->magic, "addr", out, o);
+        serve_send(c, coin->magic, "addr", out, o);
         free(out); free(rows);
     } else if (!strcmp(cmd, "addr")) {
         { uint64_t cnt; uint32_t o;
@@ -1863,7 +2418,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         int vo = 0; put_varint(out, &vo, (uint64_t)nh);
         uint32_t oo = (uint32_t)vo;
         for (int i = 0; i < nh; i++) { memcpy(out + oo, hbuf + i * 80, 80); oo += 80; out[oo++] = 0x00; }  // 0 tx count
-        if (nh) net_send(c->fd, coin->magic, "headers", out, oo);
+        if (nh) serve_send(c, coin->magic, "headers", out, oo);
         free(out);
     } else if (!strcmp(cmd, "getblocks") && ss) {
         // the sync path's forward walk (getblocks → inv → getdata → block) —
@@ -1896,7 +2451,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
                     out[oo++] = 2; out[oo++] = 0; out[oo++] = 0; out[oo++] = 0;   // MSG_BLOCK
                     memcpy(out + oo, hs[i], 32); oo += 32;
                 }
-                net_send(c->fd, coin->magic, "inv", out, oo);
+                serve_send(c, coin->magic, "inv", out, oo);
                 free(out);
             }
         }
@@ -1925,7 +2480,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
                         }
                         break;
                     }
-                    net_send(c->fd, coin->magic, "block", raw, (uint32_t)rl);
+                    serve_send(c, coin->magic, "block", raw, (uint32_t)rl);
                     free(raw);
                 }
             } else if (type == 1) {                        // tx (type 1) — from the mempool
@@ -1936,7 +2491,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
                         free(raw);
                         break;
                     }
-                    net_send(c->fd, coin->magic, "tx", raw, (uint32_t)rl);
+                    serve_send(c, coin->magic, "tx", raw, (uint32_t)rl);
                     free(raw);
                 }
             }
@@ -1959,7 +2514,10 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
                 if (mempool_has(h) || mempool_seen(h)) continue;
                 memcpy(want[nreq++], h, 32);
             } else if (type == 2 && nblk < 16 && ss && c->up) {
-                if (serve_store_have(ss, h)) continue;         // headers or stage: known
+                if (serve_store_have(ss, h)) {                 // headers or stage: known
+                    serve_peer_announced(&c->peer_h, db, serve_store_locate(ss, h, 1));
+                    continue;
+                }
                 memcpy(wblk[nblk++], h, 32);
             }
         }
@@ -1967,7 +2525,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             uint8_t getd[3 + 36 * (128 + 16)]; int go = 0; put_varint(getd, &go, (uint64_t)(nreq + nblk));
             for (int i = 0; i < nreq; i++) { getd[go++]=1; getd[go++]=0; getd[go++]=0; getd[go++]=0; memcpy(getd + go, want[i], 32); go += 32; }
             for (int i = 0; i < nblk; i++) { getd[go++]=2; getd[go++]=0; getd[go++]=0; getd[go++]=0; memcpy(getd + go, wblk[i], 32); go += 32; }
-            net_send(c->fd, coin->magic, "getdata", getd, (uint32_t)go);
+            serve_send(c, coin->magic, "getdata", getd, (uint32_t)go);
         }
     } else if (!strcmp(cmd, "block")) {
         // a block body off a serve conn (answer to the inv-pull above, or an
@@ -1977,8 +2535,28 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
         // from a hostile peer costs bounded disk and zero state.
         if (!ss || pln < 80) return;
         uint8_t bh[32]; idx_sha256d(pl, 80, bh);
+        { int64_t ph = serve_store_locate(ss, pl + 4, 1);       // prev on our chain → its height + 1
+          if (ph >= 0) serve_peer_announced(&c->peer_h, db, ph + 1); }
         if (serve_store_stage_put(ss, bh, pl + 4, pl, pln, (int64_t)time(NULL)))
             idx_serve_stage_seq++;               // embedding hosts: fold-on-inv nudge
+    } else if (!strcmp(cmd, "headers")) {
+        // a header announcement (BIP130 peers). Only headers already on our
+        // chain count (their height is known and their work was checked when
+        // they folded) — an unverified run above our tip proves nothing, and
+        // the block itself is placed when it arrives. Parsing stops at the
+        // first AuxPoW header (variable length). Only peer_height learns.
+        uint64_t cnt; uint32_t o;
+        if (!ss || !net_policy_read_count(pl, pln, &cnt, &o) || cnt == 0 || cnt > 2000) return;
+        int64_t best = -1;
+        for (uint64_t i = 0; i < cnt && o + 81 <= pln; i++, o += 81) {
+            uint32_t ver = pl[o] | (pl[o+1]<<8) | (pl[o+2]<<16) | ((uint32_t)pl[o+3]<<24);
+            uint8_t hh[32]; idx_sha256d(pl + o, 80, hh);
+            int64_t hgt = serve_store_locate(ss, hh, 1);
+            if (hgt < 0) { int64_t pv = serve_store_locate(ss, pl + o + 4, 1); if (pv >= 0) hgt = pv + 1; }
+            if (hgt > best) best = hgt;
+            if (ver & 0x100) break;                        // AuxPoW follows: stride unknown
+        }
+        if (best > 0) serve_peer_announced(&c->peer_h, db, best);
     } else if (!strcmp(cmd, "tx")) {
         // validate + pool + relay. On accept, announce (inv type 1) to every other
         // live peer — the receiver's own has/seen guard breaks the echo loop.
@@ -1988,7 +2566,7 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             inv[io++]=1; inv[io++]=0; inv[io++]=0; inv[io++]=0; memcpy(inv + io, txid, 32); io += 32;
             for (int i = 0; i < SERVE_MAX_CONN; i++) {
                 SConn *o = &conns[i];
-                if (o->fd >= 0 && o->up && o != c) net_send(o->fd, o->magic ? o->magic : coin->magic, "inv", inv, (uint32_t)io);
+                if (o->fd >= 0 && o->up && o != c) serve_send(o, o->magic ? o->magic : coin->magic, "inv", inv, (uint32_t)io);
             }
         }
     } else if (!strcmp(cmd, "mempool")) {
@@ -2000,63 +2578,130 @@ static void serve_dispatch(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db
             uint8_t *inv = malloc(3 + n * 36);
             if (inv) { int io = 0; put_varint(inv, &io, (uint64_t)n);
                 for (size_t i = 0; i < n; i++) { inv[io++]=1; inv[io++]=0; inv[io++]=0; inv[io++]=0; memcpy(inv + io, ids[i], 32); io += 32; }
-                net_send(c->fd, coin->magic, "inv", inv, (uint32_t)io); free(inv); }
+                serve_send(c, coin->magic, "inv", inv, (uint32_t)io); free(inv); }
         }
         free(ids);
     }
     // dn* carrier commands: step 3
 }
 
-// Dial `host:port`, do the version handshake (WE speak first), capture the
-// peer's agent. Fills `self` (when empty and we listen on `lport`) from the
-// peer's version.addr_recv — the ip THEY see us as. Outbound is the only
-// handshake a NAT'd node ever completes, so without this a node nobody dials
-// never learns the address it should announce (self stayed "" forever).
-// Returns the connected fd (blocking), or -1.
-static int serve_dial(const char *host, uint16_t port, const Coin *coin,
-                      int64_t services, int64_t our_h, char agent_out[128],
-                      int64_t *services_out, char self[80], uint16_t lport,
-                      int64_t *height_out) {
-    int fd = net_connect(host, port);
-    if (fd < 0) return -1;
-    serve_send_version(fd, coin, our_h, services);
-    agent_out[0] = 0; if (services_out) *services_out = 0; if (height_out) *height_out = 0;
-    int gv = 0, gvk = 0, is_self = 0;
-    // version+verack arrive immediately on a live peer. 12×8s used to freeze
-    // the serve thread for 96s on a TCP-accepting blackhole (and mesh_seat_topup
-    // used to queue eight of those in one tick).
-    for (int i = 0; i < 5 && !(gv && gvk) && !is_self; i++) {
-        char cmd[13]; uint8_t *pl; uint32_t pn;
-        int r = net_recv(fd, coin->magic, cmd, &pl, &pn, 3000);
-        if (r != 1) { if (r == -1) continue; close(fd); return -1; }
-        if (!strcmp(cmd, "version")) {
-            gv = 1;
-            uint64_t vn;                                             // did we dial ourselves?
-            if (ver_nonce(pl, pn, &vn) && vn == self_nonce()) is_self = 1;
-            if (pn >= 12 && services_out) { uint64_t sv = 0; for (int b = 0; b < 8; b++) sv |= (uint64_t)pl[4+b] << (8*b); *services_out = (int64_t)sv; }
-            if (self && lport && !*self && pn >= 46 && pl[38] == 0xFF && pl[39] == 0xFF) {
-                if (ipv4_globally_routable(pl[40], pl[41]))
-                    snprintf(self, 80, "%u.%u.%u.%u:%u", pl[40], pl[41], pl[42], pl[43], lport);
-            }
-            uint64_t off = 4+8+8+26+26+8, ua;
-            if (pn > off) { ua = pl[off++];
-                if (ua == 0xFD && pn >= off + 2) { ua = pl[off] | (pl[off+1] << 8); off += 2; }
-                if (ua <= 100 && pn >= off + ua) { memcpy(agent_out, pl + off, ua); agent_out[ua] = 0; }
-                if (ua <= 100 && height_out && pn >= off + ua + 4) {   // claimed start_height (tail)
-                    uint64_t ho = off + ua;
-                    *height_out = (int64_t)((uint32_t)pl[ho] | ((uint32_t)pl[ho+1] << 8) |
-                                            ((uint32_t)pl[ho+2] << 16) | ((uint32_t)pl[ho+3] << 24));
-                } }
-            net_send(fd, coin->magic, "verack", NULL, 0);
-        } else if (!strcmp(cmd, "verack")) gvk = 1;
-        else if (!strcmp(cmd, "ping")) net_send(fd, coin->magic, "pong", pl, pn);
-        free(pl);
+static int conn_host_live(SConn *conns, const SConn *except, const char *host);
+// Start a nonblocking TCP connect to an already-resolved numeric seat (hip).
+// Handshake (WE speak first) runs on the serve poll loop via serve_dispatch —
+// the same path inbound peers use — so a slow/blackhole outbound cannot stall
+// accept() or EOF cleanup. Returns 1 if connect completed immediately, 0 if
+// EINPROGRESS, -1 on failure. Does not change wire bytes.
+static void serve_outbound_fail(SConn *c, sqlite3 *db, time_t now) {
+    serve_release_fd(c);
+    c->agent[0] = 0; c->peer[0] = 0; c->mesh_handle = NULL;
+    if (c->chain_seat || c->mesh_seat) {
+        char addr[96]; snprintf(addr, sizeof addr, "%s:%u", c->host[0] ? c->host : c->hip, c->rport);
+        if (db) idx_db_peer_tried(db, addr, (int64_t)now);
+        if (c->mesh_seat)
+            fprintf(stderr, "serve: dial %s failed  [mesh]\n", addr);
+        c->outbound = 0; c->mesh_seat = 0; c->chain_seat = 0; c->feeler = 0;
+        c->host[0] = 0; c->hip[0] = 0;
+    } else {
+        c->redial_at = now + 15;
     }
-    if (is_self) { close(fd); return -2; }    // dialed ourselves — tell the caller to drop this peer
-    if (gv && gvk) return fd;
-    close(fd); return -1;
+}
+static int serve_start_connect(SConn *c) {
+    if (!c || !c->hip[0] || !c->rport) return -1;
+    char ps[8]; snprintf(ps, sizeof ps, "%u", c->rport);
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_flags = AI_NUMERICHOST;
+    if (getaddrinfo(c->hip, ps, &hints, &res) != 0 || !res) return -1;
+    int fd = -1, imm = 0;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        sock_nosigpipe(fd);
+        int fl = fcntl(fd, F_GETFL, 0);
+        if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        serve_apply_test_sndbuf(fd);
+        int r = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (r == 0) { imm = 1; break; }
+        if (r < 0 && errno == EINPROGRESS) { imm = 0; break; }
+        close(fd); fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) return -1;
+    serve_bufs_clear(c);
+    c->fd = fd; c->connecting = 1; c->up = 0; c->sent_ver = 0;
+    c->got_ver = 0; c->got_verack = 0; c->peer_svc = 0;
+    c->last_rx = time(NULL);
+    c->shake_by = c->last_rx + SERVE_CONNECT_S;
+    return imm ? 1 : 0;
+}
+static int serve_connect_ready(SConn *c, SConn *conns, const Coin *coin, sqlite3 *db,
+                              int64_t services) {
+    int err = 0; socklen_t el = sizeof err;
+    if (c->fd < 0) return -1;
+    if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err != 0) return -1;
+    c->connecting = 0;
+    c->magic = coin->magic;
+    net_peer_str(c->fd, c->peer, sizeof c->peer);
+    char pip[80]; snprintf(pip, sizeof pip, "%s", c->peer);
+    { char *pc = strrchr(pip, ':'); if (pc) *pc = 0; }
+    if (pip[0] && pip[0] != '?') snprintf(c->hip, sizeof c->hip, "%s", pip);
+    if (pip[0] && pip[0] != '?' && conn_host_live(conns, c, pip)) {
+        fprintf(stderr, "serve: %s is %s — already connected, dropping duplicate\n",
+                c->host, c->peer);
+        serve_release_fd(c);
+        if (c->mesh_seat || c->chain_seat) {
+            c->outbound = 0; c->mesh_seat = 0; c->chain_seat = 0; c->feeler = 0;
+            c->host[0] = 0; c->hip[0] = 0;
+        } else c->redial_at = time(NULL) + 60;
+        return 0;
+    }
+    int64_t our_h = 0; uint8_t tip[32];
+    if (db) idx_db_load_sync(db, &our_h, tip);
+    if (!serve_send_version_conn(c, coin, our_h, services)) return -1;
+    c->sent_ver = 1;
+    c->last_rx = time(NULL);
+    c->shake_by = c->last_rx + SERVE_DIAL_SHAKE_S;
+    return 1;
 }
 
+// Bind gossip to a connection only after the peer speaks dn* on it (inbound)
+// or immediately for outbound dials we initiated. Engine-sync inbounds advertise
+// the same marked desktop agent but never send dngetaddr/dnz*; overlay sockets
+// do. Do not unique-IP-collapse seats: each already-admitted connection that
+// speaks dn* may take one gossip handle, still capped by MESH_INBOUND_MAX
+// (inbound) and SERVE_INBOUND_PER_HOST (accept). Classification (marked + dn*)
+// stays distinct from zone-op signature validation in sp_state_admit.
+static void serve_try_mesh_up(SConn *c, SConn *conns, const IdxMeshHooks *mesh, const char *via) {
+    if (!c || !mesh || !mesh->peer_up || c->mesh_handle || !AGENT_MARKED(c->agent)) return;
+    int in_mesh = 0;
+    if (!c->outbound) {
+        for (int i = 0; i < SERVE_MAX_CONN; i++)
+            if (conns[i].fd >= 0 && !conns[i].outbound && conns[i].mesh_handle)
+                in_mesh++;
+        if (in_mesh >= MESH_INBOUND_MAX) return;
+    }
+    void *h = mesh->peer_up(mesh->ud, c, serve_mesh_send);
+    if (!h) return;
+    /* peer_up may synchronously send (dnsnet_up → send_inv_all → dnzinv).
+     * A send failure serve_drop's this SConn while mesh_handle is still
+     * NULL, so serve_drop cannot peer_down. Attaching `h` after that reset
+     * parks a live dnsnet Peer on a wiped slot; accept's memset then loses
+     * the handle without peer_down, and later AE/announce can send through
+     * the reused SConn. Transactional completion: if the callback dropped
+     * or replaced this conn, release `h` and never attach. */
+    if (c->fd < 0 || !c->up) {
+        if (mesh->peer_down) mesh->peer_down(mesh->ud, h);
+        return;
+    }
+    c->mesh_handle = h;
+    // Real seat signal (peer_up / dnsnet_up). Distinct from the
+    // version-handshake "inbound … [mesh]" classifier, which fires
+    // before this and also tags engine-sync inbounds.
+    fprintf(stderr, "serve: mesh seated %s (agent %s)%s via %s\n",
+            c->peer, c->agent[0] ? c->agent : "(none)",
+            c->outbound ? "  [out]" : "  [in]",
+            via && via[0] ? via : "?");
+}
 // is any slot (other than `except`) already pointed at this machine? Live
 // sockets compare by peer ip — the port always differs across directions (an
 // inbound conn arrives from an ephemeral port, the pool row names the listen
@@ -2068,20 +2713,6 @@ static int serve_dial(const char *host, uint16_t port, const Coin *coin,
 // CNetAddr): if a peer is connected — EITHER direction — we don't also dial
 // it. That's what keeps an outbound-only (NAT'd) peer that dialed us in from
 // being redialed forever off its own dnaddr self-announce.
-// 1 iff another live conn to this host already carries the mesh (peer_up).
-// Extra sockets to the same IP (sync-pass inbound while a mesh seat is parked)
-// must not each get a gossip slot — that multiplied dnzinv/dnzdat storms.
-static int mesh_on_host(SConn *conns, const SConn *except, const char *host) {
-    if (!host || !*host) return 0;
-    size_t hl = strlen(host);
-    for (int i = 0; i < SERVE_MAX_CONN; i++) {
-        SConn *c = &conns[i];
-        if (c == except || c->fd < 0 || !c->mesh_handle) continue;
-        if (c->hip[0] && !strcmp(c->hip, host)) return 1;
-        if (c->peer[0] && !strncmp(c->peer, host, hl) && c->peer[hl] == ':') return 1;
-    }
-    return 0;
-}
 static int conn_host_live(SConn *conns, const SConn *except, const char *host) {
     for (int i = 0; i < SERVE_MAX_CONN; i++) {
         SConn *c = &conns[i];
@@ -2112,7 +2743,7 @@ static int same_group16(const char *a, const char *b);   /* eclipse: one outboun
 // dnet pool. This is BOTH the startup re-dial (a returning node re-embeds into
 // the mesh from its own memory) and the live reaction to freshly-gossiped
 // dnaddr peers. ONE candidate per tick — same discipline as chain_topup:
-// serve_dial is blocking on this thread, and seating a swamp of dead vouched
+// outbound dials share this thread's poll loop, and seating a swamp of dead vouched
 // addrs at once stalled gossip and hid new discoveries behind minutes of
 // connect/handshake timeouts.
 static int mesh_try_seat(SConn *conns, int slot, const Coin *coin, const char *self,
@@ -2170,7 +2801,7 @@ static void mesh_seat_topup(SConn *conns, sqlite3 *db, const Coin *coin, int tar
 // DIAL_RETRY_S), one outbound per /16 netgroup (Core's eclipse defense),
 // never a host already connected or seated, never ourselves (we self-announce,
 // so our own addr comes back in the harvest). ONE candidate seated per tick:
-// dials are blocking on this thread, so a swamp of dead addrs must not stall
+// one candidate per tick keeps seating bounded, so a swamp of dead addrs must not stall
 // the loop — a failed dial stamps last_try and frees the seat.
 #define CHAIN_DIAL_TARGET 8
 // IPv4 /16 netgroup equality on "a.b.c.d[:port]" text (Core buckets by /16;
@@ -2216,6 +2847,27 @@ static void chain_topup(SConn *conns, sqlite3 *db, const Coin *coin, const char 
     }
 }
 
+// idx_serve_listen_status (indexer.h): last bind outcome, local diagnostics only.
+static volatile int g_listen_state = IDX_LISTEN_PENDING, g_listen_port, g_listen_err;
+static void listen_note(int state, int port, int err) {
+    __atomic_store_n(&g_listen_port, port, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_listen_err, err, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_listen_state, state, __ATOMIC_RELEASE);
+}
+void idx_serve_listen_status(int *state, int *port, int *err) {
+    int st = __atomic_load_n(&g_listen_state, __ATOMIC_ACQUIRE);
+    if (state) *state = st;
+    if (port) *port = __atomic_load_n(&g_listen_port, __ATOMIC_RELAXED);
+    if (err) *err = __atomic_load_n(&g_listen_err, __ATOMIC_RELAXED);
+}
+static int sock_last_err(void) {
+#ifdef _WIN32
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
 // The chain-wire presence (indexer.h). port 0 = dial-only. `dial_peers` =
 // comma host:port list kept connected. `mesh` non-NULL carries carrier gossip
 // as dn* commands on pepenet peers.
@@ -2226,16 +2878,18 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
     g_serve_mesh = mesh;
     (void)self_nonce();                      // generate the version nonce now (before threads race)
     sqlite3 *db = idx_db_open(dbpath); if (!db) return -1;
+    idx_peer_height_load(db);                 // seed g_ph_* from meta before any handshake/note
     idx_db_peers_scrub(db);                  // drop pre-fix hostname addr rows
     int lfd = -1;
     if (port) {
         lfd = socket(AF_INET, SOCK_STREAM, 0);
-        if (lfd < 0) { idx_db_close(db); return -1; }
+        if (lfd < 0) { listen_note(IDX_LISTEN_FAILED, port, sock_last_err()); idx_db_close(db); return -1; }
         sock_nosigpipe(lfd);
         int yes = 1; setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
         struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET; sa.sin_addr.s_addr = INADDR_ANY; sa.sin_port = htons(port);
         if (bind(lfd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(lfd, 16) != 0) {
+            listen_note(IDX_LISTEN_FAILED, port, sock_last_err());
             // The port is already taken — almost always a full node (Pepecoin
             // Core) bound to the chain port on the same box. That must NOT kill
             // the serve plane: this thread also carries the DNS mesh gossip and
@@ -2249,8 +2903,12 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
             fprintf(stderr, "serve: port %u already in use (a full node on this "
                     "host?) — running dial-only, no inbound\n", port);
             close(lfd); lfd = -1;
+        } else {
+            int fl = fcntl(lfd, F_GETFL, 0);
+            if (fl >= 0) fcntl(lfd, F_SETFL, fl | O_NONBLOCK);
+            listen_note(IDX_LISTEN_OK, port, 0);
         }
-    }
+    } else listen_note(IDX_LISTEN_OFF, 0, 0);
     char serve_path[600];
     { const char *slash = strrchr(dbpath, '/');
       if (slash) snprintf(serve_path, sizeof serve_path, "%.*s/serve-%s.db",
@@ -2265,6 +2923,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                  idx_sync_agent, (unsigned long long)services);
 
     SConn conns[SERVE_MAX_CONN];
+    idx_serve_send_eagain = 0; idx_serve_send_partial = 0;
     for (int i = 0; i < SERVE_MAX_CONN; i++) { memset(&conns[i], 0, sizeof conns[i]); conns[i].fd = -1; }
     // our own advertised addr ("ip:port"), learned from the first peer that tells
     // us — declared up here because the startup mesh re-seat below already needs
@@ -2332,7 +2991,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                           if (pc->fd < 0 || !pc->up || !AGENT_MARKED(pc->agent)) continue;
                           time_t cad = (pc->peer_h > pt + 2) ? 5 : 60;
                           if (now - pc->last_pull < cad) continue;
-                          net_send(pc->fd, coin->magic, "getblocks", gb, (uint32_t)go);
+                          serve_send(pc, coin->magic, "getblocks", gb, (uint32_t)go);
                           pc->last_pull = now;
                       }
                   }
@@ -2353,7 +3012,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                         }
                         for (int i = 0; i < SERVE_MAX_CONN; i++)
                             if (conns[i].fd >= 0 && conns[i].up)
-                                net_send(conns[i].fd, coin->magic, "inv", out, oo);
+                                serve_send(&conns[i], coin->magic, "inv", out, oo);
                     }
                 }
                 announced_tip = st;
@@ -2372,8 +3031,15 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
             SConn *c = &conns[i];
             if (c->fd < 0) continue;
             long idle = (long)(now - c->last_rx);
+            if (c->connecting) {
+                if (c->shake_by && now >= c->shake_by)
+                    serve_outbound_fail(c, db, now);
+                continue;
+            }
             if (!c->up) {
-                if (idle > SERVE_SHAKE_S) {
+                if (c->outbound && c->shake_by && now >= c->shake_by) {
+                    serve_outbound_fail(c, db, now);
+                } else if (!c->outbound && idle > SERVE_SHAKE_S) {
                     fprintf(stderr, "serve: %s stalled in handshake %lds — dropping\n",
                             c->peer[0] ? c->peer : "(inbound)", idle);
                     serve_drop(c, mesh);
@@ -2384,8 +3050,8 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
             } else if (idle > SERVE_PING_S && now - c->last_ping > SERVE_PING_S) {
                 uint8_t pn[8]; uint64_t nn = (uint64_t)now ^ ((uint64_t)i << 48);
                 for (int b = 0; b < 8; b++) pn[b] = (uint8_t)(nn >> (8 * b));
-                net_send(c->fd, coin->magic, "ping", pn, 8);
-                c->last_ping = now;      // any reply (pong or otherwise) feeds last_rx
+                if (serve_send(c, coin->magic, "ping", pn, 8))
+                    c->last_ping = now;  // any reply (pong or otherwise) feeds last_rx
             }
         }
         // maintain outbound connections
@@ -2399,9 +3065,10 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                 SConn *pc = &conns[i];
                 if (pc->fd < 0 || !pc->up || !AGENT_MARKED(pc->agent)) continue;
                 if (pc->last_dnget && now - pc->last_dnget < DNADDR_REFRESH_S) continue;
-                net_send(pc->fd, coin->magic, "dngetaddr", NULL, 0);
-                pc->dn_asked = 1;
-                pc->last_dnget = now;
+                if (serve_send(pc, coin->magic, "dngetaddr", NULL, 0)) {
+                    pc->dn_asked = 1;
+                    pc->last_dnget = now;
+                }
             }
             // and keep ~8 outbound chain peers seated addrman-style
             chain_topup(conns, db, coin, self);
@@ -2453,86 +3120,17 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                     } else c->redial_at = now + 60;
                     continue;
                 }
-                char agent[128]; int64_t psvc = 0, ph = 0;
-                int fd = serve_dial(c->hip, c->rport, coin, services, our_h, agent, &psvc,
-                                    self, port, &ph);
-                if (self[0]) {
-                    note_self_host(self);
-                    char sip[64]; snprintf(sip, sizeof sip, "%s", self);
-                    { char *sc = strrchr(sip, ':'); if (sc) *sc = 0; }
-                    idx_db_peers_drop_host(db, sip);
+                int st = serve_start_connect(c);
+                if (st < 0) { serve_outbound_fail(c, db, now); continue; }
+                c->magic = coin->magic;
+                c->last_ping = 0;
+                if (st > 0) {
+                    int cr = serve_connect_ready(c, conns, coin, db, services);
+                    if (cr < 0) serve_outbound_fail(c, db, now);
                 }
-                if (fd == -2) {   // handshake proved the peer is us — drop it for good
-                    fprintf(stderr, "serve: %s:%u is ourselves (self-connect) — dropping self-seed\n", c->host, c->rport);
-                    if (!c->chain_seat) idx_self_seed = 1;
-                    c->outbound = 0; c->mesh_seat = 0; c->chain_seat = 0; c->host[0] = 0; c->hip[0] = 0; continue;
-                }
-                if (fd < 0) {
-                    // any pool-selected seat (mesh or chain): stamp the failure —
-                    // the addr sits out DIAL_RETRY_S — and free the seat so the
-                    // next tick offers a different candidate. Never hold a seat
-                    // redialing one dead addr every 15s: an outbound-only peer
-                    // announcing a port it can't serve would pin it forever.
-                    if (c->chain_seat || c->mesh_seat) {
-                        char addr[96]; snprintf(addr, sizeof addr, "%s:%u", c->host, c->rport);
-                        idx_db_peer_tried(db, addr, (int64_t)now);
-                        if (c->mesh_seat)   // small curated pool — one line per backoff window
-                            fprintf(stderr, "serve: dial %s failed  [mesh]\n", addr);
-                        c->outbound = 0; c->mesh_seat = 0; c->chain_seat = 0; c->host[0] = 0; c->hip[0] = 0;
-                        continue;
-                    }
-                    c->redial_at = now + 15; continue;   // configured peer: keep trying
-                }
-                c->fd = fd; c->up = 1; c->sent_ver = 1; c->magic = coin->magic;
-                c->last_rx = now; c->last_ping = 0; c->peer_h = ph;
-                // record the CONNECTED remote addr — the addr book stays numeric,
-                // and the seat identity snaps to where the socket actually landed
-                // (a multi-A-record name can resolve one way and connect another)
-                net_peer_str(fd, c->peer, sizeof c->peer);
-                char pip[80]; snprintf(pip, sizeof pip, "%s", c->peer);
-                { char *pc = strrchr(pip, ':'); if (pc) *pc = 0; }
-                snprintf(c->hip, sizeof c->hip, "%s", pip);
-                // belt-and-braces: the pre-dial park makes this unreachable unless
-                // the connect landed on an address no dedup could see in advance
-                if (conn_host_live(conns, c, pip)) {
-                    fprintf(stderr, "serve: %s is %s — already connected, dropping duplicate\n",
-                            c->host, c->peer);
-                    close(fd); c->fd = -1; c->up = 0;
-                    if (c->mesh_seat || c->chain_seat) {
-                        c->outbound = 0; c->mesh_seat = 0; c->chain_seat = 0; c->host[0] = 0; c->hip[0] = 0;
-                    } else c->redial_at = now + 60;   // configured pin: the park then holds it
-                    continue;
-                }
-                snprintf(c->agent, sizeof c->agent, "%s", agent);
-                int is_dn = AGENT_MARKED(agent);
-                // unmarked feeler: stamp last_try only (do not persist a non-pepenet
-                // agent / last_good — that would drop the row out of the new table)
-                if (c->mesh_seat && !is_dn) {
-                    idx_db_peer_tried(db, c->peer, (int64_t)now);
-                    fprintf(stderr, "serve: feeler unmarked — release %s (agent %s)\n",
-                            c->peer, *agent ? agent : "(none)");
-                    close(fd); c->fd = -1; c->outbound = 0; c->mesh_seat = 0; c->feeler = 0;
-                    c->host[0] = 0; c->hip[0] = 0; c->up = 0;
-                    continue;
-                }
-                // persist the handshake so a restart re-seats this peer from memory
-                idx_db_peer_seen(db, c->peer, psvc, agent, (int64_t)now);
-                if (c->feeler) c->feeler = 0;   // observed mark → tried seat
-                fprintf(stderr, "serve: dialed %s (agent %s)%s%s\n", c->peer, agent,
-                        c->mesh_seat ? "  [mesh]" : "", c->chain_seat ? "  [chain]" : "");
-                if (mesh && mesh->peer_up && !c->mesh_handle && is_dn &&
-                    !mesh_on_host(conns, c, pip))
-                    c->mesh_handle = mesh->peer_up(mesh->ud, c, serve_mesh_send);
-                if (!c->dn_asked && is_dn) {          // solicit its overlay peer list
-                    net_send(fd, coin->magic, "dngetaddr", NULL, 0);
-                    c->dn_asked = 1;
-                    c->last_dnget = now;
-                }
-                // self-announcement (see serve_announce_self) — once per connection
-                if (port && *self && !c->self_sent) {
-                    serve_announce_self(c, coin, self, services);
-                    c->self_sent = 1;
-                }
+                // handshake completion (version/verack, peer_seen, mesh, dngetaddr,
+                // self-announce, unmarked-feeler release) runs in serve_dispatch
+                // on this same poll loop so accepts and EOF keep flowing.
             }
         }
         if (mesh && mesh->tick) mesh->tick(mesh->ud);
@@ -2540,13 +3138,24 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
         struct pollfd pfd[SERVE_MAX_CONN + 1]; int map[SERVE_MAX_CONN + 1]; int np = 0;
         if (lfd >= 0) { pfd[np].fd = lfd; pfd[np].events = POLLIN; map[np] = -1; np++; }
         for (int i = 0; i < SERVE_MAX_CONN; i++)
-            if (conns[i].fd >= 0) { pfd[np].fd = conns[i].fd; pfd[np].events = POLLIN; map[np] = i; np++; }
+            if (conns[i].fd >= 0) {
+                pfd[np].fd = conns[i].fd;
+                pfd[np].events = POLLIN | ((conns[i].connecting || serve_out_pending(&conns[i])) ? POLLOUT : 0);
+                map[np] = i; np++;
+            }
         if (poll(pfd, np, 1000) <= 0) continue;
         int start = 0;
         if (lfd >= 0 && (pfd[0].revents & POLLIN)) {
+          for (;;) {
             int cfd = accept(lfd, NULL, NULL);
-            if (cfd >= 0) {
+            if (cfd < 0) {
+                if (errno == EINTR) continue;
+                break;   /* EAGAIN/EWOULDBLOCK or hard error — next poll */
+            }
+            {
                 sock_nosigpipe(cfd);
+                { int fl = fcntl(cfd, F_GETFL, 0); if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK); }
+                serve_apply_test_sndbuf(cfd);
                 char ip[INET_ADDRSTRLEN] = ""; unsigned rport = 0;
                 struct sockaddr_in pa; socklen_t pl2 = sizeof pa;
                 if (getpeername(cfd, (struct sockaddr *)&pa, &pl2) == 0) {
@@ -2558,7 +3167,10 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                 } else {
                 int from_host = 0;
                 for (int i = 0; i < SERVE_MAX_CONN; i++) {
-                    if (conns[i].fd < 0 || !ip[0]) continue;
+                    /* inbound-only: a connecting outbound must not consume a
+                     * SERVE_INBOUND_PER_HOST seat (baseline: serve_dial held
+                     * the fd locally so outbound hip never counted here). */
+                    if (conns[i].fd < 0 || !ip[0] || conns[i].outbound) continue;
                     size_t il = strlen(ip);
                     if (conns[i].hip[0] && !strcmp(conns[i].hip, ip)) from_host++;
                     else if (conns[i].peer[0] && !strncmp(conns[i].peer, ip, il) &&
@@ -2577,6 +3189,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                     }
                     close(cfd);
                 } else {
+                    serve_bufs_clear(&conns[slot]);
                     memset(&conns[slot], 0, sizeof conns[slot]);
                     conns[slot].fd = cfd; conns[slot].magic = coin->magic;
                     conns[slot].last_rx = time(NULL);   // handshake clock starts now
@@ -2587,13 +3200,25 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
                 }
                 }
             }
+          }
         }
         if (lfd >= 0) start = 1;
         for (int k = start; k < np; k++) {
-            if (map[k] < 0 || !(pfd[k].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            if (map[k] < 0 || !(pfd[k].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR))) continue;
             SConn *c = &conns[map[k]];
+            if (c->connecting && (pfd[k].revents & (POLLOUT | POLLERR | POLLHUP))) {
+                int cr = serve_connect_ready(c, conns, coin, db, services);
+                if (cr < 0) serve_outbound_fail(c, db, time(NULL));
+                if (c->fd < 0 || c->connecting)
+                    continue;
+            }
+            if (!c->connecting && serve_out_pending(c) && (pfd[k].revents & POLLOUT)) {
+                if (!serve_out_flush(c)) { serve_drop(c, mesh); continue; }
+            }
+            if (!(pfd[k].revents & (POLLIN | POLLHUP | POLLERR))) continue;
             uint8_t chunk[8192];
             ssize_t r = recv(c->fd, chunk, sizeof chunk, 0);
+            if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
             if (r <= 0) { serve_drop(c, mesh); continue; }
             c->last_rx = time(NULL);
             size_t need = c->len + (size_t)r;
@@ -2626,6 +3251,7 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
     for (int i = 0; i < SERVE_MAX_CONN; i++) if (conns[i].fd >= 0) serve_drop(&conns[i], mesh);
     if (lfd >= 0) close(lfd);
     g_conns.seq++; g_conns.n = 0; g_conns.seq++;      // serve is down — clear the page
+    idx_peer_height_note(db, 0, (int64_t)time(NULL), 1);   // flush a rate-limited peer_height
     serve_store_close(ss); idx_db_close(db);
     return 0;
 }
@@ -2900,6 +3526,344 @@ static int cmd_crawl(int argc, char **argv) {
     return 0;
 }
 
+// ── offline snapshots (idx-01) — never called from sync; see docs/SNAPSHOT.md ──
+// snapshot-export <coin> <db> <outdir>: outdir/state.db (a VACUUM INTO copy of
+// the lossless projection at its sync height H) + outdir/MANIFEST (coin, H, tip,
+// activation, state_digest, state_ecmh of the fold loaded from that copy).
+// snapshot-verify <coin> <snapdir> [headers-file]: reload the fold from
+// state.db, recompute both digests and compare to MANIFEST, check the db's own
+// sync tip = MANIFEST, then walk headers checkpoint+1..H (linkage, PoW, nBits)
+// and require the last hash = tip. Exit 0 only if every check passed.
+static void snap_hex(const uint8_t *b, int n, char *out) {
+    static const char *H = "0123456789abcdef";
+    for (int i = 0; i < n; i++) { out[2*i] = H[b[i] >> 4]; out[2*i+1] = H[b[i] & 15]; }
+    out[2*n] = 0;
+}
+static int snap_digests(const char *coin, const char *dbpath, int64_t *h, uint8_t tip[32], int64_t *act,
+                        char d_hex[65], char e_hex[65]) {
+    sqlite3 *db; SmState *s = open_state(dbpath, coin, &db); if (!s) return 0;
+    int ok = idx_db_load_sync(db, h, tip);
+    *act = idx_db_get_activation(db, 0);
+    uint8_t d[32], e[32]; sm_state_digest(s, d); sm_state_ecmh(s, e);
+    snap_hex(d, 32, d_hex); snap_hex(e, 32, e_hex);
+    sm_free(s); idx_db_close(db); return ok;
+}
+// idx-06: canonical export. A plain VACUUM INTO keeps the hidden rowids of
+// tables with no INTEGER PRIMARY KEY (meta, names, commits, epochs, utxos, ...),
+// and those depend on the db's history: INSERT OR REPLACE, crash recovery and
+// resume order all hand out different rowids for the same logical rows, so two
+// honest builds at the same height gave different whole-file sha256s. Here the
+// same schema (sqlite_master SQL, original order) is replayed into a fresh
+// scratch db with fixed pragmas, every table is copied in primary-key order (all
+// columns when there is no PK), and that scratch db is then VACUUM INTO'd.
+// Schema, rows and the journal mode in the header are unchanged; only the
+// hidden rowids are renumbered, and nothing reads them.
+static int snap_exec(sqlite3 *db, const char *sql) {
+    char *err = NULL;
+    if (sqlite3_exec(db, sql, NULL, NULL, &err) == SQLITE_OK) return 1;
+    fprintf(stderr, "snapshot-export: %s: %s\n", sql, err ? err : "?"); sqlite3_free(err); return 0;
+}
+static int snap_export_canonical(const char *src, const char *dir, const char *out) {
+    char tmp[1200]; snprintf(tmp, sizeof tmp, "%s/.state.db.canon", dir);
+    unlink(tmp);
+    sqlite3 *c = NULL, *s = idx_db_open_ro(src);
+    if (!s) { fprintf(stderr, "cannot open %s read-only\n", src); return 0; }
+    int ok = 0; sqlite3_stmt *st = NULL, *q = NULL; char *sql = NULL;
+    char jm[16] = "delete";
+    if (sqlite3_prepare_v2(s, "PRAGMA journal_mode", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
+        snprintf(jm, sizeof jm, "%s", (const char *)sqlite3_column_text(st, 0));
+    sqlite3_finalize(st); st = NULL;
+    if (sqlite3_open(tmp, &c) != SQLITE_OK) { fprintf(stderr, "cannot create %s\n", tmp); goto done; }
+    if (!snap_exec(c, "PRAGMA page_size=4096; PRAGMA auto_vacuum=0; PRAGMA encoding='UTF-8';"
+                      " PRAGMA synchronous=OFF; PRAGMA journal_mode=OFF")) goto done;
+    // user_version / application_id travel with the file: copy them verbatim.
+    for (int k = 0; k < 2; k++) {
+        const char *pn = k ? "application_id" : "user_version"; char b[96];
+        snprintf(b, sizeof b, "PRAGMA %s", pn);
+        long long v = 0;
+        if (sqlite3_prepare_v2(s, b, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st); st = NULL;
+        snprintf(b, sizeof b, "PRAGMA %s=%lld", pn, v); if (!snap_exec(c, b)) goto done;
+    }
+    if (!snap_exec(c, "BEGIN")) goto done;
+    // schema in its original creation order (sqlite_master rowid), autoindexes implied
+    if (sqlite3_prepare_v2(s, "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+                           -1, &st, NULL) != SQLITE_OK) goto done;
+    while (sqlite3_step(st) == SQLITE_ROW) if (!snap_exec(c, (const char *)sqlite3_column_text(st, 0))) goto done;
+    sqlite3_finalize(st); st = NULL;
+    if (sqlite3_prepare_v2(s, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+                           -1, &st, NULL) != SQLITE_OK) goto done;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(st, 0);
+        // idx-07: node-local tables keep their schema but ship with zero rows:
+        // peers (gossip cache), watch + utxos (this node's wallet watch set).
+        // None feeds state_digest/state_ecmh, the fold or import.
+        if (!strcmp(t, "peers") || !strcmp(t, "watch") || !strcmp(t, "utxos")) continue;
+        // ORDER BY: primary-key columns in pk order, then every column (total order)
+        char *ord = sqlite3_mprintf(""), *ins = NULL;
+        for (int pass = 0; pass < 2; pass++) {
+            char *qs = sqlite3_mprintf("SELECT name, pk FROM pragma_table_info(%Q) %s", t,
+                                       pass ? "ORDER BY cid" : "WHERE pk > 0 ORDER BY pk");
+            sqlite3_prepare_v2(s, qs, -1, &q, NULL); sqlite3_free(qs);
+            while (q && sqlite3_step(q) == SQLITE_ROW) {
+                char *n = sqlite3_mprintf("%s%s\"%w\"", ord, *ord ? ", " : "", (const char *)sqlite3_column_text(q, 0));
+                sqlite3_free(ord); ord = n;
+            }
+            sqlite3_finalize(q); q = NULL;
+        }
+        // idx-11: meta onchain_magic is node-local (the importer re-stamps it from
+        // its coin) and is not in state_digest/state_ecmh; leave it out so a db
+        // stamped by idx-10 and an older unstamped db export byte-identically.
+        ins = sqlite3_mprintf("INSERT INTO main.\"%w\" SELECT * FROM src.\"%w\"%s ORDER BY %s", t, t,
+                              !strcmp(t, "meta") ? " WHERE k <> 'onchain_magic'" : "", ord);
+        sqlite3_free(ord);
+        sql = ins;
+        if (!sql) goto done;
+        // ATTACH the source once (read-only)
+        sqlite3_stmt *a = NULL; int attached = 0;
+        if (sqlite3_prepare_v2(c, "SELECT 1 FROM pragma_database_list WHERE name='src'", -1, &a, NULL) == SQLITE_OK)
+            attached = sqlite3_step(a) == SQLITE_ROW;
+        sqlite3_finalize(a);
+        if (!attached) {
+            char *at = sqlite3_mprintf("ATTACH 'file:%q?mode=ro' AS src", src);
+            int r = sqlite3_exec(c, at, NULL, NULL, NULL); sqlite3_free(at);
+            if (r != SQLITE_OK) {   // non-URI build: plain path, read through the tx only
+                at = sqlite3_mprintf("ATTACH %Q AS src", src); r = snap_exec(c, at) ? SQLITE_OK : SQLITE_ERROR; sqlite3_free(at);
+                if (r != SQLITE_OK) goto done;
+            }
+        }
+        if (!snap_exec(c, sql)) goto done;
+        sqlite3_free(sql); sql = NULL;
+    }
+    sqlite3_finalize(st); st = NULL;
+    if (!snap_exec(c, "COMMIT") || !snap_exec(c, "DETACH src")) goto done;
+    // keep the header's journal-mode bytes exactly as a plain export had them
+    { char b[64]; snprintf(b, sizeof b, "PRAGMA journal_mode=%s", jm); snap_exec(c, b); }
+    if (sqlite3_prepare_v2(c, "VACUUM INTO ?", -1, &st, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_text(st, 1, out, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_DONE) { fprintf(stderr, "VACUUM INTO failed: %s\n", sqlite3_errmsg(c)); goto done; }
+    ok = 1;
+done:
+    sqlite3_free(sql); sqlite3_finalize(q); sqlite3_finalize(st);
+    sqlite3_close(s); if (c) sqlite3_close(c);
+    char aux[1300];
+    unlink(tmp); snprintf(aux, sizeof aux, "%s-wal", tmp); unlink(aux); snprintf(aux, sizeof aux, "%s-shm", tmp); unlink(aux);
+    snprintf(aux, sizeof aux, "%s-journal", tmp); unlink(aux);
+    if (!ok) unlink(out);
+    return ok;
+}
+static int cmd_snapshot_export(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: snapshot-export <coin> <db> <outdir>\n"); return 2; }
+    const Coin *coin = coin_by_name(argv[2]); if (!coin) { fprintf(stderr, "unknown coin %s\n", argv[2]); return 2; }
+    const char *src = argv[3], *dir = argv[4];
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) { perror(dir); return 1; }
+    char sp[1100], mp[1100];
+    snprintf(sp, sizeof sp, "%s/state.db", dir); snprintf(mp, sizeof mp, "%s/MANIFEST", dir);
+    if (access(sp, F_OK) == 0) { fprintf(stderr, "%s exists — refusing to overwrite\n", sp); return 1; }
+    if (!snap_export_canonical(src, dir, sp)) return 1;
+    int64_t h = 0, act = 0; uint8_t tip[32]; char d[65], e[65], th[65];
+    if (!snap_digests(argv[2], sp, &h, tip, &act, d, e)) { fprintf(stderr, "db has no sync state\n"); return 1; }
+    snap_hex(tip, 32, th);
+    FILE *f = fopen(mp, "wb"); if (!f) { perror(mp); return 1; }   // idx-10: LF on every platform
+    fprintf(f, "pepenet-snapshot 1\ncoin %s\nheight %lld\ntip %s\nactivation %lld\ncheckpoint %lld\n"
+               "state_digest %s\nstate_ecmh %s\n",
+            coin->name, (long long)h, th, (long long)act, (long long)coin->start, d, e);
+    // idx-09: informational — which sqlite wrote state.db (the pin still decides)
+    fprintf(f, "sqlite_version %s\n", sqlite3_libversion());
+    fclose(f);
+    uint8_t fh[32]; char fhx[65]; int64_t fsz = 0;
+    if (!idx_snap_file_sha256(sp, fh, &fsz)) { fprintf(stderr, "cannot hash %s\n", sp); return 1; }
+    snap_hex(fh, 32, fhx);
+    printf("snapshot %s at height %lld\nstate_digest %s\nstate_ecmh   %s\n", dir, (long long)h, d, e);
+    // idx-04: the whole-file pin. Publish this out of band; consumers pass it as
+    // --snapshot-sha256 / --sha256 (MANIFEST format unchanged — it is not in it).
+    printf("sha256 %s  state.db (%lld bytes)\n", fhx, (long long)fsz);
+    printf("sqlite %s (the exporter's library: pin it to reproduce this hash)\n", sqlite3_libversion());
+    return 0;
+}
+static int snap_field(const char *mf, const char *key, char *out, size_t cap) {
+    size_t kl = strlen(key);
+    for (const char *p = mf; p && *p; p = strchr(p, '\n') ? strchr(p, '\n') + 1 : NULL) {
+        if (!strncmp(p, key, kl) && p[kl] == ' ') {
+            const char *v = p + kl + 1; size_t n = strcspn(v, "\n");
+            if (n >= cap) return 0; memcpy(out, v, n); out[n] = 0; return 1;
+        }
+    }
+    return 0;
+}
+// idx-09: log the MANIFEST's sqlite_version against this binary's sqlite.
+// Informational only: never refuses — the whole-file sha256 pin decides. A
+// MANIFEST without the key (pre-idx-09 export) is accepted.
+static void snap_note_sqlite(FILE *o, const char *pfx, const char *mf) {
+    char v[64]; const char *mine = sqlite3_libversion();
+    if (!snap_field(mf, "sqlite_version", v, sizeof v))
+        fprintf(o, "%sMANIFEST has no sqlite_version (pre-idx-09 export) — accepted; this node links sqlite %s\n", pfx, mine);
+    else if (strcmp(v, mine))
+        fprintf(o, "%sWARNING: snapshot exported with sqlite %s, this node links sqlite %s"
+                   " (informational; the sha256 pin decides)\n", pfx, v, mine);
+    else fprintf(o, "%ssqlite_version %s matches this node\n", pfx, v);
+}
+// pull "--sha256 <hex>" out of argv (any position after the command); returns
+// the hex or NULL. *bad = 1 if the flag has no value.
+static const char *snap_take_pin(int *argc, char **argv, int *bad) {
+    const char *pin = NULL; *bad = 0;
+    for (int i = 2; i < *argc; i++) {
+        if (strcmp(argv[i], "--sha256") && strcmp(argv[i], "--snapshot-sha256")) continue;
+        if (i + 1 >= *argc) { *bad = 1; return NULL; }
+        pin = argv[i + 1];
+        for (int j = i; j + 2 <= *argc; j++) argv[j] = argv[j + 2];
+        *argc -= 2; i--;
+    }
+    return pin;
+}
+static int cmd_snapshot_verify(int argc, char **argv) {
+    int badflag; const char *flag_pin = snap_take_pin(&argc, argv, &badflag);
+    int allow_unpinned = 0;                          // idx-05: dev-only escape hatch
+    for (int i = 2; i < argc; i++)
+        if (!strcmp(argv[i], "--allow-unpinned")) {
+            allow_unpinned = 1;
+            for (int j = i; j + 1 <= argc; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+        }
+    if (argc < 4 || badflag) { fprintf(stderr, "usage: snapshot-verify <coin> <snapdir> [headers-file] (--sha256 <hex> | --allow-unpinned)\n"); return 2; }
+    const Coin *coin = coin_by_name(argv[2]); if (!coin) { fprintf(stderr, "unknown coin %s\n", argv[2]); return 2; }
+    char sp[1100], mp[1100];
+    snprintf(sp, sizeof sp, "%s/state.db", argv[3]); snprintf(mp, sizeof mp, "%s/MANIFEST", argv[3]);
+    // idx-04: the whole-file pin gates everything — checked before MANIFEST or
+    // state.db is parsed. Flag overrides the compiled-in default; with neither,
+    // verify REFUSES (idx-05, same as import) unless --allow-unpinned (dev use:
+    // run the idx-01 checks only, result labelled UNPINNED).
+    const char *pin = idx_snap_effective_pin(coin->name, flag_pin);
+    if (pin) {
+        char why[300];
+        if (!idx_snap_pin_check(sp, pin, why, sizeof why)) {
+            printf("  FAIL %s\nsnapshot-verify: REFUSED (pin)\n", why); return 1; }
+        printf("  ok   state.db whole-file sha256 = pin%s\n", flag_pin ? "" : " (compiled default)");
+    } else if (!allow_unpinned) {
+        printf("  FAIL no snapshot pin (no --sha256 and no compiled default)\n"
+               "snapshot-verify: REFUSED (no pin; --allow-unpinned for dev-only integrity checks)\n");
+        return 1;
+    } else printf("  warn --allow-unpinned: integrity checks only, snapshot is UNPINNED (untrusted)\n");
+    size_t ml; uint8_t *mraw = read_file(mp, &ml);
+    if (!mraw || ml > 4096) { fprintf(stderr, "cannot read %s\n", mp); free(mraw); return 1; }
+    char mf[4097]; memcpy(mf, mraw, ml); mf[ml] = 0; free(mraw);
+    char m_coin[32], m_h[32], m_tip[80], m_d[80], m_e[80];
+    if (strncmp(mf, "pepenet-snapshot 1\n", 19) || !snap_field(mf, "coin", m_coin, sizeof m_coin) ||
+        !snap_field(mf, "height", m_h, sizeof m_h) || !snap_field(mf, "tip", m_tip, sizeof m_tip) ||
+        !snap_field(mf, "state_digest", m_d, sizeof m_d) || !snap_field(mf, "state_ecmh", m_e, sizeof m_e)) {
+        fprintf(stderr, "FAIL manifest malformed\n"); return 1; }
+    snap_note_sqlite(stdout, "  info ", mf);
+    int fail = 0;
+    #define SNAPCHK(c, msg) do { if (c) printf("  ok   %s\n", msg); else { printf("  FAIL %s\n", msg); fail++; } } while (0)
+    SNAPCHK(!strcmp(m_coin, coin->name), "manifest coin matches");
+    if (access(sp, R_OK) != 0) { printf("  FAIL state.db missing\n"); return 1; }
+    int64_t h = 0, act = 0; uint8_t tip[32]; char d[65], e[65], th[65];
+    int have = snap_digests(argv[2], sp, &h, tip, &act, d, e);
+    SNAPCHK(have, "state.db has a sync tip");
+    if (!have) return 1;
+    snap_hex(tip, 32, th);
+    SNAPCHK(strtoll(m_h, NULL, 10) == h, "state.db height = manifest height");
+    SNAPCHK(!strcmp(m_tip, th), "state.db tip = manifest tip");
+    SNAPCHK(!strcmp(m_d, d), "recomputed state_digest = manifest");
+    SNAPCHK(!strcmp(m_e, e), "recomputed state_ecmh = manifest");
+    if (argc > 4) {
+        size_t len; uint8_t *buf = read_file(argv[4], &len);
+        if (!buf) { fprintf(stderr, "cannot read %s\n", argv[4]); return 1; }
+        IdxSnapWalk w; memset(&w, 0, sizeof w);
+        w.h = coin->start; memcpy(w.hash, coin->start_hash, 32);
+        w.bits = coin->start_bits; w.time = coin->start_time; w.prev_time = coin->start_prev_time;
+        w.powlimit = coin->powlimit; w.aux_chain_id = coin->aux_chain_id; w.check_pow = coin->powlimit != 0;
+        char why[200] = "";
+        int ok = idx_snap_walk(&w, buf, len, why, sizeof why); free(buf);
+        if (!ok) printf("  FAIL header walk: %s\n", why), fail++;
+        else {
+            char msg[160]; snprintf(msg, sizeof msg, "%lld headers %s from checkpoint %lld", (long long)w.n,
+                                    w.check_pow ? "PoW-valid" : "linked (PoW off for this profile)", (long long)coin->start);
+            SNAPCHK(1, msg);
+            SNAPCHK(w.h == h, "header walk ends at snapshot height");
+            SNAPCHK(!memcmp(w.hash, tip, 32), "last header hash = snapshot tip");
+        }
+    } else if (coin->powlimit) { printf("  FAIL headers-file required for %s (PoW profile)\n", coin->name); fail++; }
+    else printf("  skip header walk (no headers-file; %s has PoW off)\n", coin->name);
+    #undef SNAPCHK
+    printf(fail ? "snapshot-verify: %d FAILED\n" : "snapshot-verify: OK\n", fail);
+    return fail ? 1 : 0;
+}
+
+// ── idx-04 import: pinned, fail-closed ───────────────────────────────────────
+// Apply <snapdir>/state.db as a fresh db at dbpath, only if (in order):
+//   1. a pin exists (flag overrides the compiled default) and is 64 hex;
+//   2. dbpath does not exist (never clobbers a live db);
+//   3. the whole-file SHA-256 of state.db equals the pin — before sqlite ever
+//      opens it;
+//   4. the bytes actually COPIED (to dbpath.snap-tmp) hash to the pin again
+//      (closes the check-then-copy race);
+//   5. the copy's MANIFEST coin/height/tip/state_digest/state_ecmh agree.
+// Then rename into place. Any failure: temp removed, nothing applied, returns 0
+// with `why`; the caller just runs a normal full sync. 1 = applied.
+int idx_snapshot_import(const char *coin_name, const char *snapdir, const char *dbpath,
+                        const char *flag_pin, char *why, size_t cap) {
+    const Coin *coin = coin_by_name(coin_name);
+    if (!coin) { snprintf(why, cap, "unknown coin %s", coin_name ? coin_name : "?"); return 0; }
+    const char *pin = idx_snap_effective_pin(coin->name, flag_pin);
+    uint8_t want[32];
+    if (!pin) { snprintf(why, cap, "no snapshot pin (no --snapshot-sha256 and no compiled default)"); return 0; }
+    if (!idx_snap_parse_pin(pin, want)) { snprintf(why, cap, "malformed snapshot pin (need 64 hex digits)"); return 0; }
+    if (access(dbpath, F_OK) == 0) { snprintf(why, cap, "%s already exists — snapshot not applied over a live db", dbpath); return 0; }
+    char sp[1100], mp[1100], tmp[1100];
+    snprintf(sp, sizeof sp, "%s/state.db", snapdir); snprintf(mp, sizeof mp, "%s/MANIFEST", snapdir);
+    snprintf(tmp, sizeof tmp, "%s.snap-tmp", dbpath);
+    if (!idx_snap_pin_check(sp, pin, why, cap)) return 0;
+    // copy while hashing
+    FILE *in = fopen(sp, "rb"), *out = in ? fopen(tmp, "wb") : NULL;
+    if (!in || !out) { if (in) fclose(in); snprintf(why, cap, "cannot copy %s", sp); return 0; }
+    SHA256_CTX c; sha256_init(&c); uint8_t buf[65536]; size_t n; int ioerr = 0;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        sha256_update(&c, buf, (unsigned)n);
+        if (fwrite(buf, 1, n, out) != n) { ioerr = 1; break; }
+    }
+    ioerr |= ferror(in); fclose(in);
+    if (fflush(out) || fsync(fileno(out))) ioerr = 1;
+    fclose(out);
+    uint8_t got[32]; sha256_final(&c, got);
+    #define IMPFAIL(...) do { snprintf(why, cap, __VA_ARGS__); unlink(tmp); return 0; } while (0)
+    if (ioerr) IMPFAIL("i/o error copying %s", sp);
+    if (memcmp(got, want, 32)) IMPFAIL("sha256 mismatch on the copied bytes (file changed during import)");
+    size_t ml; uint8_t *mraw = read_file(mp, &ml);
+    if (!mraw || ml > 4096) { free(mraw); IMPFAIL("cannot read %s", mp); }
+    char mf[4097]; memcpy(mf, mraw, ml); mf[ml] = 0; free(mraw);
+    char m_coin[32], m_h[32], m_tip[80], m_d[80], m_e[80];
+    if (strncmp(mf, "pepenet-snapshot 1\n", 19) || !snap_field(mf, "coin", m_coin, sizeof m_coin) ||
+        !snap_field(mf, "height", m_h, sizeof m_h) || !snap_field(mf, "tip", m_tip, sizeof m_tip) ||
+        !snap_field(mf, "state_digest", m_d, sizeof m_d) || !snap_field(mf, "state_ecmh", m_e, sizeof m_e))
+        IMPFAIL("MANIFEST malformed");
+    snap_note_sqlite(stderr, "snapshot: ", mf);
+    if (strcmp(m_coin, coin->name)) IMPFAIL("MANIFEST coin %s != %s", m_coin, coin->name);
+    int64_t h = 0, act = 0; uint8_t tip[32]; char d[65], e[65], th[65];
+    if (!snap_digests(coin->name, tmp, &h, tip, &act, d, e)) IMPFAIL("state.db has no sync tip");
+    snap_hex(tip, 32, th);
+    if (strtoll(m_h, NULL, 10) != h || strcmp(m_tip, th) || strcmp(m_d, d) || strcmp(m_e, e))
+        IMPFAIL("state.db does not reproduce MANIFEST height/tip/digests");
+    // idx-11: the export omits onchain_magic; stamp this coin's after every
+    // pin/digest check passed (the magic is not digested, so nothing above changes).
+    { sqlite3 *sdb = idx_db_open(tmp); if (!sdb) IMPFAIL("cannot open %s to stamp onchain_magic", tmp);
+      idx_db_set_onchain_magic(sdb, coin->onchain_magic); idx_db_close(sdb); }
+    { char x[1200]; snprintf(x, sizeof x, "%s-wal", tmp); unlink(x); snprintf(x, sizeof x, "%s-shm", tmp); unlink(x); }
+    if (rename(tmp, dbpath) != 0) IMPFAIL("rename to %s failed", dbpath);
+    #undef IMPFAIL
+    snprintf(why, cap, "applied %s snapshot at height %lld (sha256 pinned)", coin->name, (long long)h);
+    return 1;
+}
+// snapshot-import <coin> <snapdir> <db> [--sha256 <hex>]: exit 0 applied, 1 refused.
+static int cmd_snapshot_import(int argc, char **argv) {
+    int badflag; const char *flag_pin = snap_take_pin(&argc, argv, &badflag);
+    if (argc < 5 || badflag) { fprintf(stderr, "usage: snapshot-import <coin> <snapdir> <db> [--sha256 <hex>]\n"); return 2; }
+    char why[400];
+    int ok = idx_snapshot_import(argv[2], argv[3], argv[4], flag_pin, why, sizeof why);
+    fprintf(stderr, ok ? "snapshot: %s\n" : "snapshot: REFUSED: %s — not applied; full sync instead\n", why);
+    return ok ? 0 : 1;
+}
+
 int indexer_main(int argc, char **argv) {
     const char *cmd = argv[1];
     if (!strcmp(cmd, "index"))   return cmd_index(argc, argv);
@@ -2912,5 +3876,13 @@ int indexer_main(int argc, char **argv) {
     if (!strcmp(cmd, "crawl"))   return cmd_crawl(argc, argv);
     if (!strcmp(cmd, "serve"))   return cmd_serve(argc, argv);
     if (!strcmp(cmd, "weigh"))   return cmd_weigh(argc, argv);
+    if (!strcmp(cmd, "snapshot-export")) return cmd_snapshot_export(argc, argv);
+    if (!strcmp(cmd, "snapshot-verify")) return cmd_snapshot_verify(argc, argv);
+    if (!strcmp(cmd, "snapshot-import")) return cmd_snapshot_import(argc, argv);
+    if (!strcmp(cmd, "check")) {
+        if (argc < 3) { fprintf(stderr, "usage: check <db> [serve-db]\n"); return 2; }
+        IdxCheckReport r;
+        return idx_db_check(argv[2], argc > 3 ? argv[3] : NULL, stdout, &r) ? 1 : 0;
+    }
     return 2;
 }

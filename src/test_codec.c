@@ -351,6 +351,11 @@ static void sec_txcheck(void) {
       uint64_t v[2] = { 0, 100000000ULL };
       int n = raw_tx(raw, 1, prev1, g_ss1, g_ssn1, 2, v, sp, sn);
       CHECK(accepted(raw, n), "an OP_RETURN carrier at value 0 is exempt from dust"); }
+    { uint8_t dn[38]; memcpy(dn, g_opret, 38); dn[3] = 0x44;   // same push, DN magic
+      const uint8_t *sp[2] = { dn, g_p2pkh }; int sn[2] = { 38, 25 };
+      uint64_t v[2] = { 0, 100000000ULL };
+      int n = raw_tx(raw, 1, prev1, g_ss1, g_ssn1, 2, v, sp, sn);
+      CHECK(accepted(raw, n), "DN twin: an OP_RETURN carrier at value 0 is exempt from dust"); }
     { uint8_t multi[8]; int l = 0; p1(multi, &l, 0x6A); p1(multi, &l, 0x01); p1(multi, &l, 0xAA);
       p1(multi, &l, 0x01); p1(multi, &l, 0xBB);
       const uint8_t *sp[1] = { multi }; int sn[1] = { l };

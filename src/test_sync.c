@@ -36,6 +36,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include "dbcheck.h"
 
 int secp_pubkey(const uint8_t priv[32], uint8_t pub33[33]);
 int secp_ecdsa_sign(const uint8_t priv[32], const uint8_t h[32], uint8_t r32[32], uint8_t s32[32]);
@@ -246,6 +249,7 @@ static int run_index(const char *dbpath, int from, int to) {
     int argc = 0;
     argv[argc++] = (char *)"indexerd"; argv[argc++] = (char *)"index";
     argv[argc++] = (char *)dbpath;     argv[argc++] = act;
+    argv[argc++] = (char *)"--coin"; argv[argc++] = (char *)"regtest";   // idx-10: PN fixtures; never guessed
     for (int i = from; i <= to; i++) argv[argc++] = g_blk[i];
     fflush(stdout);
     int saved = dup(1), devnull = open("/dev/null", O_WRONLY);
@@ -279,6 +283,8 @@ static int fold_open(Fold *f, const char *dbpath) {
     f->db = idx_db_open(dbpath); if (!f->db) return 0;
     f->activation = idx_db_get_activation(f->db, ACTIVATION);
     f->s = sm_new((uint64_t)f->activation);
+    if (!idx_db_get_onchain_magic(f->db, f->s->onchain_magic))
+        idx_coin_onchain_magic("pep", f->s->onchain_magic);
     idx_db_load_state(f->db, f->s);
     f->o = oracle_new();
     idx_db_oracle_warm(f->db, f->o);
@@ -606,22 +612,308 @@ static void sec_rewalk(const char *dir) {
     rm_db(dbp);
 }
 
+// DN twin of the h2 COMMIT carrier. Same commitment bytes, same fold digest;
+// each prefix is IGNORE under the other profile.
+static void fold_commit(const SmAction *a, uint8_t dig[32]) {
+    SmState *s = sm_new(0);
+    sm_begin_block(s, 2, 1000, 1);
+    SmTx t; memset(&t, 0, sizeof t);
+    SmId *in = sm_tx_input(&t); memset(in->h160, 0x11, 20); in->type = SM_P2PKH;
+    t.in_sighash_all[0] = 1;
+    SmCarrier *c = sm_tx_carrier(&t);
+    c->kind = SM_CAR_ACTION; c->act = *a; c->value = 0; c->vout = 0;
+    sm_apply_tx(s, &t);
+    sm_state_digest(s, dig);
+    sm_tx_free(&t); sm_free(s);
+}
+static void sec_magic(void) {
+    printf("\n-- on-chain magic: PN commit vector and its DN twin --\n");
+    uint8_t pn[2] = { 0x50, 0x4E }, dn[2] = { 0x44, 0x4E };
+    uint8_t commit[36] = { 0xFF, 0x50, 0x4E, SM_OP_COMMIT };
+    memset(commit + 4, 0x22, 32);
+    SmCarrier c;
+    sm_decode_payload(commit, 36, 0, pn, &c);
+    CHECK(c.kind == SM_CAR_ACTION && c.act.op == SM_OP_COMMIT, "PN commit decodes under the PN profile");
+    SmAction pn_act = c.act;
+    sm_decode_payload(commit, 36, 0, dn, &c);
+    CHECK(c.kind == SM_CAR_IGNORE, "PN commit is ignored under the DN profile");
+    uint8_t dnc[36]; memcpy(dnc, commit, 36); dnc[1] = dn[0]; dnc[2] = dn[1];
+    sm_decode_payload(dnc, 36, 0, dn, &c);
+    CHECK(c.kind == SM_CAR_ACTION && c.act.op == SM_OP_COMMIT, "DN twin commit decodes under the DN profile");
+    SmAction dn_act = c.act;
+    sm_decode_payload(dnc, 36, 0, pn, &c);
+    CHECK(c.kind == SM_CAR_IGNORE, "DN commit is ignored under the PN profile");
+    uint8_t dp[32], dd[32];
+    fold_commit(&pn_act, dp); fold_commit(&dn_act, dd);
+    CHECK(memcmp(dp, dd, 32) == 0, "DN commit fold digest equals the PN fold");
+}
+
+
+// ── 10–12 (idx-03): crash mid-write, reorg, and the read-only check ──────────
+// alt branch for h3..h5: fillers with different seeds/times, NO wallet spend.
+static char g_alt[NBLK][600];
+static void make_alt_files(const char *dir) {
+    uint8_t stranger[20]; memset(stranger, 0x7B, 20);
+    uint8_t tx[1024], blk[2048]; int txl, blkl;
+    for (int i = 3; i < NBLK; i++) {
+        snprintf(g_alt[i], sizeof g_alt[0], "%s/alt%d.bin", dir, i);
+        uint8_t prev[32]; memset(prev, (uint8_t)(0x90 + i), 32);
+        build_plain_tx(prev, 0, stranger, 200000000ULL, (uint8_t)(0xA0 + i), tx, &txl);
+        build_block(tx, txl, (uint32_t)(1000 + 61 * i), blk, &blkl);
+        if (!write_file(g_alt[i], blk, blkl)) exit(2);
+    }
+}
+static int run_files(const char *dbpath, char **files, int n) {
+    char act[32]; snprintf(act, sizeof act, "%lld", (long long)ACTIVATION);
+    char *argv[8 + NBLK]; int argc = 0;
+    argv[argc++] = (char *)"indexerd"; argv[argc++] = (char *)"index";
+    argv[argc++] = (char *)dbpath; argv[argc++] = act;
+    argv[argc++] = (char *)"--coin"; argv[argc++] = (char *)"regtest";   // idx-10: PN fixtures; never guessed
+    for (int i = 0; i < n; i++) argv[argc++] = files[i];
+    fflush(stdout);
+    int saved = dup(1), dn = open("/dev/null", O_WRONLY);
+    if (dn >= 0) { dup2(dn, 1); close(dn); }
+    int rc = indexer_main(argc, argv);
+    fflush(stdout); if (saved >= 0) { dup2(saved, 1); close(saved); }
+    return rc;
+}
+// Run `index` over files in a CHILD that SIGKILLs itself after block crash_at's
+// rows autocommit (pre-projection). Returns 1 if the child died by SIGKILL.
+static int run_files_killed(const char *dbpath, char **files, int n, int64_t crash_at) {
+    fflush(stdout); fflush(stderr);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char b[32]; snprintf(b, sizeof b, "%lld", (long long)crash_at);
+        setenv("IDX_TEST_CRASH_AT", b, 1);
+        int dn = open("/dev/null", O_WRONLY); if (dn >= 0) { dup2(dn, 2); close(dn); }
+        run_files(dbpath, files, n); _exit(0);
+    }
+    int st = 0; waitpid(pid, &st, 0);
+    return WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL;
+}
+static void state_digest(const char *dbpath, uint8_t d[32]) {
+    Fold f; memset(d, 0, 32); if (!fold_open(&f, dbpath)) return;
+    sm_state_digest(f.s, d); fold_close(&f);
+}
+static int64_t bal_of(const char *dbpath) {
+    sqlite3 *db = idx_db_open(dbpath); int64_t b = db ? balance(db) : -1; idx_db_close(db); return b;
+}
+static int check_clean(const char *dbpath, int want_warn) {   // errors==0 (and warnings==0 if asked)
+    IdxCheckReport r; FILE *nul = fopen("/dev/null", "w");
+    int e = idx_db_check(dbpath, NULL, nul, &r); if (nul) fclose(nul);
+    return e == 0 && (!want_warn || r.warnings == 0);
+}
+static int64_t cursor(const char *dbpath) {
+    sqlite3 *db = idx_db_open(dbpath); int64_t h = -9; uint8_t t[32];
+    if (db && !idx_db_load_sync(db, &h, t)) { h = -9; }
+    idx_db_close(db); return h;
+}
+static int fresh_watch_db(const char *dbpath) {
+    rm_db(dbpath); sqlite3 *db = idx_db_open(dbpath); if (!db) return 0;
+    idx_db_watch_add(db, g_wallet); idx_db_close(db); return 1;
+}
+
+static void sec_crash(const char *dir) {
+    printf("\n-- idx-03: SIGKILL mid-write → recovery resumes byte-identically --\n");
+    char ref[600], dbp[600]; snprintf(ref, sizeof ref, "%s/ref.db", dir); snprintf(dbp, sizeof dbp, "%s/crash.db", dir);
+    char *all[NBLK]; for (int i = 0; i < NBLK; i++) all[i] = g_blk[i];
+    if (!fresh_watch_db(ref) || run_files(ref, all, NBLK)) { CHECK(0, "reference fold"); return; }
+    uint8_t dref[32]; state_digest(ref, dref);
+    CHECK(check_clean(ref, 1), "check: clean reference db has 0 errors, 0 warnings");
+    int all_ok = 1, kills = 0, gaps_ok = 1;
+    // (a) crash in the FIRST batch (no projection yet) at every height
+    // (b) crash in a LATER batch (projection at h2) at h3/h4/h5
+    for (int phase = 0; phase < 2; phase++)
+      for (int k = phase ? 3 : 0; k < NBLK; k++) {
+        if (!fresh_watch_db(dbp)) { all_ok = 0; continue; }
+        int base = 0;
+        if (phase) { if (run_files(dbp, all, 3)) { all_ok = 0; continue; } base = 3; }
+        kills += run_files_killed(dbp, all + base, NBLK - base, k);
+        if (cursor(dbp) != k) all_ok = 0;                       // the kill landed after h=k's rows
+        if (!check_clean(dbp, 0)) gaps_ok = 0;                  // crash gap is a warning, never an error
+        int64_t resume = phase ? 3 : 0;                         // = proj_height + 1
+        if (run_files(dbp, all + resume, NBLK - (int)resume)) { all_ok = 0; continue; }
+        uint8_t d[32]; state_digest(dbp, d);
+        if (memcmp(d, dref, 32) || cursor(dbp) != NBLK - 1 || bal_of(dbp) != 0 || !check_clean(dbp, 1)) all_ok = 0;
+      }
+    CHECK(kills == NBLK + 3, "every injected crash was a real SIGKILL (9 kills)");
+    CHECK(gaps_ok, "check: a crashed db reports the gap as a warning, 0 errors");
+    CHECK(all_ok, "after each kill, resume → same digest, cursor 5, balance 0, check clean");
+
+    // (c) recovery drops the dead rows: crash at h4 (spend recorded), then the
+    //     chain reorgs to the alt branch — the stale spend must not survive.
+    if (fresh_watch_db(dbp) && !run_files(dbp, all, 3)) {
+        run_files_killed(dbp, all + 3, 3, 4);
+        sqlite3 *db = idx_db_open(dbp);
+        CHECK(db && balance(db) == 0, "pre-recovery: the h4 spend mark is on disk (autocommitted)");
+        int64_t h = 0; uint8_t tip[32]; static const uint8_t z[32];
+        idx_db_load_sync(db, &h, tip);
+        CHECK(idx_sync_recover(db, -1, z, &h, tip) == 1 && h == 2, "idx_sync_recover rewinds the cursor to proj_height 2");
+        CHECK(table_rows(db, "blocks") == 3 && balance(db) == FUND_VALUE,
+              "recover pruned blocks/utxo marks above 2 (no stale spend from the dead write)");
+        CHECK(idx_sync_recover(db, -1, z, &h, tip) == 0, "recover is a no-op on a consistent db");
+        idx_db_close(db);
+        char *alt[3] = { g_alt[3], g_alt[4], g_alt[5] };
+        CHECK(run_files(dbp, alt, 3) == 0 && bal_of(dbp) == FUND_VALUE && check_clean(dbp, 1),
+              "alt branch after the crash: output unspent, check clean");
+    }
+}
+
+static void sec_reorg(const char *dir) {
+    printf("\n-- idx-03: simulated reorg (h3..h5 replaced) resumes cleanly --\n");
+    char dbp[600], ref[600]; snprintf(dbp, sizeof dbp, "%s/reorg.db", dir); snprintf(ref, sizeof ref, "%s/altref.db", dir);
+    char *all[NBLK]; for (int i = 0; i < NBLK; i++) all[i] = g_blk[i];
+    char *altc[NBLK] = { g_blk[0], g_blk[1], g_blk[2], g_alt[3], g_alt[4], g_alt[5] };
+    if (!fresh_watch_db(ref) || run_files(ref, altc, NBLK)) { CHECK(0, "alt reference fold"); return; }
+    uint8_t dalt[32]; state_digest(ref, dalt);
+    if (!fresh_watch_db(dbp) || run_files(dbp, all, NBLK)) { CHECK(0, "main fold"); return; }
+    CHECK(bal_of(dbp) == 0, "main branch: wallet output spent at h4");
+    // the sync loop's reorg: rollback to the fork, stamp the cursor, connect
+    Fold f; fold_open(&f, dbp);
+    int ok = idx_sync_rollback(&f.s, f.db, f.o, f.activation, 2);
+    uint8_t tip[32]; idx_db_block_get(f.db, 2, tip); idx_db_save_sync(f.db, 2, tip);
+    fold_close(&f);
+    CHECK(ok && check_clean(dbp, 1), "after rollback to the fork (h2): check clean, no orphans");
+    CHECK(run_files(dbp, altc + 3, 3) == 0, "connect the alt branch h3'..h5'");
+    uint8_t d[32]; state_digest(dbp, d);
+    CHECK(memcmp(d, dalt, 32) == 0, "reorged state digest == a fresh fold of the alt chain");
+    CHECK(bal_of(dbp) == FUND_VALUE, "spend disconnected: output unspent on the alt branch");
+    CHECK(check_clean(dbp, 1), "check: reorged db clean");
+    // crash DURING the post-reorg reconnect, then resume
+    fold_open(&f, dbp); idx_sync_rollback(&f.s, f.db, f.o, f.activation, 2);
+    idx_db_block_get(f.db, 2, tip); idx_db_save_sync(f.db, 2, tip); fold_close(&f);
+    CHECK(run_files_killed(dbp, altc + 3, 3, 4), "SIGKILL mid-reconnect at h4'");
+    CHECK(check_clean(dbp, 0), "check: crashed-mid-reorg db has 0 errors");
+    CHECK(run_files(dbp, altc + 3, 3) == 0, "resume reconnect from the projection");
+    state_digest(dbp, d);
+    CHECK(memcmp(d, dalt, 32) == 0 && bal_of(dbp) == FUND_VALUE && check_clean(dbp, 1),
+          "crash-in-reorg resume converges on the alt-chain digest, check clean");
+}
+
+static int exec_sql(const char *dbpath, const char *sql) {
+    sqlite3 *db; if (sqlite3_open(dbpath, &db) != SQLITE_OK) return 0;
+    int ok = sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK; sqlite3_close(db); return ok;
+}
+static void sec_check(const char *dir) {
+    printf("\n-- idx-03: `check` flags each class of damage, and is read-only --\n");
+    char dbp[600]; snprintf(dbp, sizeof dbp, "%s/chk.db", dir);
+    char *all[NBLK]; for (int i = 0; i < NBLK; i++) all[i] = g_blk[i];
+    struct { const char *sql, *what; } cases[] = {
+        { "INSERT INTO blocks(height,hash,time,coinbase,bytes,bits) VALUES(9,zeroblob(32),1,0,0,1)", "orphan block above tip" },
+        { "UPDATE meta SET v='00' || substr(v,3) WHERE k='tip'", "tip hash disagrees with stored block" },
+        { "DELETE FROM blocks WHERE height=3", "gap in blocks below tip" },
+        { "INSERT INTO epochs(name,start_height,owner,owner_type) VALUES('zz',8,NULL,0)", "orphan epoch above tip" },
+        { "UPDATE utxos SET spent_height=9", "utxo spend above tip" },
+        { "UPDATE meta SET v='7' WHERE k='proj_height'", "projection ahead of cursor" },
+        { "INSERT INTO names(name,owner,owner_type,lease_expiry,st,seller,seller_type,price,offer_expiry,buyer,burn_leg,pay_leg,reserve_expiry)"
+          " VALUES('bad',x'00',0,9,0,zeroblob(20),0,0,0,zeroblob(20),0,0,0)", "malformed name row" },
+        { "INSERT INTO raw_blocks(height,raw) VALUES(1,x'00'); DELETE FROM blocks WHERE height=1", "raw block without a blocks row" },
+    };
+    int ncase = (int)(sizeof cases / sizeof cases[0]), caught = 0;
+    for (int i = 0; i < ncase; i++) {
+        if (!fresh_watch_db(dbp) || run_files(dbp, all, NBLK)) continue;
+        exec_sql(dbp, cases[i].sql);
+        IdxCheckReport r; FILE *nul = fopen("/dev/null", "w");
+        int e = idx_db_check(dbp, NULL, nul, &r); if (nul) fclose(nul);
+        if (e > 0) caught++; else printf("     missed: %s\n", cases[i].what);
+    }
+    CHECK(caught == ncase, "check reports an error for all 8 injected damage classes");
+    // read-only: a check never changes the file
+    fresh_watch_db(dbp); run_files(dbp, all, NBLK);
+    { sqlite3 *db = idx_db_open(dbp); sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, NULL, NULL); idx_db_close(db); }
+    uint8_t before[32], after[32];
+    { FILE *f = fopen(dbp, "rb"); uint8_t buf[4096]; size_t n; SHA256_CTX c; sha256_init(&c);
+      while (f && (n = fread(buf, 1, sizeof buf, f)) > 0) { sha256_update(&c, buf, (unsigned)n); }
+      if (f) fclose(f); sha256_final(&c, before); }
+    IdxCheckReport r; FILE *nul = fopen("/dev/null", "w"); idx_db_check(dbp, NULL, nul, &r); if (nul) fclose(nul);
+    { FILE *f = fopen(dbp, "rb"); uint8_t buf[4096]; size_t n; SHA256_CTX c; sha256_init(&c);
+      while (f && (n = fread(buf, 1, sizeof buf, f)) > 0) { sha256_update(&c, buf, (unsigned)n); }
+      if (f) fclose(f); sha256_final(&c, after); }
+    CHECK(memcmp(before, after, 32) == 0 && r.errors == 0, "check is read-only: db bytes unchanged, clean db 0 errors");
+    // corrupted file → integrity_check fails
+    { FILE *f = fopen(dbp, "r+b"); if (f) { fseek(f, 0, SEEK_END); long sz = ftell(f); uint8_t junk[16]; memset(junk, 0xEE, sizeof junk);
+        for (long pg = 1024; pg < sz; pg += 1024) { fseek(f, pg, SEEK_SET); fwrite(junk, 1, sizeof junk, f); } fclose(f); } }
+    nul = fopen("/dev/null", "w"); int e = idx_db_check(dbp, NULL, nul, &r); if (nul) fclose(nul);
+    CHECK(e != 0, "a byte-smashed db fails sqlite integrity_check");
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
+// peer_height from announcements: monotonic in memory and on disk, the meta
+// write rate-limited to one per IDX_PH_WRITE_MIN_S, force flushes, and a
+// every write (handshake or announcement) is a monotonic max at the db.
+static void sec_peer_height(const char *dir) {
+    printf("\n-- peer_height follows announcements --\n");
+    char p[700]; snprintf(p, sizeof p, "%s/ph.db", dir);
+    sqlite3 *db = idx_db_open(p);
+    if (!db) { CHECK(0, "open ph.db"); return; }
+    idx_peer_height_reset();
+    int64_t t = 1000000;
+    CHECK(idx_peer_height_note(db, 100, t, 0) == 100 && idx_db_get_peer_height(db) == 100, "first announcement written at once");
+    CHECK(idx_peer_height_note(db, 150, t + 1, 0) == 150 && idx_db_get_peer_height(db) == 100, "second within the window: memory only (rate-limited)");
+    CHECK(idx_peer_height_note(db, 120, t + 2, 0) == 150, "a lower announcement never lowers the best");
+    CHECK(idx_peer_height_note(db, 151, t + IDX_PH_WRITE_MIN_S - 1, 0) == 151 && idx_db_get_peer_height(db) == 100, "still inside the window: no write");
+    idx_peer_height_note(db, 0, t + IDX_PH_WRITE_MIN_S, 0);
+    CHECK(idx_db_get_peer_height(db) == 151, "window elapsed: best written");
+    idx_peer_height_note(db, 160, t + IDX_PH_WRITE_MIN_S + 1, 1);
+    CHECK(idx_db_get_peer_height(db) == 160, "force flushes inside the window");
+    int writes = 0; int64_t last = idx_db_get_peer_height(db);
+    for (int i = 0; i < 1000; i++) {           // a block every second for ~16 min
+        idx_peer_height_note(db, 161 + i, t + 200 + i, 0);
+        int64_t now = idx_db_get_peer_height(db); if (now != last) { writes++; last = now; }
+    }
+    CHECK(writes <= 1000 / IDX_PH_WRITE_MIN_S + 1 && writes >= 1000 / IDX_PH_WRITE_MIN_S - 1, "1000 announcements → ~1 write per window");
+    idx_db_set_peer_height(db, 5000);
+    idx_db_raise_peer_height(db, 4000);
+    CHECK(idx_db_get_peer_height(db) == 5000, "raise never lowers the stored value");
+    // restart: in-memory state wiped, then a lower handshake claim — stored stays
+    idx_db_set_peer_height(db, 900);
+    CHECK(idx_db_get_peer_height(db) == 5000, "set itself is monotonic (900 cannot replace 5000)");
+    idx_peer_height_reset();                                 // process restart
+    idx_db_set_peer_height(db, 500);                         // first handshake after restart
+    CHECK(idx_db_get_peer_height(db) == 5000, "restart: handshake 500 cannot lower stored 5000");
+    // also the exact scenario: preset 900, restart, handshake 500 → stay 900
+    { char q[700]; snprintf(q, sizeof q, "%s/ph2.db", dir);
+      sqlite3 *d2 = idx_db_open(q); idx_db_set_peer_height(d2, 900);
+      CHECK(idx_db_get_peer_height(d2) == 900, "preset 900");
+      idx_peer_height_reset();
+      idx_db_set_peer_height(d2, 500);
+      CHECK(idx_db_get_peer_height(d2) == 900, "restart: preset 900, handshake 500 → stays 900");
+      idx_db_close(d2); unlink(q); }
+    // load seeds g_ph_disk from DB: after reset+load, note(500) must keep memory+DB at 900
+    { char q[256]; snprintf(q, sizeof q, "%s/ph_load.db", dir); unlink(q);
+      sqlite3 *d2 = idx_db_open(q); idx_db_set_peer_height(d2, 900);
+      CHECK(idx_db_get_peer_height(d2) == 900, "load-seed: preset 900");
+      idx_peer_height_reset();
+      idx_peer_height_load(d2);
+      CHECK(idx_peer_height_note(d2, 500, 1000, 1) == 900, "load-seed: note 500 keeps in-memory best at 900");
+      CHECK(idx_db_get_peer_height(d2) == 900, "load-seed: DB stays 900");
+      idx_db_close(d2); unlink(q); }
+    idx_db_close(db); idx_peer_height_reset();
+    unlink(p);
+}
+
 int main(void) {
     char dir[] = "/tmp/idx_test_sync_XXXXXX";
     if (!mkdtemp(dir)) { fprintf(stderr, "mkdtemp failed\n"); return 1; }
     printf("temp chain dir: %s\n", dir);
 
+    sec_magic();
     make_chain_files(dir);
     CHECK(1, "built a 6-block synthetic chain (carrier funding at h2, non-carrier spend at h4)");
 
     sec_seam(dir);
     sec_bounds(dir);
     sec_rewalk(dir);
+    make_alt_files(dir);
+    sec_crash(dir);
+    sec_reorg(dir);
+    sec_check(dir);
+    sec_peer_height(dir);
+    for (int i = 3; i < NBLK; i++) unlink(g_alt[i]);
 
     // teardown
     for (int i = 0; i < NBLK; i++) unlink(g_blk[i]);
-    { const char *left[] = { "seam.db", "bounds.db", "rewalk.db", "serve-pep.db", "serve-doge.db" };
+    { const char *left[] = { "seam.db", "bounds.db", "rewalk.db", "ref.db", "crash.db", "reorg.db", "altref.db", "chk.db", "serve-pep.db", "serve-doge.db" };
       for (unsigned i = 0; i < sizeof left / sizeof left[0]; i++) {
           char pth[700]; snprintf(pth, sizeof pth, "%s/%s", dir, left[i]); rm_db(pth);
       } }

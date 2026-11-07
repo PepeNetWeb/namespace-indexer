@@ -79,10 +79,15 @@ static int usage(const char *p) {
       "  serve  <coin> <db> [port] [host:port,...]  run as a pepenet chain peer (serve headers/blocks, gossip)\n"
       "  resolve <db> <name>      print the current owner (hash160) of a name\n"
       "  owned  <db> <hash160hex> list names owned by an address\n"
-      "  digest <db>              print height, live §3.4 rate, and the state digest\n"
-      "  refold <db>              rebuild the fold from local blocks under current rules\n"
+      "  digest <db> [--coin C]   print height, live §3.4 rate, and the state digest\n"
+      "  refold <db> [--coin C] [--force]  rebuild the fold from local blocks under current rules\n"
+      "                           (refuses if referenced heights are missing from raw_blocks)\n"
       "  watch  <db> <addr|h160>  register a wallet address for UTXO tracking (before funding!)\n"
-      "  index  <blockfile>       fold a raw block file (hex or binary) — offline\n",
+      "  index  <blockfile>       fold a raw block file (hex or binary) — offline\n"
+      "  check  <db> [serve-db]   read-only integrity/consistency check (exit 1 on errors)\n"
+      "  snapshot-export <coin> <db> <outdir>         offline: state.db copy + MANIFEST (digest/ECMH at H)\n"
+      "  snapshot-verify <coin> <snapdir> [headers] (--sha256 <hex> | --allow-unpinned)   pin gate (no pin = refuse), then recheck digests + header PoW\n"
+      "  snapshot-import <coin> <snapdir> <db> [--sha256 <hex>]   apply a PINNED snapshot as a fresh db (fail closed)\n",
       p);
     return 2;
 }
@@ -96,7 +101,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "sync") || !strcmp(cmd, "resolve") || !strcmp(cmd, "owned") ||
         !strcmp(cmd, "digest") || !strcmp(cmd, "index") ||
         !strcmp(cmd, "watch") || !strcmp(cmd, "refold") || !strcmp(cmd, "crawl") ||
-        !strcmp(cmd, "serve") || !strcmp(cmd, "weigh"))
+        !strcmp(cmd, "serve") || !strcmp(cmd, "weigh") ||
+        !strcmp(cmd, "snapshot-export") || !strcmp(cmd, "snapshot-verify") || !strcmp(cmd, "snapshot-import") ||
+        !strcmp(cmd, "check"))
         return indexer_main(argc, argv);
     return usage(argv[0]);
 }

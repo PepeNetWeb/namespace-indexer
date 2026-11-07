@@ -117,6 +117,34 @@ After a consensus re-pin, `indexerd refold <db>` rebuilds the fold state from
 local data (oracle re-warmed from `blocks`, state replayed from the stored raw
 carrier blocks) under the current engine rules — no network round trip.
 
+### Integrity check & crash recovery (idx-03)
+
+```sh
+# Read-only consistency check (opens the db SQLITE_OPEN_READONLY; never writes).
+# Exit 0 = no errors (warnings allowed), 1 = errors found.
+./indexerd check pepe.db [serve-pep.db]
+```
+
+Checks: `PRAGMA integrity_check`; schema; meta tip height/hash vs the stored
+`blocks` row; block contiguity / hash uniqueness; orphaned rows (blocks,
+raw_blocks, epochs, utxos, utxo spends above the tip; raw_blocks without a
+block; commits/muts above `proj_height`; utxos of unwatched addresses);
+`proj_height` vs the cursor; name blob sizes / state ranges / RESERVED legs;
+lease and offer expiry vs MTP (when 11 block times are stored); epoch owner vs
+projected owner (warning); and, given a serve db, header hash = sha256d(hdr),
+prev-links, no headers above the tip, agreement with the fold's blocks.
+A cursor ahead of `proj_height` (a crash gap) is a warning: it is repaired on
+the next start.
+
+Recovery: on start, `sync` and `index` call `idx_sync_recover`. If the block
+cursor is ahead of the projection (killed mid-batch) — or the projection is
+empty (killed before the first batch commit) — the cursor rewinds to the
+projection and every height-keyed row above it (blocks, raw_blocks, epochs,
+utxos + spend marks, oracle, serve headers) is pruned, then the gap is
+re-folded. Tests (`test_sync`) SIGKILL the indexer at every height via the
+test-only `IDX_TEST_CRASH_AT=<h>` env var and check that resume equals a clean
+fold, including across a simulated reorg.
+
 ## Status
 
 Fully working against Pepecoin mainnet: offline `index` + queries + projection;

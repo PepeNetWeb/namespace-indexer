@@ -23,12 +23,17 @@ void idx_db_save_sync(sqlite3 *db, int64_t height, const uint8_t tip_hash[32]);
 int  idx_db_load_sync(sqlite3 *db, int64_t *height, uint8_t tip_hash[32]);   // 1 if present
 // last observed peer start_height from a version handshake — the fail-closed
 // error page (and anything else in another process) reads this; 0 if never seen
-void    idx_db_set_peer_height(sqlite3 *db, int64_t h);
+void    idx_db_set_peer_height(sqlite3 *db, int64_t h);   // monotonic max (same as raise)
+void    idx_db_raise_peer_height(sqlite3 *db, int64_t h);   // monotonic max
 int64_t idx_db_get_peer_height(sqlite3 *db);
 void idx_db_set_activation(sqlite3 *db, int64_t activation);
 int64_t idx_db_get_activation(sqlite3 *db, int64_t dflt);
 void    idx_db_set_subsidy(sqlite3 *db, int64_t subsidy_koinu);
 int64_t idx_db_get_subsidy(sqlite3 *db, int64_t dflt);
+// name-carrier magic (two bytes). Missing key → 0, so an old pep.db stays pep
+// via the caller's default. An extra meta row is not part of the name digest.
+void idx_db_set_onchain_magic(sqlite3 *db, const uint8_t mag[2]);
+int  idx_db_get_onchain_magic(sqlite3 *db, uint8_t mag[2]);   // 1 if present
 // one-shot meta markers (migrations/repairs that must run once per db)
 int  idx_db_flag_get(sqlite3 *db, const char *k);
 void idx_db_flag_set(sqlite3 *db, const char *k);
@@ -121,6 +126,22 @@ int64_t idx_db_projected_height(sqlite3 *db);   // height the last projection re
 // fresh sm_new(activation); fields are loaded verbatim. Returns rows loaded.
 int  idx_db_load_state(sqlite3 *db, SmState *s);
 
+// Rollback checkpoints — local replay shortcut, never digested or sent. A row is
+// the projected fold state at a height; idx_db_project takes one every
+// idx_db_ckpt_every() heights (meta rb_ckpt_every; 0 = off) and keeps the last 4.
+// ckpt_load restores the newest valid row <= max_height whose activation matches
+// s->activation_height into *s (a fresh sm_new); it returns that height, or -1.
+int64_t idx_db_ckpt_every(sqlite3 *db);
+void    idx_db_ckpt_set_every(sqlite3 *db, int64_t every);
+int     idx_db_ckpt_save(sqlite3 *db, SmState *s);
+int64_t idx_db_ckpt_load(sqlite3 *db, int64_t max_height, SmState *s);
+int     idx_db_ckpt_prune_above(sqlite3 *db, int64_t height);
+int     idx_db_ckpt_wipe(sqlite3 *db);
+int     idx_db_ckpt_count(sqlite3 *db);
+// Empty table + loaded projection >= activation+every: take one now (1), else 0; -1 error.
+int     idx_db_ckpt_seed(sqlite3 *db, SmState *s);
+extern size_t idx_ckpt_max_bytes;   // state blob cap (tests may lower it)
+
 // ── epochs projection (ownership history — substrate for overlay layers) ─
 // An append-only per-block record of every ownership CHANGE: (name, start_height,
 // owner) rows, owner NULL = the name lapsed/left the state at that height. Written
@@ -159,6 +180,9 @@ int  idx_db_utxos(sqlite3 *db, const uint8_t h160[20],
 
 // ── queries (display) ─────────────────────────────────────────────────────────
 // owner hash160 hex of `name` (any state), "" if unowned. 1 if found.
+// read-only open for display readers (no schema/migration writes); NULL if the
+// file is missing or has no names table yet.
+sqlite3 *idx_db_open_ro(const char *path);
 int  idx_db_resolve(sqlite3 *db, const char *name, char owner_hex[41], char *state_out);
 // full projected name record, market fields included — the wallet's market data
 // source (price/seller/legs read from the fold's own view, never hand-typed).
@@ -172,6 +196,13 @@ int  idx_db_name_row(sqlite3 *db, const char *name, IdxNameRow *out);           
 // names owned by hash160-hex `h160hex`; callback per row. Returns count.
 int  idx_db_owned(sqlite3 *db, const char *h160hex,
                   void (*cb)(void *u, const char *name, int64_t lease_expiry, int st), void *u);
+// dane-09: page of names in BINARY name order, optionally restricted to a
+// prefix (the range [prefix, prefix+1) so the name PRIMARY KEY index serves both
+// the count and the page — no table scan). owner is NULL for an unowned row.
+// Returns the total rows matching the prefix, or -1 on error.
+int64_t idx_db_names(sqlite3 *db, const char *prefix, int64_t offset, int limit,
+                     void (*cb)(void *u, const char *name, const uint8_t *owner,
+                                int64_t lease_expiry, int st, uint64_t price), void *u);
 
 #ifdef __cplusplus
 }

@@ -117,13 +117,16 @@ static int decode_action(const uint8_t *b, size_t blen, uint8_t op, SmAction *a)
     }
 }
 
-void sm_decode_payload(const uint8_t *payload, size_t len, uint64_t value, SmCarrier *car) {
+void sm_decode_payload(const uint8_t *payload, size_t len, uint64_t value,
+                       const uint8_t magic[2], SmCarrier *car) {
     (void)value;
     memset(&car->act, 0, sizeof car->act);
     car->kind = SM_CAR_IGNORE;
+    if (!magic) return;
 
-    // §1 action recognition: prefix 0xFF 'P' 'N' + opcode 0x01..0x0F.
-    if (len >= 4 && payload[0] == 0xFF && payload[1] == 0x50 && payload[2] == 0x4E) {
+    // §1 action recognition: prefix 0xFF ‖ magic ‖ opcode 0x01..0x0F.
+    // Any other magic (the other chain, or unset 0,0) is IGNORE, like unknown data.
+    if (len >= 4 && payload[0] == 0xFF && payload[1] == magic[0] && payload[2] == magic[1]) {
         uint8_t op = payload[3];
         if (op >= SM_OP_MIN && op <= SM_OP_MAX &&
             decode_action(payload + 4, len - 4, op, &car->act))
@@ -131,13 +134,14 @@ void sm_decode_payload(const uint8_t *payload, size_t len, uint64_t value, SmCar
         // else IGNORE (malformed / unknown opcode / overlay band)
         return;
     }
-    // everything else (UTF-8 noise, overlay, empty) → IGNORE
+    // everything else (other chain, UTF-8 noise, overlay, empty) → IGNORE
     car->kind = SM_CAR_IGNORE;
 }
 
 // ── canonical action encoder (inverse of decode_action; grammar-aware fuzz) ──
-size_t sm_encode_action(const SmAction *a, uint8_t out[SM_CARRIER_MAX]) {
-    out[0] = 0xFF; out[1] = 0x50; out[2] = 0x4E; out[3] = a->op;
+size_t sm_encode_action(const SmAction *a, const uint8_t magic[2], uint8_t out[SM_CARRIER_MAX]) {
+    if (!a || !magic || !out) return 0;
+    out[0] = 0xFF; out[1] = magic[0]; out[2] = magic[1]; out[3] = a->op;
     uint8_t *b = out + 4;
     switch (a->op) {
     case SM_OP_COMMIT:

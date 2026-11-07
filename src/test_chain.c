@@ -114,6 +114,46 @@ static int build_block(const uint8_t *tx, int txlen, uint32_t time, uint8_t *out
 
 struct foldctx { SmState *s; };
 static void fold_cb(void *u, const IdxTx *tx, uint32_t txindex) { idx_adapt_tx(((struct foldctx *)u)->s, tx, txindex); }
+static const uint8_t CHAIN_PN[2] = { 0x50, 0x4E };
+static const uint8_t CHAIN_DN[2] = { 0x44, 0x4E };
+static void bind_mag(SmState *s, const uint8_t mag[2]) { memcpy(s->onchain_magic, mag, 2); }
+
+/* Fold the alice commit→claim under `state_mag`, reading payloads prefixed
+ * with `pay_mag`. Returns 1 and writes the digest + owns flag. */
+static int fold_mint(const uint8_t state_mag[2], const uint8_t pay_mag[2],
+                     const uint8_t priv[32], const uint8_t pub[33], const uint8_t h160[20],
+                     uint8_t digest[32], int *owns) {
+    SmState *s = sm_new(2);
+    bind_mag(s, state_mag);
+    struct foldctx fc = { s };
+    const char *name = "alice"; int nlen = 5;
+    uint8_t salt[32]; memset(salt, 0x07, 32);
+    uint8_t cm_in[60]; int ci = 0;
+    memcpy(cm_in + ci, salt, 32); ci += 32;
+    memcpy(cm_in + ci, name, (size_t)nlen); ci += nlen;
+    memcpy(cm_in + ci, h160, 20); ci += 20;
+    uint8_t commitment[32]; sha256_1(cm_in, (size_t)ci, commitment);
+    uint8_t commit[36]; commit[0] = 0xFF; commit[1] = pay_mag[0]; commit[2] = pay_mag[1]; commit[3] = SM_OP_COMMIT;
+    memcpy(commit + 4, commitment, 32);
+    uint8_t prev[32]; memset(prev, 0x11, 32);
+    uint8_t txc[1024]; int txcl = 0;
+    if (!build_tx(priv, pub, h160, commit, 36, 0, NULL, 0, prev, 1, txc, &txcl)) { sm_free(s); return 0; }
+    uint8_t blk2[2048]; int blk2l = 0; build_block(txc, txcl, 1000, blk2, &blk2l);
+    IdxBlockMeta m; sm_begin_block(s, 2, 1000, 1);
+    if (!idx_parse_block(blk2, (size_t)blk2l, &m, fold_cb, &fc)) { sm_free(s); return 0; }
+    uint8_t claim[41]; claim[0] = 0xFF; claim[1] = pay_mag[0]; claim[2] = pay_mag[1]; claim[3] = SM_OP_CLAIM;
+    memcpy(claim + 4, salt, 32); memcpy(claim + 36, name, (size_t)nlen);
+    uint8_t prev2[32]; memset(prev2, 0x33, 32);
+    uint8_t txk[1024]; int txkl = 0;
+    if (!build_tx(priv, pub, h160, claim, 36 + nlen, 1, NULL, 0, prev2, 0, txk, &txkl)) { sm_free(s); return 0; }
+    uint8_t blk3[2048]; int blk3l = 0; build_block(txk, txkl, 2000, blk3, &blk3l);
+    sm_begin_block(s, 3, 2000, 1);
+    if (!idx_parse_block(blk3, (size_t)blk3l, &m, fold_cb, &fc)) { sm_free(s); return 0; }
+    sm_state_digest(s, digest);
+    *owns = sm_owns(s, h160, "alice");
+    sm_free(s);
+    return 1;
+}
 
 int chain_selftest(void) {
     int fail = 0;
@@ -136,6 +176,7 @@ int chain_selftest(void) {
 
     // ── commit→claim mints a name end-to-end ─────────────────────────────────
     SmState *s = sm_new(2);                                // ACTIVATION_HEIGHT = 2
+    bind_mag(s, CHAIN_PN);
     struct foldctx fc = { s };
     const char *name = "alice"; int nlen = 5;
     uint8_t salt[32]; memset(salt, 0x07, 32);
@@ -167,6 +208,7 @@ int chain_selftest(void) {
     CK(db != NULL, "open in-memory projection db");
     idx_db_project(db, s);
     SmState *s2 = sm_new(2);
+    bind_mag(s2, CHAIN_PN);
     idx_db_load_state(db, s2);
     uint8_t d_after[32]; sm_state_digest(s2, d_after);
     CK(memcmp(d_before, d_after, 32) == 0, "projection is lossless (digest survives save→load)");
@@ -182,6 +224,7 @@ int chain_selftest(void) {
         sqlite3 *rdb = idx_db_open(":memory:");
         OracleFeed *of = oracle_new();
         SmState *rs = sm_new(2);
+        bind_mag(rs, CHAIN_PN);
         struct foldctx rfc = { rs };
         uint8_t d2[32], d3[32], dg[32];
         const uint8_t *blks[2] = { blk2, blk3 }; const int blens[2] = { blk2l, blk3l };
@@ -219,6 +262,7 @@ int chain_selftest(void) {
     {
         sqlite3 *edb = idx_db_open(":memory:");
         SmState *es = sm_new(2);
+        bind_mag(es, CHAIN_PN);
         struct foldctx efc = { es };
         idx_db_epochs_mark(edb, 0);                       // complete-history db
         IdxBlockMeta mm;
@@ -260,6 +304,22 @@ int chain_selftest(void) {
         CK(idx_db_owner_at(edb, "alice", 5, 10, o, &ot) == 1 && memcmp(o, h160, 20) == 0,
            "epochs: reorg prune reverts to the pre-fork owner");
         idx_db_close(edb); sm_free(es);
+    }
+
+    // DN twin of the alice mint, plus cross-magic reject. The fold digest must
+    // match the PN mint; the other chain's payload must not mint the name.
+    {
+        uint8_t d_pn[32], d_dn[32], d_x[32];
+        int own_pn = 0, own_dn = 0, own_x = 0;
+        CK(fold_mint(CHAIN_PN, CHAIN_PN, priv, pub, h160, d_pn, &own_pn) && own_pn,
+           "PN profile mints alice");
+        CK(fold_mint(CHAIN_DN, CHAIN_DN, priv, pub, h160, d_dn, &own_dn) && own_dn,
+           "DN profile mints alice");
+        CK(memcmp(d_pn, d_dn, 32) == 0, "DN mint digest equals the PN mint");
+        CK(fold_mint(CHAIN_PN, CHAIN_DN, priv, pub, h160, d_x, &own_x) && !own_x,
+           "DN payload under the PN profile is ignored");
+        CK(fold_mint(CHAIN_DN, CHAIN_PN, priv, pub, h160, d_x, &own_x) && !own_x,
+           "PN payload under the DN profile is ignored");
     }
 
     printf(fail ? "\nchain selftest: %d FAILED\n" : "\nchain selftest: all passed\n", fail);
@@ -381,7 +441,10 @@ int mempool_selftest(void) {
 // COMMIT, block 1 = CLAIM) into `dir`, for an end-to-end `index` CLI test
 // (run with activation_height 0). Returns 0 on success.
 static int write_file(const char *path, const uint8_t *b, int n) { FILE *f = fopen(path, "wb"); if (!f) return 1; fwrite(b, 1, (size_t)n, f); fclose(f); return 0; }
-int chain_mkblocks(const char *dir) {
+// idx-10: same fixture, carrier prefix selectable (PN default, DN for doge tests)
+int chain_mkblocks_mag(const char *dir, const uint8_t mag[2]);
+int chain_mkblocks(const char *dir) { return chain_mkblocks_mag(dir, CHAIN_PN); }
+int chain_mkblocks_mag(const char *dir, const uint8_t mag[2]) {
     uint8_t priv[32]; for (int i = 0; i < 32; i++) priv[i] = (uint8_t)(i + 1);
     uint8_t pub[33]; if (!secp_pubkey(priv, pub)) return 1;
     uint8_t h160[20]; hash160(pub, 33, h160);
@@ -391,11 +454,11 @@ int chain_mkblocks(const char *dir) {
     uint8_t commitment[32]; sha256_1(cm_in, ci, commitment);
     uint8_t prev[32]; memset(prev, 0x11, 32);
 
-    uint8_t commit[40]; int cl = 0; uint8_t cpre[4] = { 0xFF, 0x50, 0x4E, SM_OP_COMMIT }; memcpy(commit, cpre, 4); cl = 4; memcpy(commit + cl, commitment, 32); cl += 32;
+    uint8_t commit[40]; int cl = 0; uint8_t cpre[4] = { 0xFF, mag[0], mag[1], SM_OP_COMMIT }; memcpy(commit, cpre, 4); cl = 4; memcpy(commit + cl, commitment, 32); cl += 32;
     uint8_t txc[1024]; int txcl; build_tx(priv, pub, h160, commit, cl, 0, NULL, 0, prev, 1, txc, &txcl);
     uint8_t blk0[2048]; int blk0l; build_block(txc, txcl, 1000, blk0, &blk0l);
 
-    uint8_t claim[80]; int kl = 0; uint8_t kpre[4] = { 0xFF, 0x50, 0x4E, SM_OP_CLAIM }; memcpy(claim, kpre, 4); kl = 4; memcpy(claim + kl, salt, 32); kl += 32; memcpy(claim + kl, name, nlen); kl += nlen;
+    uint8_t claim[80]; int kl = 0; uint8_t kpre[4] = { 0xFF, mag[0], mag[1], SM_OP_CLAIM }; memcpy(claim, kpre, 4); kl = 4; memcpy(claim + kl, salt, 32); kl += 32; memcpy(claim + kl, name, nlen); kl += nlen;
     uint8_t prev2[32]; memset(prev2, 0x33, 32);
     uint8_t txk[1024]; int txkl; build_tx(priv, pub, h160, claim, kl, 1, NULL, 0, prev2, 0, txk, &txkl);
     uint8_t blk1[2048]; int blk1l; build_block(txk, txkl, 2000, blk1, &blk1l);
@@ -404,5 +467,97 @@ int chain_mkblocks(const char *dir) {
     if (write_file(p0, blk0, blk0l) || write_file(p1, blk1, blk1l)) return 1;
     printf("wrote %s and %s (signer hash160=", p0, p1);
     for (int i = 0; i < 20; i++) printf("%02x", h160[i]); printf(")\n");
+    return 0;
+}
+
+// idx-12: expiry/lapse fixture. Writes e00.bin..e47.bin (heights 0..47):
+//   carriers: 0 commit alice, 1 claim alice, 6 commit bob, 21 commit carol
+//   (bob/carol never claimed); every other block carries a plain OP_RETURN that
+//   is NOT a carrier. Times step so alice's lease lapses and both commits pass
+//   COMMIT_EXPIRY on NON-carrier blocks — exactly what a carrier-only replay
+//   used to get wrong (pruning/lapse at the next carrier, or never).
+// idx-13: same fixture as a branch: blocks at heights > fork differ (filler tag,
+// time +7 s) from branch 'e'; files <pfx>NN.bin. times[48] gets the block times.
+int chain_mkblocks_expiry_br(const char *dir, const uint8_t mag[2], char pfx, int fork, int64_t *times);
+int chain_mkblocks_expiry(const char *dir, const uint8_t mag[2]) { return chain_mkblocks_expiry_br(dir, mag, 'e', 99, NULL); }
+int chain_mkblocks_expiry_br(const char *dir, const uint8_t mag[2], char pfx, int fork, int64_t *times) {
+    uint8_t priv[32]; for (int i = 0; i < 32; i++) priv[i] = (uint8_t)(i + 1);
+    uint8_t pub[33]; if (!secp_pubkey(priv, pub)) return 1;
+    uint8_t h160[20]; hash160(pub, 33, h160);
+    uint8_t salt[32]; memset(salt, 0x07, 32);
+    uint32_t t = 1000;
+    for (int h = 0; h < 48; h++) {
+        uint8_t act[80]; int al = 0;
+        const char *cname = h == 0 ? "alice" : h == 6 ? "bob" : h == 21 ? "carol" : NULL;
+        if (cname) {
+            int nl = (int)strlen(cname);
+            uint8_t ci[60]; memcpy(ci, salt, 32); memcpy(ci + 32, cname, (size_t)nl); memcpy(ci + 32 + nl, h160, 20);
+            uint8_t cm[32]; sha256_1(ci, (size_t)(52 + nl), cm);
+            uint8_t pre[4] = { 0xFF, mag[0], mag[1], SM_OP_COMMIT }; memcpy(act, pre, 4); memcpy(act + 4, cm, 32); al = 36;
+        } else if (h == 1) {
+            uint8_t pre[4] = { 0xFF, mag[0], mag[1], SM_OP_CLAIM }; memcpy(act, pre, 4); memcpy(act + 4, salt, 32);
+            memcpy(act + 36, "alice", 5); al = 41;
+        } else {
+            memcpy(act, "idx12-filler", 12); act[12] = (uint8_t)h; al = 13;   // not a carrier prefix
+            if (h > fork) { act[13] = (uint8_t)pfx; al = 14; }               // the other branch
+        }
+        uint8_t prev[32]; memset(prev, 0x40 + h, 32);
+        uint8_t tx[1024]; int txl; if (!build_tx(priv, pub, h160, act, al, h == 1 ? 1 : 0, NULL, 0, prev, 0, tx, &txl)) return 1;
+        uint32_t bt = t + (h > fork ? 7u : 0u);
+        if (times) times[h] = bt;
+        uint8_t blk[2048]; int bl; build_block(tx, txl, bt, blk, &bl);
+        char pth[1024]; snprintf(pth, sizeof pth, "%s/%c%02d.bin", dir, pfx, h);
+        if (write_file(pth, blk, bl)) return 1;
+        t += h < 6 ? 1000 : h < 25 ? 4000 : 3500000;   // tail: ~40 d steps > SM_MAX_LEASE overall
+    }
+    return 0;
+}
+
+// rollback-txn fixture: heights 0..RB_NBLK-1, files <dir>/<pfx>NN.bin.
+//   0 commit alice · 1 claim alice · 4 commit bob · 5 claim bob ·
+//   12 TRANSFER_NAME alice→T · 22 TRANSFER_NAME bob→T · every other block a
+//   non-carrier filler. Heights > fork form a branch: kind 0 = fillers only
+//   (claims/transfers above the fork REMOVED), kind 1 = same actions but the
+//   transfers go to T' (CHANGED), kind 2 = same actions (only times/fillers differ).
+int chain_mkblocks_rb(const char *dir, char pfx, int fork, int kind, int nblk) {
+    uint8_t priv[32]; for (int i = 0; i < 32; i++) priv[i] = (uint8_t)(i + 1);
+    uint8_t pub[33]; if (!secp_pubkey(priv, pub)) return 1;
+    uint8_t h160[20]; hash160(pub, 33, h160);
+    uint8_t salt[32]; memset(salt, 0x07, 32);
+    const uint8_t *mag = CHAIN_PN;
+    uint32_t t = 1000;
+    for (int h = 0; h < nblk; h++) {
+        int br = h > fork;
+        uint8_t act[80]; int al = 0;
+        const char *cname = h == 0 ? "alice" : h == 4 ? "bob" : NULL;
+        const char *kname = h == 1 ? "alice" : h == 5 ? "bob" : NULL;
+        const char *xname = h == 12 ? "alice" : h == 22 ? "bob" : NULL;
+        if (br && kind == 0) cname = kname = xname = NULL;
+        if (cname) {
+            int nl = (int)strlen(cname);
+            uint8_t ci[60]; memcpy(ci, salt, 32); memcpy(ci + 32, cname, (size_t)nl); memcpy(ci + 32 + nl, h160, 20);
+            uint8_t cm[32]; sha256_1(ci, (size_t)(52 + nl), cm);
+            uint8_t pre[4] = { 0xFF, mag[0], mag[1], SM_OP_COMMIT }; memcpy(act, pre, 4); memcpy(act + 4, cm, 32); al = 36;
+        } else if (kname) {
+            int nl = (int)strlen(kname);
+            uint8_t pre[4] = { 0xFF, mag[0], mag[1], SM_OP_CLAIM }; memcpy(act, pre, 4); memcpy(act + 4, salt, 32);
+            memcpy(act + 36, kname, (size_t)nl); al = 36 + nl;
+        } else if (xname) {
+            int nl = (int)strlen(xname);
+            uint8_t pre[4] = { 0xFF, mag[0], mag[1], SM_OP_TRANSFER_NAME }; memcpy(act, pre, 4);
+            memset(act + 4, (br && kind == 1) ? 0x6B : 0x5A, 20);
+            memcpy(act + 24, xname, (size_t)nl); al = 24 + nl;
+        } else {
+            memcpy(act, "rbtxn-filler", 12); act[12] = (uint8_t)h; al = 13;
+            if (br) { act[13] = (uint8_t)pfx; al = 14; }
+        }
+        uint8_t prev[32]; memset(prev, 0x40 + h, 32); prev[0] = br ? (uint8_t)pfx : 0;
+        uint8_t tx[1024]; int txl;
+        if (!build_tx(priv, pub, h160, act, al, kname ? 1 : 0, NULL, 0, prev, 0, tx, &txl)) return 1;
+        uint8_t blk[2048]; int bl; build_block(tx, txl, t + (br ? 7u : 0u), blk, &bl);
+        char pth[1024]; snprintf(pth, sizeof pth, "%s/%c%02d.bin", dir, pfx, h);
+        if (write_file(pth, blk, bl)) return 1;
+        t += 600;
+    }
     return 0;
 }

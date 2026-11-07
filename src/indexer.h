@@ -35,6 +35,23 @@ extern "C" {
 // index). Defined in sync.c. Returns a process exit code.
 int indexer_main(int argc, char **argv);
 
+// idx-03 crash recovery (sync.c): rewind a cursor that is ahead of the committed
+// projection and drop every height-keyed row above it. 1 = rewound.
+// idx-04: apply a snapshot dir as a FRESH db only if state.db's whole-file
+// SHA-256 equals the pin (flag_pin, else the compiled per-chain default —
+// snapshot.h IDX_SNAPSHOT_PIN_*). 1 = applied; 0 = refused (why filled; nothing
+// written at dbpath) — the caller falls back to a normal full sync.
+int  idx_snapshot_import(const char *coin, const char *snapdir, const char *dbpath,
+                         const char *flag_pin, char *why, size_t cap);
+int  idx_sync_recover(sqlite3 *db, int64_t start, const uint8_t start_hash[32],
+                      int64_t *height, uint8_t tip[32]);
+// test-only: IDX_TEST_CRASH_AT=<h> → _exit(137) after block h's rows, pre-projection
+void idx_test_crash_point(int64_t height);
+
+// Active coin's name-carrier prefix (the two bytes after 0xFF). 1 if `name`
+// is a known coin. Testnet and regtest return the pep prefix.
+int idx_coin_onchain_magic(const char *name, uint8_t out[2]);
+
 // Cooperative stop for an embedding host (the desktop client runs `sync` on a
 // background thread). Set to 1 to make a running sync wind down at the next
 // recv boundary (≤ one recv timeout); the host clears it before the next pass.
@@ -47,6 +64,16 @@ extern volatile int idx_sync_stop;
 // signal — a caught-up getblocks is answered with silence — so embedding
 // hosts use it to render truthful sync state. The headless CLI just logs it.
 extern volatile int64_t idx_sync_peer_height;
+// peer_height follows block announcements (inv / headers / pushed blocks we
+// can place on our chain, and blocks folded from the sync peer), not only the
+// handshake's start_height. Monotonic; the meta write is rate-limited to one
+// per IDX_PH_WRITE_MIN_S (force = flush now, e.g. at pass end). Returns the
+// best height noted so far. db may be NULL (memory only).
+#define IDX_PH_WRITE_MIN_S 60
+struct sqlite3;
+void    idx_peer_height_load(struct sqlite3 *db);   /* seed g_ph_* from meta on db open */
+int64_t idx_peer_height_note(struct sqlite3 *db, int64_t h, int64_t now, int force);
+void    idx_peer_height_reset(void);   /* tests */
 
 // The user-agent (subver) sent in our version message. A "/pepenet-…/" prefix
 // is the mesh's discovery mark (peer-discovery design): crawlers classify a
@@ -169,6 +196,13 @@ void serve_conn_misbehave(void *peer, int n, const char *why);
 // non-NULL — carry carrier gossip as
 // dn* commands over every pepenet connection. Blocks until *stop; run on a
 // thread. Returns 0, -1 on bind failure.
+// Outcome of idx_serve's chain-port bind, for local status reporting only
+// (never on the wire). PENDING until idx_serve reaches the bind; OFF when
+// started with port 0 (dial-only by choice); FAILED = bind/listen refused and
+// the node degraded to dial-only (err = errno, or WSAGetLastError on Windows).
+enum { IDX_LISTEN_PENDING = 0, IDX_LISTEN_OK = 1, IDX_LISTEN_FAILED = 2,
+       IDX_LISTEN_OFF = 3 };
+void idx_serve_listen_status(int *state, int *port, int *err);
 int idx_serve(const char *coin, const char *dbpath, uint16_t port,
               const char *dial_peers, volatile int *stop, const IdxMeshHooks *mesh);
 

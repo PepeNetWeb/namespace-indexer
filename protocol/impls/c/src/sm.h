@@ -218,6 +218,9 @@ typedef struct {
     SmClaimWin *claimsc; int n_claimsc, cap_claimsc;   // per-block scratch (not digested)
 
     int64_t ev[16];                 // coverage event counters (NOT digested — see SM_EV_*)
+    uint8_t onchain_magic[2];       // name-carrier prefix after 0xFF; not digested.
+                                    // 0,0 accepts nothing (sm_new). The indexer stamps
+                                    // the active Coin's onchain_magic before folding.
 } SmState;
 
 // Coverage events — bumped at the edge-case branches so the generator can prove
@@ -380,16 +383,20 @@ uint64_t sm_record_chain(uint64_t seed, uint64_t count,
 // on validity", §0) lives in, exercised by `sm fuzz`. Pinned in SPEC-conformance.md.
 
 // Decode one OP_RETURN payload (the bytes of the single minimal push, §1) into a
-// carrier: ACTION (prefix 0xFF 'P' 'N' + opcode 0x01..0x0F, fields parse per §2/§3)
-// or IGNORE (everything else — unknown opcode, field/length mismatch, non-prefix).
-// `value` is unused by the demux (kept for call-site uniformity); the caller sets
-// car->value/car->vout. Fail-closed. `len` ≤ SM_CARRIER_MAX.
-void sm_decode_payload(const uint8_t *payload, size_t len, uint64_t value, SmCarrier *car);
+// carrier: ACTION (prefix 0xFF ‖ magic[2] + opcode 0x01..0x0F, fields parse per
+// §2/§3) or IGNORE (everything else — the other chain's magic, unknown opcode,
+// field/length mismatch, non-prefix). `magic` is the active coin's two prefix
+// bytes (PepeNet 0x50 0x4E, DogeNet 0x44 0x4E); NULL or a mismatch is IGNORE,
+// the same as unknown data. `value` is unused by the demux (kept for call-site
+// uniformity); the caller sets car->value/car->vout. Fail-closed. `len` ≤ SM_CARRIER_MAX.
+void sm_decode_payload(const uint8_t *payload, size_t len, uint64_t value,
+                       const uint8_t magic[2], SmCarrier *car);
 
 // Canonical wire encoding of a well-formed action (the inverse of the action path
-// of sm_decode_payload). Writes ≤ SM_CARRIER_MAX bytes to out, returns the length,
-// or 0 if `a` is not encodable (bad opcode / field). Used by the grammar-aware fuzzer.
-size_t sm_encode_action(const SmAction *a, uint8_t out[SM_CARRIER_MAX]);
+// of sm_decode_payload). Writes 0xFF ‖ magic ‖ opcode ‖ body, ≤ SM_CARRIER_MAX
+// bytes, and returns the length, or 0 if `a` is not encodable (bad opcode /
+// field) or `magic` is NULL. Used by the grammar-aware fuzzer.
+size_t sm_encode_action(const SmAction *a, const uint8_t magic[2], uint8_t out[SM_CARRIER_MAX]);
 
 // ── property/reorg fingerprints (harness.c) ──────────────────────────────────
 // Per-block property fingerprint: hashes order-independent derived aggregates

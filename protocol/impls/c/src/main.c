@@ -506,14 +506,20 @@ static void test_tx_bounds(void) {
 // ── §9 wire-codec round-trip + demux/drop tests ──────────────────────────────
 // enc(a) → decode → enc again must reproduce the bytes (the codec is a bijection
 // on well-formed actions); the demux/drop cases pin the fail-closed parse.
-static int codec_rt(const SmAction *a) {
-    static uint8_t b1[SM_CARRIER_MAX]; size_t l1 = sm_encode_action(a, b1);
+// The historical suite is the PepeNet prefix. DogeNet is the same bijection
+// under a different magic (test_magic_profiles).
+static const uint8_t MAG_PN[2] = { 0x50, 0x4E };
+static const uint8_t MAG_DN[2] = { 0x44, 0x4E };
+static int codec_rt_m(const SmAction *a, const uint8_t mag[2]) {
+    static uint8_t b1[SM_CARRIER_MAX]; size_t l1 = sm_encode_action(a, mag, b1);
     if (l1 == 0) return 0;
-    static SmCarrier c; sm_decode_payload(b1, l1, 0, &c);
+    if (b1[0] != 0xFF || b1[1] != mag[0] || b1[2] != mag[1]) return 0;
+    static SmCarrier c; sm_decode_payload(b1, l1, 0, mag, &c);
     if (c.kind != SM_CAR_ACTION) return 0;
-    static uint8_t b2[SM_CARRIER_MAX]; size_t l2 = sm_encode_action(&c.act, b2);
+    static uint8_t b2[SM_CARRIER_MAX]; size_t l2 = sm_encode_action(&c.act, mag, b2);
     return l2 == l1 && memcmp(b1, b2, l1) == 0;
 }
+static int codec_rt(const SmAction *a) { return codec_rt_m(a, MAG_PN); }
 static void test_codec(void) {
     uint8_t A[20], B[20]; mk_h160(A, 0xAA); mk_h160(B, 0xBB);
     SmAction a;
@@ -542,12 +548,12 @@ static void test_codec(void) {
       r.flags_len = SM_FLAGS_MAX;
       for (int i = 0; i < SM_FLAGS_MAX; i++) r.flags[i] = (uint8_t)(i * 7 + 1);
       CHECK(codec_rt(&r), "codec round-trip RENEW-selective at SM_FLAGS_MAX (9987 flag bytes)");
-      static uint8_t w[SM_CARRIER_MAX + 8]; size_t l = sm_encode_action(&r, w);
+      static uint8_t w[SM_CARRIER_MAX + 8]; size_t l = sm_encode_action(&r, MAG_PN, w);
       CHECK(l == (size_t)SM_CARRIER_MAX, "RENEW at cap encodes to exactly SM_CARRIER_MAX (9996) bytes");
-      SmCarrier cw; sm_decode_payload(w, l, 0, &cw);
+      SmCarrier cw; sm_decode_payload(w, l, 0, MAG_PN, &cw);
       CHECK(cw.kind == SM_CAR_ACTION && cw.act.flags_len == SM_FLAGS_MAX,
             "...and decodes with every flag byte intact");
-      w[l] = 0x00; sm_decode_payload(w, l + 1, 0, &cw);
+      w[l] = 0x00; sm_decode_payload(w, l + 1, 0, MAG_PN, &cw);
       CHECK(cw.kind == SM_CAR_IGNORE, "one byte past the L1 carrier ceiling -> ignore"); }
     { SmAction t; memset(&t, 0, sizeof t); t.op = SM_OP_TRANSFER; mk_h160(t.addr, 0xBB);
       t.has_anchor = 1; t.anchor = 7;
@@ -556,7 +562,7 @@ static void test_codec(void) {
       CHECK(codec_rt(&t), "codec round-trip TRANSFER-selective at SM_FLAGS_XFER_MAX (9967)");
       static uint8_t w2[SM_CARRIER_MAX + 8];
       t.flags_len = SM_FLAGS_XFER_MAX + 1;
-      CHECK(sm_encode_action(&t, w2) == 0, "TRANSFER flags past the cap refuse to encode"); }
+      CHECK(sm_encode_action(&t, MAG_PN, w2) == 0, "TRANSFER flags past the cap refuse to encode"); }
     { SmAction r; memset(&r, 0, sizeof r); r.op = SM_OP_RELEASE; r.has_anchor = 1; r.anchor = 3;
       r.flags_len = SM_FLAGS_MAX;
       for (int i = 0; i < SM_FLAGS_MAX; i++) r.flags[i] = 0xFF;
@@ -565,34 +571,34 @@ static void test_codec(void) {
     // demux: non-prefix / overlay / bare UTF-8 → IGNORE; only name actions → ACTION.
     SmCarrier c;
     const uint8_t hello[5] = { 'h','e','l','l','o' };
-    sm_decode_payload(hello, 5, 1, &c); CHECK(c.kind == SM_CAR_IGNORE, "demux bare UTF-8 → ignore");
+    sm_decode_payload(hello, 5, 1, MAG_PN, &c); CHECK(c.kind == SM_CAR_IGNORE, "demux bare UTF-8 → ignore");
     const uint8_t ff[1] = { 0xFF };
-    sm_decode_payload(ff, 1, 1, &c);    CHECK(c.kind == SM_CAR_IGNORE, "demux lone 0xFF → ignore");
+    sm_decode_payload(ff, 1, 1, MAG_PN, &c);    CHECK(c.kind == SM_CAR_IGNORE, "demux lone 0xFF → ignore");
     { uint8_t ov[5] = { 0xFF, 0x50, 0x4E, 0xD6, 0x00 };
-      sm_decode_payload(ov, 5, 0, &c);  CHECK(c.kind == SM_CAR_IGNORE, "demux overlay opcode → ignore"); }
+      sm_decode_payload(ov, 5, 0, MAG_PN, &c);  CHECK(c.kind == SM_CAR_IGNORE, "demux overlay opcode → ignore"); }
 
     // fail-closed action parse: truncated / wrong-length / bad-name / bad-opcode → IGNORE.
-    { static uint8_t b[SM_CARRIER_MAX]; a = mk_claim("bob", 0x11); size_t l = sm_encode_action(&a, b);
-      sm_decode_payload(b, 36, 0, &c);    CHECK(c.kind == SM_CAR_IGNORE, "parse CLAIM with no name (salt only) → ignore");
-      sm_decode_payload(b, l, 0, &c);     CHECK(c.kind == SM_CAR_ACTION && c.act.op == SM_OP_CLAIM, "parse exact CLAIM → action"); }
-    { static uint8_t b[SM_CARRIER_MAX]; a = mk_commit("bob", A, 0x11); size_t l = sm_encode_action(&a, b);
-      sm_decode_payload(b, l - 1, 0, &c); CHECK(c.kind == SM_CAR_IGNORE, "parse short COMMIT → ignore"); }
+    { static uint8_t b[SM_CARRIER_MAX]; a = mk_claim("bob", 0x11); size_t l = sm_encode_action(&a, MAG_PN, b);
+      sm_decode_payload(b, 36, 0, MAG_PN, &c);    CHECK(c.kind == SM_CAR_IGNORE, "parse CLAIM with no name (salt only) → ignore");
+      sm_decode_payload(b, l, 0, MAG_PN, &c);     CHECK(c.kind == SM_CAR_ACTION && c.act.op == SM_OP_CLAIM, "parse exact CLAIM → action"); }
+    { static uint8_t b[SM_CARRIER_MAX]; a = mk_commit("bob", A, 0x11); size_t l = sm_encode_action(&a, MAG_PN, b);
+      sm_decode_payload(b, l - 1, 0, MAG_PN, &c); CHECK(c.kind == SM_CAR_IGNORE, "parse short COMMIT → ignore"); }
     { uint8_t b[5] = { 0xFF, 0x50, 0x4E, SM_OP_RESERVE, ',' };       // comma is not a name char
-      sm_decode_payload(b, 5, 0, &c);     CHECK(c.kind == SM_CAR_IGNORE, "parse RESERVE bad-name → ignore"); }
+      sm_decode_payload(b, 5, 0, MAG_PN, &c);     CHECK(c.kind == SM_CAR_IGNORE, "parse RESERVE bad-name → ignore"); }
     { uint8_t b[4] = { 0xFF, 0x50, 0x4E, 0x00 };
-      sm_decode_payload(b, 4, 1, &c);     CHECK(c.kind == SM_CAR_IGNORE, "parse opcode 0x00 → ignore"); }
+      sm_decode_payload(b, 4, 1, MAG_PN, &c);     CHECK(c.kind == SM_CAR_IGNORE, "parse opcode 0x00 → ignore"); }
     { uint8_t b[4] = { 0xFF, 0x50, 0x4E, 0x10 };
-      sm_decode_payload(b, 4, 1, &c);     CHECK(c.kind == SM_CAR_IGNORE, "parse opcode 0x10 (>0x0F) → ignore"); }
+      sm_decode_payload(b, 4, 1, MAG_PN, &c);     CHECK(c.kind == SM_CAR_IGNORE, "parse opcode 0x10 (>0x0F) → ignore"); }
     { uint8_t b[9] = { 0xFF, 0x50, 0x4E, SM_OP_TRADE, 0, 1, 'a', 'b', 'c' };   // no comma
-      sm_decode_payload(b, 9, 0, &c);     CHECK(c.kind == SM_CAR_IGNORE, "parse TRADE no-comma → ignore"); }
+      sm_decode_payload(b, 9, 0, MAG_PN, &c);     CHECK(c.kind == SM_CAR_IGNORE, "parse TRADE no-comma → ignore"); }
     { uint8_t b[10] = { 0xFF, 0x50, 0x4E, SM_OP_TRADE, 0, 1, 'a', ',', 'b', ',' }; // two commas → wait that's a,(b,)
       // construct a clean double-comma: a,,b
       uint8_t d[10] = { 0xFF, 0x50, 0x4E, SM_OP_TRADE, 0, 1, 'a', ',', ',', 'b' };
-      sm_decode_payload(d, 10, 0, &c);    CHECK(c.kind == SM_CAR_IGNORE, "parse TRADE double-comma → ignore"); (void)b; }
+      sm_decode_payload(d, 10, 0, MAG_PN, &c);    CHECK(c.kind == SM_CAR_IGNORE, "parse TRADE double-comma → ignore"); (void)b; }
     { uint8_t b[5] = { 0xFF, 0x50, 0x4E, SM_OP_AS, 2 };
-      sm_decode_payload(b, 5, 0, &c);     CHECK(c.kind == SM_CAR_ACTION && c.act.op == SM_OP_AS && c.act.as_index == 2, "parse AS exact → action"); }
+      sm_decode_payload(b, 5, 0, MAG_PN, &c);     CHECK(c.kind == SM_CAR_ACTION && c.act.op == SM_OP_AS && c.act.as_index == 2, "parse AS exact → action"); }
     { uint8_t b[6] = { 0xFF, 0x50, 0x4E, SM_OP_AS, 2, 0 };
-      sm_decode_payload(b, 6, 0, &c);     CHECK(c.kind == SM_CAR_IGNORE, "parse AS over-length → ignore"); }
+      sm_decode_payload(b, 6, 0, MAG_PN, &c);     CHECK(c.kind == SM_CAR_IGNORE, "parse AS over-length → ignore"); }
 }
 
 // Every digested field MUST affect the digest (catch an accidental omission), and
@@ -904,11 +910,112 @@ static void test_ecmh(void) {
     sm_free(s1); sm_free(s2); sm_free(s3);
 }
 
+// DN twin of every PN codec vector: the same action round-trips under 0x44 0x4E,
+// the fold of the decoded action matches the PN fold, and each chain's bytes
+// are IGNORE under the other profile. The inert harness payloads (truncated
+// CLAIM, opcode 0x20, bare UTF-8, overlay 0xD6) get the same twin.
+static int decode_round(const SmAction *a, const uint8_t mag[2], SmAction *out) {
+    uint8_t b[SM_CARRIER_MAX];
+    size_t n = sm_encode_action(a, mag, b);
+    if (!n) return 0;
+    SmCarrier c; memset(&c, 0, sizeof c);
+    sm_decode_payload(b, n, 0, mag, &c);
+    if (c.kind != SM_CAR_ACTION) return 0;
+    *out = c.act;
+    return 1;
+}
+static void fold_decoded(const SmAction *a, uint8_t dig[32]) {
+    SmState *s = sm_new(0);
+    sm_begin_block(s, 10, 1000, 1);
+    SmTx t; memset(&t, 0, sizeof t);
+    tx1(&t, 0xAA, 1);
+    add_action(&t, *a, 0);
+    sm_apply_tx(s, &t);
+    sm_state_digest(s, dig);
+    sm_tx_free(&t); sm_free(s);
+}
+static void twin_bytes(const uint8_t *pn, size_t n, const char *msg) {
+    SmCarrier c;
+    sm_decode_payload(pn, n, 0, MAG_PN, &c);
+    SmCarKind pn_kind = c.kind;
+    uint8_t dn[64];
+    if (n > sizeof dn) n = sizeof dn;
+    memcpy(dn, pn, n);
+    if (n >= 3 && pn[0] == 0xFF) { dn[1] = MAG_DN[0]; dn[2] = MAG_DN[1]; }
+    sm_decode_payload(dn, n, 0, MAG_DN, &c);
+    CHECK(c.kind == pn_kind, msg);
+    sm_decode_payload(dn, n, 0, MAG_PN, &c);
+    CHECK(c.kind == SM_CAR_IGNORE, "DN payload under the PN profile is ignored");
+    sm_decode_payload(pn, n, 0, MAG_DN, &c);
+    CHECK(c.kind == SM_CAR_IGNORE, "PN payload under the DN profile is ignored");
+}
+static void test_magic_profiles(void) {
+    uint8_t A[20], B[20]; mk_h160(A, 0xAA); mk_h160(B, 0xBB);
+    SmAction acts[18]; int n = 0;
+    acts[n++] = mk_commit("bob", A, 0x11);
+    acts[n++] = mk_claim("bob", 0x11);
+    acts[n++] = mk_claim("abcdefghijklmnopqrstuvwxyz0123ab", 0x11);
+    acts[n++] = renew_all();
+    { SmAction r; memset(&r, 0, sizeof r); r.op = SM_OP_RENEW; r.has_anchor = 1; r.anchor = 0x0102030405ULL;
+      acts[n++] = r;
+      r.flags[0] = 0x05; r.flags[1] = 0x80; r.flags_len = 2; acts[n++] = r; }
+    acts[n++] = xfer_all(B);
+    { SmAction t = xfer_all(B); t.has_anchor = 1; t.anchor = 99; t.flags[0] = 0x03; t.flags_len = 1; acts[n++] = t; }
+    acts[n++] = sell(20000, 50000, "wname");
+    acts[n++] = nameact(SM_OP_RESERVE, "wname");
+    acts[n++] = nameact(SM_OP_SETTLE, "wname");
+    acts[n++] = nameact(SM_OP_PAY, "wname");
+    { uint8_t f[2] = { 0x01, 0x40 }; acts[n++] = release_bits(12, f, 2); }
+    acts[n++] = sell_to(5000, B, "wname");
+    acts[n++] = as_to(3);
+    acts[n++] = trade(0, 1, "aaa", "bbb");
+    for (int i = 0; i < n; i++) {
+        CHECK(codec_rt_m(&acts[i], MAG_DN), "DN codec round-trip matches the PN vector");
+        SmAction pn, dn;
+        CHECK(decode_round(&acts[i], MAG_PN, &pn) && decode_round(&acts[i], MAG_DN, &dn),
+              "PN and DN both decode the vector to an action");
+        uint8_t dp[32], dd[32];
+        fold_decoded(&pn, dp); fold_decoded(&dn, dd);
+        CHECK(memcmp(dp, dd, 32) == 0, "DN fold digest equals the PN fold");
+        uint8_t wire[SM_CARRIER_MAX];
+        size_t ln = sm_encode_action(&acts[i], MAG_DN, wire);
+        SmCarrier c; sm_decode_payload(wire, ln, 0, MAG_PN, &c);
+        CHECK(c.kind == SM_CAR_IGNORE, "DN payload under the PN profile is ignored");
+        ln = sm_encode_action(&acts[i], MAG_PN, wire);
+        sm_decode_payload(wire, ln, 0, MAG_DN, &c);
+        CHECK(c.kind == SM_CAR_IGNORE, "PN payload under the DN profile is ignored");
+    }
+    // harness inert vectors + the demux/drop fixtures, each with a DN twin.
+    { uint8_t bad[8] = { 0xFF, 0x50, 0x4E, SM_OP_CLAIM, 0, 0, 0, 0 };
+      twin_bytes(bad, 8, "DN twin: truncated CLAIM stays IGNORE"); }
+    { uint8_t unk[4] = { 0xFF, 0x50, 0x4E, 0x20 };
+      twin_bytes(unk, 4, "DN twin: opcode 0x20 stays IGNORE"); }
+    { const uint8_t hello[5] = { 'h','e','l','l','o' };
+      twin_bytes(hello, 5, "DN twin: bare UTF-8 stays IGNORE"); }
+    { uint8_t ov[5] = { 0xFF, 0x50, 0x4E, 0xD6, 0x00 };
+      twin_bytes(ov, 5, "DN twin: overlay opcode stays IGNORE"); }
+    { uint8_t z[4] = { 0xFF, 0x50, 0x4E, 0x00 };
+      twin_bytes(z, 4, "DN twin: opcode 0x00 stays IGNORE"); }
+    { uint8_t z[4] = { 0xFF, 0x50, 0x4E, 0x10 };
+      twin_bytes(z, 4, "DN twin: opcode 0x10 stays IGNORE"); }
+    { uint8_t b[5] = { 0xFF, 0x50, 0x4E, SM_OP_RESERVE, ',' };
+      twin_bytes(b, 5, "DN twin: RESERVE bad-name stays IGNORE"); }
+    { uint8_t b[9] = { 0xFF, 0x50, 0x4E, SM_OP_TRADE, 0, 1, 'a', 'b', 'c' };
+      twin_bytes(b, 9, "DN twin: TRADE no-comma stays IGNORE"); }
+    { uint8_t d[10] = { 0xFF, 0x50, 0x4E, SM_OP_TRADE, 0, 1, 'a', ',', ',', 'b' };
+      twin_bytes(d, 10, "DN twin: TRADE double-comma stays IGNORE"); }
+    { uint8_t b[5] = { 0xFF, 0x50, 0x4E, SM_OP_AS, 2 };
+      twin_bytes(b, 5, "DN twin: AS exact stays ACTION"); }
+    { uint8_t b[6] = { 0xFF, 0x50, 0x4E, SM_OP_AS, 2, 0 };
+      twin_bytes(b, 6, "DN twin: AS over-length stays IGNORE"); }
+}
+
 static int selftest(void) {
     test_prng();
     test_secp();
     test_ecmh();
     test_codec();
+    test_magic_profiles();
     test_digest_sensitivity();
     test_empty_digest_stable();
     test_activation_gate();

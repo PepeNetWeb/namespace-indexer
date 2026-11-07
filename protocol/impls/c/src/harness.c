@@ -214,6 +214,9 @@ static void fz_build_action(FzGen *g, uint8_t op, SmAction *a) {
 // FZ_CARS bounds the per-tx raw-copy arrays (the fuzz draws 1..4 carriers);
 // it is a harness constant, decoupled from the SM_INLINE_CARRIERS memory hint.
 #define FZ_CARS 8
+/* Fuzz stays on the PepeNet prefix so pinned input digests do not move.
+   DN coverage is a separate selftest, not a retarget of this draw. */
+static const uint8_t FZ_PN[2] = { 0x50, 0x4E };
 static int fz_carrier_bytes(FzGen *g, uint8_t out[SM_CARRIER_MAX]) {
     uint64_t mode = fbnd(g, 10);
     if (mode < 4) {                                                   // ── dumb random (40%) ──
@@ -229,7 +232,7 @@ static int fz_carrier_bytes(FzGen *g, uint8_t out[SM_CARRIER_MAX]) {
     // ── grammar-aware (60%): build → encode → perturb ──
     uint8_t op = (uint8_t)(1 + fbnd(g, 15));                          // 0x01..0x0F
     SmAction a; fz_build_action(g, op, &a);
-    size_t enc = sm_encode_action(&a, out);
+    size_t enc = sm_encode_action(&a, FZ_PN, out);
     if (enc == 0) { out[0] = 0xFF; return 1; }                        // unreachable (fields valid); degenerate → ignore
     int len = (int)enc;
     switch (fbnd(g, 6)) {                                             // the twist
@@ -280,7 +283,7 @@ static void fz_build_tx(FzGen *g, uint32_t j, SmTx *t) {
         rlen[c] = fz_carrier_bytes(g, raw[c]);
         uint64_t val = fz_value(g);
         SmCarrier *cr = sm_tx_carrier(t);
-        sm_decode_payload(raw[c], (size_t)rlen[c], val, cr);
+        sm_decode_payload(raw[c], (size_t)rlen[c], val, FZ_PN, cr);
         cr->value = val; cr->vout = (uint32_t)c;
         if (cr->kind == SM_CAR_IGNORE) g->cov[0]++;
         else                           g->cov[1 + cr->act.op]++;       // op 1..15 → 2..16
@@ -502,18 +505,18 @@ static void build_inert_tx(SmTx *t) {
     // 0: truncated CLAIM → IGNORE
     uint8_t bad[8] = { 0xFF, 0x50, 0x4E, SM_OP_CLAIM, 0, 0, 0, 0 };
     SmCarrier *c0 = sm_tx_carrier(t);
-    sm_decode_payload(bad, 8, 0, c0); c0->value = 0; c0->vout = 0;
+    sm_decode_payload(bad, 8, 0, FZ_PN, c0); c0->value = 0; c0->vout = 0;
     // 1: unknown opcode in gap (0x20) → IGNORE
     uint8_t unk[4] = { 0xFF, 0x50, 0x4E, 0x20 };
     SmCarrier *c1 = sm_tx_carrier(t);
-    sm_decode_payload(unk, 4, 0, c1); c1->value = 0; c1->vout = 1;
+    sm_decode_payload(unk, 4, 0, FZ_PN, c1); c1->value = 0; c1->vout = 1;
     // 2: bare UTF-8 noise (no prefix) → IGNORE
     SmCarrier *c2 = sm_tx_carrier(t);
-    sm_decode_payload((const uint8_t *)"hello", 5, 1, c2); c2->value = 1; c2->vout = 2;
+    sm_decode_payload((const uint8_t *)"hello", 5, 1, FZ_PN, c2); c2->value = 1; c2->vout = 2;
     // 3: overlay-band opcode 0xD6 → IGNORE
     uint8_t ov[5] = { 0xFF, 0x50, 0x4E, 0xD6, 0x00 };
     SmCarrier *c3 = sm_tx_carrier(t);
-    sm_decode_payload(ov, 5, 0, c3); c3->value = 0; c3->vout = 3;
+    sm_decode_payload(ov, 5, 0, FZ_PN, c3); c3->value = 0; c3->vout = 3;
 }
 
 int sm_cmd_meta(int argc, char **argv) {

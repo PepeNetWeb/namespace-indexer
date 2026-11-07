@@ -418,6 +418,25 @@ static void rm_db(const char *path) {
     snprintf(b, sizeof b, "%s-journal", path); unlink(b);
 }
 
+// A marked peer known only from inbound (last_good=0) whose dial failed must
+// sit out the retry window, not re-seat every serve tick.
+static void sec_mesh_nat_backoff(const char *dir) {
+    char p[600]; snprintf(p, sizeof p, "%s/meshbk.db", dir);
+    sqlite3 *db = idx_db_open(p);
+    CHECK(db != NULL, "mesh backoff: open db");
+    if (!db) return;
+    char pool[8][80]; int64_t now = 1800000000;
+    idx_db_peer_touch_agent(db, "74.179.67.173", 33874, "/pepenet-dnsd:0.1/", now - 100);
+    int n = idx_db_peers_dnet_confirmed(db, pool, 8, now - 600);
+    CHECK(n == 1, "mesh backoff: inbound-marked peer is a candidate before any dial");
+    idx_db_peer_tried(db, "74.179.67.173:33874", now);
+    n = idx_db_peers_dnet_confirmed(db, pool, 8, now - 600);
+    CHECK(n == 0, "mesh backoff: failed dial of last_good=0 marked peer sits out DIAL_RETRY_S");
+    n = idx_db_peers_dnet_confirmed(db, pool, 8, now + 1);
+    CHECK(n == 1, "mesh backoff: candidate again after the window");
+    idx_db_close(db); rm_db(p);
+}
+
 int main(void) {
     char dir[] = "/tmp/idx_test_db_XXXXXX";
     if (!mkdtemp(dir)) { fprintf(stderr, "mkdtemp failed\n"); return 1; }
@@ -435,6 +454,7 @@ int main(void) {
     sec_flags(dir);
     sec_property(dir);
     sec_idempotence(dir);
+    sec_mesh_nat_backoff(dir);
 
     // teardown: the temp tree goes away entirely.
     rm_db(main_db);

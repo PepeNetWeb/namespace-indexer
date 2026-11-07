@@ -35,6 +35,8 @@ static const char *SCHEMA =
     "CREATE TABLE IF NOT EXISTS peers(addr TEXT PRIMARY KEY, services INTEGER,"
     "  last_seen INTEGER, last_good INTEGER DEFAULT 0,"
     "  last_try INTEGER DEFAULT 0, agent TEXT DEFAULT '', dnet INTEGER DEFAULT 0);"
+    // rollback checkpoints (local replay shortcut; see idx_db_ckpt_*)
+    "CREATE TABLE IF NOT EXISTS rb_ckpt(height INTEGER PRIMARY KEY, activation INTEGER, digest BLOB, state BLOB);"
     "CREATE INDEX IF NOT EXISTS names_owner ON names(owner);"
     "CREATE INDEX IF NOT EXISTS blocks_hash ON blocks(hash);";
 
@@ -51,6 +53,15 @@ sqlite3 *idx_db_open(const char *path) {
     sqlite3_exec(db, "ALTER TABLE peers ADD COLUMN agent TEXT DEFAULT ''", NULL, NULL, NULL);
     sqlite3_exec(db, "ALTER TABLE peers ADD COLUMN dnet INTEGER DEFAULT 0", NULL, NULL, NULL);
     sqlite3_exec(db, "ALTER TABLE blocks ADD COLUMN bits INTEGER DEFAULT 0", NULL, NULL, NULL);
+    return db;
+}
+sqlite3 *idx_db_open_ro(const char *path) {
+    sqlite3 *db;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) { sqlite3_close(db); return NULL; }
+    sqlite3_busy_timeout(db, 2000);
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM names LIMIT 1", -1, &st, NULL) != SQLITE_OK) { sqlite3_close(db); return NULL; }
+    sqlite3_finalize(st);
     return db;
 }
 void idx_db_close(sqlite3 *db) { if (db) sqlite3_close(db); }
@@ -73,10 +84,18 @@ void idx_db_save_sync(sqlite3 *db, int64_t height, const uint8_t tip_hash[32]) {
     char hbuf[32]; snprintf(hbuf, sizeof hbuf, "%lld", (long long)height); meta_set(db, "height", hbuf);
     char hh[65]; tohex(tip_hash, 32, hh); meta_set(db, "tip", hh);
 }
-void idx_db_set_peer_height(sqlite3 *db, int64_t h) {
-    if (h <= 0) return;
+int64_t idx_db_get_peer_height(sqlite3 *db);
+// Every writer is monotonic: peer_height is a high-water mark of evidence
+// (handshake start_height or an announced block). A lower claim — including
+// the first handshake after a restart, when in-memory state is empty — must
+// never pull the stored value down. set and raise are the same at the db.
+void idx_db_raise_peer_height(sqlite3 *db, int64_t h) {
+    if (h <= 0 || h <= idx_db_get_peer_height(db)) return;
     char b[32]; snprintf(b, sizeof b, "%lld", (long long)h);
     meta_set(db, "peer_height", b);
+}
+void idx_db_set_peer_height(sqlite3 *db, int64_t h) {
+    idx_db_raise_peer_height(db, h);
 }
 int64_t idx_db_get_peer_height(sqlite3 *db) {
     char b[32]; return meta_get(db, "peer_height", b, sizeof b) ? strtoll(b, NULL, 10) : 0;
@@ -94,6 +113,18 @@ int64_t idx_db_get_activation(sqlite3 *db, int64_t dflt) { char b[32]; return me
 // so a later refold/digest on this db uses the same subsidy, even for a non-default chain.
 void idx_db_set_subsidy(sqlite3 *db, int64_t s) { char b[32]; snprintf(b, sizeof b, "%lld", (long long)s); meta_set(db, "subsidy", b); }
 int64_t idx_db_get_subsidy(sqlite3 *db, int64_t dflt) { char b[32]; return meta_get(db, "subsidy", b, sizeof b) ? strtoll(b, NULL, 10) : dflt; }
+void idx_db_set_onchain_magic(sqlite3 *db, const uint8_t mag[2]) {
+    char b[8]; snprintf(b, sizeof b, "%02x%02x", mag[0], mag[1]);
+    meta_set(db, "onchain_magic", b);
+}
+int idx_db_get_onchain_magic(sqlite3 *db, uint8_t mag[2]) {
+    char b[16];
+    if (!meta_get(db, "onchain_magic", b, sizeof b) || strlen(b) != 4) return 0;
+    unsigned a = 0, c = 0;
+    if (sscanf(b, "%2x%2x", &a, &c) != 2) return 0;
+    mag[0] = (uint8_t)a; mag[1] = (uint8_t)c;
+    return 1;
+}
 // one-shot markers in meta (migrations/repairs that must run once per db)
 int  idx_db_flag_get(sqlite3 *db, const char *k) { char b[8]; return meta_get(db, k, b, sizeof b); }
 void idx_db_flag_set(sqlite3 *db, const char *k) { meta_set(db, k, "1"); }
@@ -276,7 +307,11 @@ int idx_db_peers_dnet_confirmed(sqlite3 *db, char (*out)[80], int max,
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(db,
             "SELECT addr FROM peers WHERE agent LIKE '" IDX_DNET_MARK "%'"
-            " AND NOT (?2 > 0 AND last_good > 0 AND last_try > last_good AND last_try > ?2)"
+            // a failed dial (last_try newer than last_good) sits out the retry
+            // window. last_good=0 included: an inbound-only marked peer (NAT'd,
+            // agent stamped by touch_agent) otherwise re-seated every tick and
+            // blocked the serve thread on a 5s connect forever.
+            " AND NOT (?2 > 0 AND last_try > last_good AND last_try > ?2)"
             " ORDER BY last_good DESC, last_seen DESC LIMIT ?1",
             -1, &st, NULL) != SQLITE_OK) return 0;
     sqlite3_bind_int(st, 1, max);
@@ -637,8 +672,12 @@ int idx_db_oracle_warm(sqlite3 *db, void *oracle) {
 // never leaves a half-rebuilt `names` table stamped as complete. On failure the
 // in-RAM SmState remains authoritative and the next projection retries; a restart
 // sees the old proj_height and re-folds the gap. Returns 1 on commit, 0 on rollback.
+// A SAVEPOINT, not BEGIN: standalone it is the same single transaction; inside
+// idx_sync_rollback's BEGIN IMMEDIATE it nests, so the reorg's prune + replay +
+// projection commit (or vanish) together.
+static int ckpt_maybe(sqlite3 *db, SmState *s);
 int idx_db_project(sqlite3 *db, SmState *s) {
-    if (sqlite3_exec(db, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) return 0;
+    if (sqlite3_exec(db, "SAVEPOINT idx_project", NULL, NULL, NULL) != SQLITE_OK) return 0;
     int ok = sqlite3_exec(db, "DELETE FROM names; DELETE FROM commits; DELETE FROM muts;", NULL, NULL, NULL) == SQLITE_OK;
     sqlite3_stmt *st = NULL;
     if (ok) ok = sqlite3_prepare_v2(db, "INSERT INTO names(name,owner,owner_type,lease_expiry,st,seller,seller_type,price,offer_expiry,buyer,burn_leg,pay_leg,reserve_expiry) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", -1, &st, NULL) == SQLITE_OK;
@@ -673,12 +712,234 @@ int idx_db_project(sqlite3 *db, SmState *s) {
     // Sentinel: the height this projection reflects, written INSIDE the same
     // transaction so it commits atomically with the rebuilt tables (or not at all).
     if (ok) { char hb[32]; snprintf(hb, sizeof hb, "%lld", (long long)s->cur_height); ok = meta_set(db, "proj_height", hb); }
-    if (ok && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) return 1;
-    sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);   // leave the prior projection + proj_height intact
+    // Checkpoints are optional and local: a failed save (disk, sqlite, cap) is
+    // logged and skipped inside its own nested savepoint; it never rolls back
+    // the projection itself.
+    if (ok) {
+        if (sqlite3_exec(db, "SAVEPOINT idx_ckpt", NULL, NULL, NULL) != SQLITE_OK) {
+            fprintf(stderr, "rb_ckpt: warning: savepoint failed at height %lld: %s; checkpoint skipped\n",
+                    (long long)s->cur_height, sqlite3_errmsg(db));
+        } else if (ckpt_maybe(db, s)) {
+            sqlite3_exec(db, "RELEASE idx_ckpt", NULL, NULL, NULL);
+        } else {
+            fprintf(stderr, "rb_ckpt: warning: checkpoint save failed at height %lld: %s; checkpoint skipped, projection kept\n",
+                    (long long)s->cur_height, sqlite3_errmsg(db));
+            sqlite3_exec(db, "ROLLBACK TO idx_ckpt", NULL, NULL, NULL);
+            sqlite3_exec(db, "RELEASE idx_ckpt", NULL, NULL, NULL);
+        }
+    }
+    if (ok && sqlite3_exec(db, "RELEASE idx_project", NULL, NULL, NULL) == SQLITE_OK) return 1;
+    sqlite3_exec(db, "ROLLBACK TO idx_project", NULL, NULL, NULL);   // leave the prior projection + proj_height intact
+    sqlite3_exec(db, "RELEASE idx_project", NULL, NULL, NULL);
     return 0;
 }
 int64_t idx_db_projected_height(sqlite3 *db) {
     char b[32]; return meta_get(db, "proj_height", b, sizeof b) ? strtoll(b, NULL, 10) : -1;
+}
+
+// ── rollback checkpoints (local-only; never on the wire, never digested) ─────
+// A reorg rollback used to replay the fold from activation. A checkpoint is a
+// verbatim copy of the projected fold state (names/commits/muts + cursor) at
+// some height H, so a rollback to T >= H replays only (H, T]. The rows written
+// are exactly what idx_db_project writes, so the state a checkpoint restores is
+// the state a restart from the projection at H would resume from. Each row
+// carries the state digest of what it encodes: a load that does not reproduce
+// it is ignored (full replay) — a bad checkpoint can cost time, never state.
+// Taken from idx_db_project every `rb_ckpt_every` heights (meta; default
+// IDX_CKPT_EVERY, 0 = off); at most IDX_CKPT_KEEP rows are kept.
+#define IDX_CKPT_EVERY 1000
+#define IDX_CKPT_KEEP  4
+// State blob layout: u32 LE format version, then the fields below. Unknown
+// versions are rejected (fall back to an older row or full replay). The blob
+// is capped so a pathological state cannot balloon a local row; an oversize
+// state is simply not checkpointed (checkpoints are optional, never digested).
+#define IDX_CKPT_FMT_VER   1u
+#define IDX_CKPT_MAX_BYTES (64u * 1024 * 1024)
+size_t idx_ckpt_max_bytes = IDX_CKPT_MAX_BYTES;   // test override
+static void ckpt_reject(int64_t h, const char *why) {
+    fprintf(stderr, "rb_ckpt: rejected checkpoint at height %lld: %s\n", (long long)h, why);
+}
+typedef struct { uint8_t *p; size_t n, cap; int bad; } CkBuf;
+static void ck_put(CkBuf *b, const void *d, size_t n) {
+    if (b->bad) return;
+    if (b->n + n > b->cap) {
+        size_t c = b->cap ? b->cap : 4096; while (c < b->n + n) c *= 2;
+        uint8_t *q = realloc(b->p, c); if (!q) { b->bad = 1; return; }
+        b->p = q; b->cap = c;
+    }
+    memcpy(b->p + b->n, d, n); b->n += n;
+}
+static void ck_u64(CkBuf *b, uint64_t v) { uint8_t t[8]; for (int i = 0; i < 8; i++) t[i] = (uint8_t)(v >> (8 * i)); ck_put(b, t, 8); }
+typedef struct { const uint8_t *p; size_t n, o; int bad; } CkRd;
+static void ck_get(CkRd *r, void *d, size_t n) { if (r->bad || r->o + n > r->n) { r->bad = 1; memset(d, 0, n); return; } memcpy(d, r->p + r->o, n); r->o += n; }
+static uint64_t ck_g64(CkRd *r) { uint8_t t[8]; ck_get(r, t, 8); uint64_t v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | t[i]; return v; }
+
+int64_t idx_db_ckpt_every(sqlite3 *db) {
+    char b[32]; return meta_get(db, "rb_ckpt_every", b, sizeof b) ? strtoll(b, NULL, 10) : IDX_CKPT_EVERY;
+}
+void idx_db_ckpt_set_every(sqlite3 *db, int64_t every) {
+    char b[32]; snprintf(b, sizeof b, "%lld", (long long)every); meta_set(db, "rb_ckpt_every", b);
+}
+static int ck_exec(sqlite3 *db, const char *sql, int64_t h) {
+    sqlite3_stmt *st; if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, h); int rc = sqlite3_step(st); sqlite3_finalize(st);
+    return rc == SQLITE_DONE;
+}
+int idx_db_ckpt_prune_above(sqlite3 *db, int64_t height) {
+    return ck_exec(db, "DELETE FROM rb_ckpt WHERE height>?1", height);
+}
+int idx_db_ckpt_wipe(sqlite3 *db) { return sqlite3_exec(db, "DELETE FROM rb_ckpt", NULL, NULL, NULL) == SQLITE_OK; }
+int idx_db_ckpt_count(sqlite3 *db) {
+    sqlite3_stmt *st; int n = -1;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM rb_ckpt", -1, &st, NULL) != SQLITE_OK) return -1;
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st); return n;
+}
+int idx_db_ckpt_save(sqlite3 *db, SmState *s) {
+    CkBuf b = {0};
+    { uint8_t v[4] = { IDX_CKPT_FMT_VER & 255, 0, 0, 0 }; ck_put(&b, v, 4); }
+    ck_u64(&b, (uint64_t)s->cur_height); ck_u64(&b, (uint64_t)s->cur_mtp); ck_u64(&b, s->cur_rate);
+    ck_u64(&b, (uint64_t)s->n_names);
+    for (int i = 0; i < s->n_names; i++) {
+        SmNameRow *r = &s->names[i]; uint8_t nl = (uint8_t)r->name_len;
+        ck_put(&b, &nl, 1); ck_put(&b, r->name, nl);
+        ck_put(&b, r->owner, 20); ck_put(&b, &r->owner_type, 1);
+        ck_u64(&b, (uint64_t)r->lease_expiry); ck_u64(&b, (uint64_t)r->st);
+        ck_put(&b, r->seller, 20); ck_put(&b, &r->seller_type, 1);
+        ck_u64(&b, r->price); ck_u64(&b, (uint64_t)r->offer_expiry);
+        ck_put(&b, r->buyer, 20);
+        ck_u64(&b, r->burn_leg); ck_u64(&b, r->pay_leg); ck_u64(&b, (uint64_t)r->reserve_expiry);
+    }
+    ck_u64(&b, (uint64_t)s->n_commits);
+    for (int i = 0; i < s->n_commits; i++) {
+        SmCommit *c = &s->commits[i];
+        ck_put(&b, c->commitment, 32); ck_u64(&b, (uint64_t)c->commit_height);
+        ck_u64(&b, c->tx_index); ck_u64(&b, (uint64_t)c->commit_time);
+    }
+    ck_u64(&b, (uint64_t)s->n_muts);
+    for (int i = 0; i < s->n_muts; i++) { ck_put(&b, s->muts[i].owner, 20); ck_u64(&b, (uint64_t)s->muts[i].height); }
+    if (b.bad) { free(b.p); return 0; }
+    if (b.n > idx_ckpt_max_bytes) {          // optional: skip, never fail the projection
+        fprintf(stderr, "rb_ckpt: state at height %lld is %zu bytes (> cap %zu); not checkpointed\n",
+                (long long)s->cur_height, b.n, idx_ckpt_max_bytes);
+        free(b.p); return 1;
+    }
+    uint8_t dig[32]; sm_state_digest(s, dig);
+    sqlite3_stmt *st; int ok = 0;
+    if (sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO rb_ckpt(height,activation,digest,state) VALUES(?,?,?,?)", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, s->cur_height); sqlite3_bind_int64(st, 2, (int64_t)s->activation_height);
+        sqlite3_bind_blob(st, 3, dig, 32, SQLITE_STATIC); sqlite3_bind_blob(st, 4, b.p, (int)b.n, SQLITE_STATIC);
+        ok = sqlite3_step(st) == SQLITE_DONE; sqlite3_finalize(st);
+    }
+    free(b.p);
+    // keep-N prune: find the N-th newest height and delete strictly below it.
+    // Two plain statements (no NOT IN / LIMIT-subquery semantics to rely on);
+    // fewer than N rows → nothing to delete.
+    if (ok) {
+        int64_t floor_h = -1; sqlite3_stmt *q;
+        if (sqlite3_prepare_v2(db, "SELECT height FROM rb_ckpt ORDER BY height DESC LIMIT 1 OFFSET ?1", -1, &q, NULL) != SQLITE_OK) ok = 0;
+        else {
+            sqlite3_bind_int64(q, 1, IDX_CKPT_KEEP - 1);
+            int rc = sqlite3_step(q);
+            if (rc == SQLITE_ROW) floor_h = sqlite3_column_int64(q, 0);
+            else if (rc != SQLITE_DONE) ok = 0;
+            sqlite3_finalize(q);
+        }
+        if (ok && floor_h >= 0) ok = ck_exec(db, "DELETE FROM rb_ckpt WHERE height<?1", floor_h);
+    }
+    return ok;
+}
+// Called from idx_db_project inside its savepoint.
+static int ckpt_maybe(sqlite3 *db, SmState *s) {
+    int64_t every = idx_db_ckpt_every(db);
+    if (every <= 0 || s->cur_height < (int64_t)s->activation_height) return 1;
+    sqlite3_stmt *st; int64_t last = -1;
+    if (sqlite3_prepare_v2(db, "SELECT MAX(height) FROM rb_ckpt", -1, &st, NULL) != SQLITE_OK) return 0;
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL) last = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    if (last >= 0 && s->cur_height < last + every) return 1;
+    if (last < 0 && s->cur_height < (int64_t)s->activation_height + every) return 1;
+    return idx_db_ckpt_save(db, s);
+}
+int64_t idx_db_ckpt_load(sqlite3 *db, int64_t max_height, SmState *s) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, "SELECT height,digest,state FROM rb_ckpt WHERE height<=?1 AND activation=?2"
+                               " ORDER BY height DESC", -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int64(st, 1, max_height); sqlite3_bind_int64(st, 2, (int64_t)s->activation_height);
+    int64_t got = -1;
+    while (got < 0 && sqlite3_step(st) == SQLITE_ROW) {
+        int64_t h = sqlite3_column_int64(st, 0);
+        if (sqlite3_column_bytes(st, 1) != 32) { ckpt_reject(h, "bad digest length"); continue; }
+        uint8_t want[32]; memcpy(want, sqlite3_column_blob(st, 1), 32);
+        CkRd r = { sqlite3_column_blob(st, 2), (size_t)sqlite3_column_bytes(st, 2), 0, 0 };
+        if (r.n > idx_ckpt_max_bytes) { ckpt_reject(h, "state blob over size cap"); continue; }
+        if (r.n < 4) { ckpt_reject(h, "state blob truncated"); continue; }
+        uint32_t ver = (uint32_t)r.p[0] | (uint32_t)r.p[1] << 8 | (uint32_t)r.p[2] << 16 | (uint32_t)r.p[3] << 24;
+        if (ver != IDX_CKPT_FMT_VER) {
+            char why[64]; snprintf(why, sizeof why, "unknown format version %u", ver);
+            ckpt_reject(h, why); continue;
+        }
+        r.o = 4;
+        SmState *t = sm_new(s->activation_height);
+        if (!t) break;
+        t->cur_height = (int64_t)ck_g64(&r); t->cur_mtp = (int64_t)ck_g64(&r); t->cur_rate = ck_g64(&r);
+        uint64_t n = ck_g64(&r);
+        for (uint64_t i = 0; !r.bad && i < n; i++) {
+            uint8_t nl; char nm[256]; ck_get(&r, &nl, 1); ck_get(&r, nm, nl);
+            if (r.bad || nl == 0 || nl > SM_NAME_MAX) { r.bad = 1; break; }
+            SmNameRow *x = sm_add_name(t, nm, nl); if (!x) { r.bad = 1; break; }
+            ck_get(&r, x->owner, 20); ck_get(&r, &x->owner_type, 1);
+            x->lease_expiry = (int64_t)ck_g64(&r); x->st = (SmNameState)ck_g64(&r);
+            ck_get(&r, x->seller, 20); ck_get(&r, &x->seller_type, 1);
+            x->price = ck_g64(&r); x->offer_expiry = (int64_t)ck_g64(&r);
+            ck_get(&r, x->buyer, 20);
+            x->burn_leg = ck_g64(&r); x->pay_leg = ck_g64(&r); x->reserve_expiry = (int64_t)ck_g64(&r);
+        }
+        n = r.bad ? 0 : ck_g64(&r);
+        for (uint64_t i = 0; !r.bad && i < n; i++) {
+            uint8_t cm[32]; ck_get(&r, cm, 32); int64_t ch = (int64_t)ck_g64(&r);
+            uint32_t ti = (uint32_t)ck_g64(&r); int64_t ct = (int64_t)ck_g64(&r);
+            if (!r.bad) sm_commit_add(t, cm, ch, ti, ct);
+        }
+        n = r.bad ? 0 : ck_g64(&r);
+        for (uint64_t i = 0; !r.bad && i < n; i++) {
+            uint8_t ow[20]; ck_get(&r, ow, 20); int64_t mh = (int64_t)ck_g64(&r);
+            if (!r.bad) sm_bump_mutation(t, ow, mh);
+        }
+        uint8_t dig[32];
+        if (r.bad || r.o != r.n) ckpt_reject(h, "state blob malformed");
+        else if (t->cur_height != h) ckpt_reject(h, "height mismatch");
+        else {
+            sm_state_digest(t, dig);
+            if (memcmp(dig, want, 32) != 0) ckpt_reject(h, "digest mismatch");
+            else {
+                // swap the loaded rows into *s (caller's magic and pointer kept)
+                SmState tmp = *s; uint8_t mag[2]; memcpy(mag, s->onchain_magic, 2);
+                *s = *t; *t = tmp; memcpy(s->onchain_magic, mag, 2);
+                got = h;
+            }
+        }
+        sm_free(t);
+    }
+    sqlite3_finalize(st);
+    return got;
+}
+
+// First checkpoint on open: an existing db upgraded to this build (or one
+// whose checkpoints were wiped) has an empty table while its tip may sit far
+// past activation; without this the first checkpoint waits a full interval.
+// Only when the loaded state IS the projection (cur_height == proj_height).
+// Returns 1 if one was taken, 0 if not needed, -1 on error.
+int idx_db_ckpt_seed(sqlite3 *db, SmState *s) {
+    int64_t every = idx_db_ckpt_every(db);
+    if (every <= 0 || idx_db_ckpt_count(db) != 0) return 0;
+    if (s->cur_height < (int64_t)s->activation_height + every) return 0;
+    if (idx_db_projected_height(db) != s->cur_height) return 0;
+    if (sqlite3_exec(db, "SAVEPOINT ckpt_seed", NULL, NULL, NULL) != SQLITE_OK) return -1;
+    int ok = idx_db_ckpt_save(db, s);
+    if (ok && sqlite3_exec(db, "RELEASE ckpt_seed", NULL, NULL, NULL) == SQLITE_OK) return idx_db_ckpt_count(db) > 0;
+    sqlite3_exec(db, "ROLLBACK TO ckpt_seed", NULL, NULL, NULL); sqlite3_exec(db, "RELEASE ckpt_seed", NULL, NULL, NULL);
+    return -1;
 }
 
 int idx_db_load_state(sqlite3 *db, SmState *s) {
@@ -736,4 +997,37 @@ int idx_db_owned(sqlite3 *db, const char *h160hex, void (*cb)(void *, const char
     sqlite3_bind_blob(st, 1, owner, 20, SQLITE_STATIC); int n = 0;
     while (sqlite3_step(st) == SQLITE_ROW) { if (cb) cb(u, (const char *)sqlite3_column_text(st, 0), sqlite3_column_int64(st, 1), sqlite3_column_int(st, 2)); n++; }
     sqlite3_finalize(st); return n;
+}
+
+// dane-09 — see db.h. Prefix range: name >= p AND name < p' where p' is p with
+// its last byte incremented (names are [a-z0-9-], so no 0xff carry).
+int64_t idx_db_names(sqlite3 *db, const char *prefix, int64_t offset, int limit,
+                     void (*cb)(void *u, const char *name, const uint8_t *owner,
+                                int64_t lease_expiry, int st, uint64_t price), void *u) {
+    size_t pl = prefix ? strlen(prefix) : 0;
+    char hi[64];
+    if (pl >= sizeof hi || offset < 0 || limit < 0) return -1;
+    if (pl) { memcpy(hi, prefix, pl + 1); hi[pl - 1]++; }
+    const char *cq = pl ? "SELECT COUNT(*) FROM names WHERE name >= ?1 AND name < ?2"
+                        : "SELECT COUNT(*) FROM names";
+    const char *pq = pl ? "SELECT name,owner,lease_expiry,st,price FROM names WHERE name >= ?1 AND name < ?2 "
+                          "ORDER BY name LIMIT ?3 OFFSET ?4"
+                        : "SELECT name,owner,lease_expiry,st,price FROM names ORDER BY name LIMIT ?3 OFFSET ?4";
+    sqlite3_stmt *st = NULL; int64_t total = -1;
+    if (sqlite3_prepare_v2(db, cq, -1, &st, NULL) != SQLITE_OK) return -1;
+    if (pl) { sqlite3_bind_text(st, 1, prefix, -1, SQLITE_STATIC); sqlite3_bind_text(st, 2, hi, -1, SQLITE_STATIC); }
+    if (sqlite3_step(st) == SQLITE_ROW) total = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    if (total < 0) return -1;
+    if (sqlite3_prepare_v2(db, pq, -1, &st, NULL) != SQLITE_OK) return -1;
+    if (pl) { sqlite3_bind_text(st, 1, prefix, -1, SQLITE_STATIC); sqlite3_bind_text(st, 2, hi, -1, SQLITE_STATIC); }
+    sqlite3_bind_int(st, 3, limit); sqlite3_bind_int64(st, 4, offset);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const uint8_t *ow = sqlite3_column_blob(st, 1);
+        if (ow && sqlite3_column_bytes(st, 1) != 20) ow = NULL;
+        if (cb) cb(u, (const char *)sqlite3_column_text(st, 0), ow, sqlite3_column_int64(st, 2),
+                   sqlite3_column_int(st, 3), (uint64_t)sqlite3_column_int64(st, 4));
+    }
+    sqlite3_finalize(st);
+    return total;
 }

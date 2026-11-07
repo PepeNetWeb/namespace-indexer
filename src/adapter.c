@@ -19,7 +19,7 @@ int idx_adapt_tx(SmState *s, const IdxTx *tx, uint32_t txindex) {
         const uint8_t *payload; size_t plen;
         if (!idx_op_return_payload(out->spk, out->spklen, &payload, &plen)) continue;
         SmCarrier car; memset(&car, 0, sizeof car);
-        sm_decode_payload(payload, plen, (uint64_t)out->value, &car);
+        sm_decode_payload(payload, plen, (uint64_t)out->value, s->onchain_magic, &car);
         if (car.kind != SM_CAR_IGNORE) have_carrier = 1;
     }
     if (!have_carrier) return 0;
@@ -35,7 +35,7 @@ int idx_adapt_tx(SmState *s, const IdxTx *tx, uint32_t txindex) {
         const uint8_t *payload; size_t plen;
         if (idx_op_return_payload(out->spk, out->spklen, &payload, &plen)) {
             SmCarrier car; memset(&car, 0, sizeof car);
-            sm_decode_payload(payload, plen, (uint64_t)out->value, &car);
+            sm_decode_payload(payload, plen, (uint64_t)out->value, s->onchain_magic, &car);
             if (car.kind != SM_CAR_ACTION) continue;          // §1: only name-action carriers
             car.value = (uint64_t)out->value;
             car.vout  = out->vout;
