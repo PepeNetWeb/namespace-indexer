@@ -1674,7 +1674,15 @@ static int cmd_sync(int argc, char **argv) {
         fprintf(stderr, "  no archive peer reachable — using limited peer %s\n", picked);
     }
     if (fb_fd >= 0) close(fb_fd);
-    if (fd < 0) { fprintf(stderr, "no peer reachable (%d candidates)\n", nc); idx_db_close(db); return 1; }
+    if (fd < 0) {
+        // same teardown as every other exit: the serve store's sqlite handle,
+        // the oracle feed and the fold state were leaked here on each pass
+        // that found no peer (a daemon loop retrying a dead network grew
+        // without bound). fb_fd is already closed above.
+        fprintf(stderr, "no peer reachable (%d candidates)\n", nc);
+        serve_store_close(fc.serve); oracle_free(oracle); sm_free(s); idx_db_close(db);
+        return 1;
+    }
     fprintf(stderr, "connected %s, syncing from height %lld (activation %lld, peer height %lld, agent %s)\n",
             picked, (long long)(height + 1), (long long)activation,
             (long long)idx_sync_peer_height, (const char *)idx_sync_peer_agent);
