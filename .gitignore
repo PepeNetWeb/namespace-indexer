@@ -13,3 +13,4 @@ test_codec
 test_serve
 test_net_policy
 test_rollback
+indexerd-stalltest

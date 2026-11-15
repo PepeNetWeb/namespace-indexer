@@ -760,22 +760,72 @@ static int stop_poll(int fd, short ev, int timeout_ms) {
     }
     return 0;
 }
-static int read_n(int fd, uint8_t *buf, size_t n, int timeout_ms) {
+// ── receive deadlines (slow-loris bounds) ─────────────────────────────────────
+// net_recv's timeout_ms is an INACTIVITY timeout: it restarts on every message
+// in the callers' loops, and on every read() inside read_n. A peer that is
+// never silent — ping/addr/inv chatter, or one frame trickled a byte at a time
+// — never trips it, so a wait for a specific reply (blocks after getdata,
+// headers after getheaders, inv after getblocks, version/verack) could last
+// forever. Each such wait also carries an absolute CLOCK_MONOTONIC deadline
+// (ms; 0 = none): the inactivity timeout still catches a dead peer fast, the
+// deadline catches a busy-but-useless one. Overridable at build time only for
+// the regression test (indexerd-stalltest); not a runtime knob.
+//   batch: ≤600 blocks per getdata, Doge/Pepe blocks ≤1 MB, typically tens of
+//          KB. 600 s = 1 s/block for a full batch. Blocks connect as they
+//          arrive, so a peer cut at the deadline loses no folded work — the
+//          next pass resumes from the new tip. (The old honest bound was only
+//          "≤15 s between messages", i.e. none.)
+//   weigh: one branch_outweighs (all pages). Its drain may first have to
+//          swallow the rest of the in-flight batch backlog; 300 s covers that
+//          plus ≥1 headers page (2000 headers ≈ 160 KB, ≲ a few MB with
+//          AuxPoW). A real reorg is short (forks below the 288 raw floor are
+//          refused anyway), so it outweighs on page one.
+//   round: the existing 10 s "no inv → idle round" wait after getblocks, now
+//          held across interleaved ping/addr instead of restarting per message.
+//   shake: whole sync-pass version/verack exchange (was ≤10 msgs × 8 s
+//          inactivity, unbounded with a trickled frame). Two RTTs on any honest
+//          link. (The serve plane's outbound handshake is already multiplexed
+//          with its own SERVE_DIAL_SHAKE_S budget.)
+#ifndef IDX_SYNC_BATCH_DEADLINE_S
+#define IDX_SYNC_BATCH_DEADLINE_S 600
+#endif
+#ifndef IDX_SYNC_WEIGH_DEADLINE_S
+#define IDX_SYNC_WEIGH_DEADLINE_S 300
+#endif
+#ifndef IDX_SYNC_ROUND_MS
+#define IDX_SYNC_ROUND_MS 10000
+#endif
+#ifndef IDX_NET_SHAKE_DEADLINE_MS
+#define IDX_NET_SHAKE_DEADLINE_MS 20000
+#endif
+static int64_t mono_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static int dl_passed(int64_t dl) { return dl && mono_ms() >= dl; }
+static int read_n(int fd, uint8_t *buf, size_t n, int timeout_ms, int64_t dl) {
     size_t got = 0;
     while (got < n) {
-        if (!stop_poll(fd, POLLIN, timeout_ms)) return 0;
+        int wait = timeout_ms;
+        if (dl) {                                    // clamp to the deadline
+            int64_t left = dl - mono_ms(); if (left <= 0) return 0;
+            if (left < wait) wait = (int)left;
+        }
+        if (!stop_poll(fd, POLLIN, wait)) return 0;
         ssize_t r = read(fd, buf + got, n - got); if (r <= 0) return 0; got += (size_t)r;
     }
     return 1;
 }
-static int net_recv(int fd, const uint8_t magic[4], char cmd_out[13], uint8_t **payload, uint32_t *len, int timeout_ms) {
-    uint8_t hdr[24]; if (!read_n(fd, hdr, 24, timeout_ms)) return 0;
+// 1 = message, 0 = dead/timeout/deadline (dl_passed(dl) tells which), -1 = bad frame
+static int net_recv_dl(int fd, const uint8_t magic[4], char cmd_out[13], uint8_t **payload, uint32_t *len,
+                       int timeout_ms, int64_t dl) {
+    uint8_t hdr[24]; if (!read_n(fd, hdr, 24, timeout_ms, dl)) return 0;
     if (memcmp(hdr, magic, 4) != 0) return -1;
     memcpy(cmd_out, hdr + 4, 12); cmd_out[12] = 0;
     uint32_t l = (uint32_t)hdr[16] | (uint32_t)hdr[17] << 8 | (uint32_t)hdr[18] << 16 | (uint32_t)hdr[19] << 24;
     if (l > IDX_MSG_MAX) return -1;
     uint8_t *buf = malloc(l ? l : 1);
-    if (l && !read_n(fd, buf, l, timeout_ms)) { free(buf); return 0; }
+    if (l && !read_n(fd, buf, l, timeout_ms, dl)) { free(buf); return 0; }
     uint8_t ck[32]; idx_sha256d(l ? buf : (const uint8_t *)"", l, ck);
     if (memcmp(hdr + 20, ck, 4) != 0) { free(buf); return -1; }
     *payload = buf; *len = l; return 1;
@@ -954,9 +1004,10 @@ static int p2p_handshake(int fd, const uint8_t magic[4], int64_t our_height) {
     if (!net_send(fd, magic, "version", v, (uint32_t)o)) return 0;
     // exchange until we see verack
     int got_verack = 0, sent_verack = 0;
+    int64_t sdl = mono_ms() + IDX_NET_SHAKE_DEADLINE_MS;
     for (int i = 0; i < 10; i++) {
         char cmd[13]; uint8_t *pl; uint32_t pl_len;
-        int r = net_recv(fd, magic, cmd, &pl, &pl_len, 8000); if (r != 1) { if (r == -1) continue; return got_verack && sent_verack; }
+        int r = net_recv_dl(fd, magic, cmd, &pl, &pl_len, 8000, sdl); if (r != 1) { if (r == -1) continue; return got_verack && sent_verack; }
         if (!strcmp(cmd, "version")) {
             uint64_t vn;                                 // did we just dial ourselves?
             if (ver_nonce(pl, pl_len, &vn) && vn == self_nonce()) { free(pl); return 2; }
@@ -1210,7 +1261,8 @@ static int branch_weigh(BranchCtx *bc, const Coin *coin, sqlite3 *db,
 }
 
 // 1 = the peer's branch is strictly heavier than ours above fork_h (reorg),
-// 0 = not heavier / unweighable (keep our chain), -1 = branch invalid (drop peer).
+// 0 = not heavier / unweighable (keep our chain), -1 = branch invalid (drop peer),
+// -2 = peer stalled past the weigh deadline (drop peer, no invalidity verdict).
 static int branch_outweighs(int fd, const Coin *coin, sqlite3 *db,
                             int64_t fork_h, const uint8_t fork_hash[32],
                             int64_t our_height, char *why, size_t cap) {
@@ -1228,6 +1280,7 @@ static int branch_outweighs(int fd, const Coin *coin, sqlite3 *db,
         uint8_t w[32]; idx_pow_work(bits, w); idx_pow_work_add(our_work, w);
     }
     BranchCtx bc; branch_seed(&bc, coin, db, fork_h, fork_hash);
+    int64_t wdl = mono_ms() + (int64_t)IDX_SYNC_WEIGH_DEADLINE_S * 1000;   // whole weigh, all pages
     for (int page = 0; page < 64 && !idx_sync_stop; page++) {  // ≤128k headers
         uint8_t gh[4 + 3 + 3*32]; int o = 0;
         for (int i = 0; i < 4; i++) gh[o++] = (70015 >> (8*i)) & 0xff;
@@ -1245,10 +1298,18 @@ static int branch_outweighs(int fd, const Coin *coin, sqlite3 *db,
         // forever (the branch it declined was the majority chain). The real
         // timeout still bounds a dead peer: net_recv returns 0 on a 15 s stall,
         // taking the `r != 1` exit below. Cap well above one batch as a
-        // junk-flood backstop.
+        // junk-flood backstop. A peer that is never silent but never sends
+        // the headers is cut by the weigh deadline (wdl) → -2, drop the peer.
         for (int tries = 0; tries < 4096 && !got && !idx_sync_stop; tries++) {
-            int r = net_recv(fd, coin->magic, cmd, &pl, &pl_len, 15000);
-            if (r != 1) { if (r == -1) continue; return 0; }         // dead/timeout → keep ours
+            int r = net_recv_dl(fd, coin->magic, cmd, &pl, &pl_len, 15000, wdl);
+            if (r != 1) {
+                if (r == -1) continue;
+                if (dl_passed(wdl)) {
+                    snprintf(why, cap, "no headers within the %ds weigh deadline", IDX_SYNC_WEIGH_DEADLINE_S);
+                    return -2;
+                }
+                return 0;                                            // dead/timeout → keep ours
+            }
             if (!strcmp(cmd, "ping")) { net_send(fd, coin->magic, "pong", pl, pl_len); free(pl); continue; }
             if (!strcmp(cmd, "headers")) { got = 1; break; }
             free(pl);                                                // drop interleaved inv/addr/block backlog
@@ -1621,6 +1682,7 @@ static int cmd_sync(int argc, char **argv) {
 
     int idle = 0;
     char vwhy[128];
+    int64_t rdl = 0;            // getblocks round deadline: survives ping/addr `continue`s
     while (idle < 3 && !idx_sync_stop) {
         // getblocks: standard exponential locator over our stored chain, terminated
         // by the profile checkpoint — after a reorg past our tip the peer then finds
@@ -1644,11 +1706,13 @@ static int cmd_sync(int argc, char **argv) {
         int got_any = 0;
         // collect block hashes from inv, request + fold each
         char cmd[13]; uint8_t *pl; uint32_t pl_len;
-        int r = net_recv(fd, coin->magic, cmd, &pl, &pl_len, 10000);
-        if (r != 1) { if (r == -1) continue; idle++; continue; }
+        if (!rdl) rdl = mono_ms() + IDX_SYNC_ROUND_MS;
+        int r = net_recv_dl(fd, coin->magic, cmd, &pl, &pl_len, IDX_SYNC_ROUND_MS, rdl);
+        if (r != 1) { if (r == -1) continue; idle++; rdl = 0; continue; }
         if (!strcmp(cmd, "ping")) { net_send(fd, coin->magic, "pong", pl, pl_len); free(pl); continue; }
         if (!strcmp(cmd, "addr")) { addr_harvest(db, pl, pl_len, 0); free(pl); continue; }
         if (strcmp(cmd, "inv") != 0) { free(pl); continue; }
+        rdl = 0;                // an inv answers the round (idle or a batch follows)
         // parse inv: varint count, then [type(4)+hash(32)] — request blocks (type 2).
         // Bounds-check the count varint against pl_len before every read (a peer
         // controls these bytes). inv counts are ≤50000 (MAX_INV_SZ) so 0xFD+2 is the
@@ -1669,10 +1733,21 @@ static int cmd_sync(int argc, char **argv) {
         go = 0; put_varint(getd, &go, (uint64_t)nwant);
         for (int i = 0; i < nwant; i++) { getd[go++]=2; getd[go++]=0; getd[go++]=0; getd[go++]=0; memcpy(getd + go, want[i], 32); go += 32; }
         net_send(fd, coin->magic, "getdata", getd, (uint32_t)go);
-        // receive nwant blocks (interleaved control messages tolerated)
+        // receive nwant blocks (interleaved control messages tolerated, but
+        // only inside the batch deadline — chatter no longer extends the wait)
         int recvd = 0;
+        int64_t bdl = mono_ms() + (int64_t)IDX_SYNC_BATCH_DEADLINE_S * 1000;
         while (recvd < nwant && !idx_sync_stop) {
-            r = net_recv(fd, coin->magic, cmd, &pl, &pl_len, 15000); if (r != 1) { if (r == -1) continue; break; }
+            r = net_recv_dl(fd, coin->magic, cmd, &pl, &pl_len, 15000, bdl);
+            if (r != 1) {
+                if (r == -1) continue;
+                if (dl_passed(bdl)) {
+                    fprintf(stderr, "peer %s stalled: %d of %d requested blocks within the %ds batch deadline — dropping peer\n",
+                            picked, recvd, nwant, IDX_SYNC_BATCH_DEADLINE_S);
+                    goto stalled_peer;
+                }
+                break;
+            }
             if (!strcmp(cmd, "ping")) { net_send(fd, coin->magic, "pong", pl, pl_len); free(pl); continue; }
             if (!strcmp(cmd, "addr")) { addr_harvest(db, pl, pl_len, 0); free(pl); continue; }
             if (strcmp(cmd, "block") != 0) { free(pl); continue; }
@@ -1707,6 +1782,10 @@ static int cmd_sync(int argc, char **argv) {
                 // fork (first-valid-peer-wins) must never rewrite the chain.
                 { char rwhy[160] = "";
                   int ow = branch_outweighs(fd, coin, db, fork_h, pl + 4, height, rwhy, sizeof rwhy);
+                  if (ow == -2) {
+                      fprintf(stderr, "peer %s stalled in branch weigh: %s — dropping peer\n", picked, rwhy);
+                      free(pl); goto stalled_peer;
+                  }
                   if (ow < 0) {
                       fprintf(stderr, "reorg branch from %s invalid: %s — abandoning peer\n", picked, rwhy);
                       free(pl); goto invalid_peer;
@@ -1763,6 +1842,18 @@ invalid_peer:
     // the peer served a provably invalid block: everything further from it is
     // suspect. Demote it (the ladder stops preferring it), persist what folded
     // before the poison, and end the pass — the next pass dials someone else.
+    idx_db_peer_bad(db, picked);
+    idx_db_project(db, s);
+    close(fd); serve_store_close(fc.serve); oracle_free(oracle); sm_free(s); idx_db_close(db);
+    return 1;
+
+stalled_peer:
+    // never silent, never useful: the peer kept the socket busy past a batch or
+    // weigh deadline without delivering what we asked for. Same exit as an
+    // invalid peer (no invalidity is claimed): demote it so the ladder rotates
+    // to another candidate, keep every block that already folded, end the pass.
+    // A re-handshake re-proves it (peer_seen), so an honest peer loses nothing
+    // but its place in the ladder.
     idx_db_peer_bad(db, picked);
     idx_db_project(db, s);
     close(fd); serve_store_close(fc.serve); oracle_free(oracle); sm_free(s); idx_db_close(db);

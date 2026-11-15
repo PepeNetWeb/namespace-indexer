@@ -124,7 +124,7 @@ test: indexerd
 	./indexerd selftest
 
 clean:
-	rm -rf indexerd indexerd.san build
+	rm -rf indexerd indexerd.san indexerd-stalltest build
 
 .PHONY: all test clean
 
@@ -185,14 +185,23 @@ test_net_policy: src/test_net_policy.c src/net_policy.c src/net_policy.h $(SQLIT
 
 # `make check` = the suites + test_peer_height.py. Run `make test` for the shipped selftest.
 # Every suite runs even if an earlier one fails; the target fails if any did.
-check: test_db test_sync test_codec test_serve test_net_policy test_snapshot test_rollback test_serve_accept test_serve_gossip indexerd
+# indexerd-stalltest: indexerd with SHORT receive deadlines (batch 6 s, weigh
+# 4 s, getblocks round 2 s, handshake 3 s) for scripts/test_sync_stall.py — the
+# sync slow-loris regression. Same sources; only the four #ifndef deadlines differ.
+STALL_DEFS := -DIDX_SYNC_BATCH_DEADLINE_S=6 -DIDX_SYNC_WEIGH_DEADLINE_S=4 \
+              -DIDX_SYNC_ROUND_MS=2000 -DIDX_NET_SHAKE_DEADLINE_MS=3000
+indexerd-stalltest: $(ALL_SRCS) $(wildcard src/*.h) $(wildcard $(SMDIR)/*.h) $(SECPLIB) $(SQLITE_OBJ)
+	$(CC) $(CFLAGS) $(STALL_DEFS) $(INCLUDES) $(SQLITE_CFLAGS) $(LINK_FLAGS) -o $@ $(ALL_SRCS) $(LIBS)
+
+check: test_db test_sync test_codec test_serve test_net_policy test_snapshot test_rollback test_serve_accept test_serve_gossip indexerd indexerd-stalltest
 	@rc=0; for t in ./test_db ./test_sync ./test_codec ./test_serve ./test_net_policy ./test_snapshot ./test_rollback ./test_serve_accept ./test_serve_gossip; do \
 	  echo "=== $$t ==="; $$t || rc=1; done; \
 	echo "=== scripts/test_peer_height.py ==="; python3 scripts/test_peer_height.py ./indexerd || rc=1; \
+	echo "=== scripts/test_sync_stall.py ==="; python3 scripts/test_sync_stall.py ./indexerd-stalltest || rc=1; \
 	if [ $$rc -eq 0 ]; then echo "check: ALL PASSED"; else echo "check: FAILED"; fi; exit $$rc
 
 check-clean:
-	rm -f test_db test_sync test_codec test_serve test_net_policy test_snapshot test_rollback test_serve_accept test_serve_gossip
+	rm -f test_db test_sync test_codec test_serve test_net_policy test_snapshot test_rollback test_serve_accept test_serve_gossip indexerd-stalltest
 
 .PHONY: check check-clean
 
