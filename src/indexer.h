@@ -182,6 +182,15 @@ typedef struct {
     void  (*peer_misbehave)(void *peer, int score, const char *why);
 } IdxMeshHooks;
 
+// Transport hooks for a mesh carrier (local policy only, nothing on the wire);
+// `peer` is the pointer idx_serve passed to peer_up. Serve thread only.
+//   pending: bytes queued for that conn but not yet written to its socket
+//   kick:    close that conn right after the mesh tick (logged; no ban/score)
+//   exempt:  1 for loopback/unknown-address peers and outbound seats we dialed
+size_t idx_serve_peer_pending(void *peer);
+void   idx_serve_peer_kick(void *peer, const char *why);
+int    idx_serve_peer_exempt(void *peer);
+
 /* Overlay / serve local-policy strike: add `n` to this SConn's score; at 100
  * ban the IPv4 24 h and drop the conn. `peer` is the SConn* from peer_up. */
 void serve_conn_misbehave(void *peer, int n, const char *why);

@@ -1959,6 +1959,7 @@ typedef struct {
                                       // next tick tries a different candidate
     int  feeler;                      // mesh seat probing a dnet=1 unconfirmed vouch
     int  score;                       // per-conn misbehavior; 100 → ban the IPv4
+    int  mesh_kick;                   // the mesh carrier asked to close this conn (L6, no ban)
     time_t   gd_win_t;                // getdata 10 s window start
     int      gd_blocks;
     uint32_t gd_bytes;
@@ -2107,7 +2108,7 @@ static void sconn_reset(SConn *c) {   // wipe transient state, keep outbound red
     c->fd = -1; c->up = c->sent_ver = c->got_ver = c->got_verack = 0;
     c->connecting = 0; c->shake_by = 0; c->peer_svc = 0;
     c->peer[0] = 0; c->agent[0] = 0; c->hip[0] = 0; c->peer_h = 0; c->mesh_handle = NULL; c->dn_asked = 0; c->mesh_seat = 0;
-    c->self_sent = 0; c->chain_seat = 0; c->feeler = 0; c->score = 0;
+    c->self_sent = 0; c->chain_seat = 0; c->feeler = 0; c->score = 0; c->mesh_kick = 0;
     c->gd_win_t = 0; c->gd_blocks = 0; c->gd_bytes = 0;
     c->last_rx = 0; c->last_ping = 0; c->last_pull = 0;
     c->last_dnget = 0; c->got_dnaddr = 0; c->last_dnaddr_n = 0;
@@ -2127,6 +2128,24 @@ void serve_conn_misbehave(void *peer, int n, const char *why) {
             ip[0] ? ip : c->peer, c->score, why ? why : "");
     if (ip[0]) net_policy_ban(ip, time(NULL));
     serve_drop(c, g_serve_mesh);
+}
+// transport hooks for the mesh carrier (indexer.h): `peer` is the pointer
+// handed to peer_up; valid until peer_down. All three run on the serve thread.
+size_t idx_serve_peer_pending(void *peer) {
+    SConn *sc = (SConn *)peer;
+    return sc->fd >= 0 && sc->out_len > sc->out_off ? sc->out_len - sc->out_off : 0;
+}
+void idx_serve_peer_kick(void *peer, const char *why) {
+    SConn *sc = (SConn *)peer;
+    if (sc->fd < 0 || sc->mesh_kick) return;
+    sc->mesh_kick = 1;                               // closed right after the mesh tick; no ban, no score
+    fprintf(stderr, "serve: %s dropped by the mesh carrier (%s)\n",
+            sc->peer[0] ? sc->peer : "(peer)", why ? why : "-");
+}
+int idx_serve_peer_exempt(void *peer) {
+    SConn *sc = (SConn *)peer;
+    if (sc->outbound) return 1;                      // a seat we chose to dial
+    return !strncmp(sc->peer, "127.", 4) || !strncmp(sc->peer, "::1", 3) || !sc->peer[0];
 }
 // close + notify the mesh (peer_down) if this was a live mesh peer
 static void serve_drop(SConn *c, const IdxMeshHooks *mesh) {
@@ -3233,6 +3252,8 @@ int idx_serve(const char *coinname, const char *dbpath, uint16_t port,
             }
         }
         if (mesh && mesh->tick) mesh->tick(mesh->ud);
+        for (int i = 0; i < SERVE_MAX_CONN; i++)        // L6: closes the carrier asked for
+            if (conns[i].fd >= 0 && conns[i].mesh_kick) serve_drop(&conns[i], mesh);
 
         struct pollfd pfd[SERVE_MAX_CONN + 1]; int map[SERVE_MAX_CONN + 1]; int np = 0;
         if (lfd >= 0) { pfd[np].fd = lfd; pfd[np].events = POLLIN; map[np] = -1; np++; }
