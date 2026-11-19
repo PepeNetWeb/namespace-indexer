@@ -1,0 +1,55 @@
+# CI for PepeNetWeb/namespace-indexer — build + unit/regression tests on x86_64 and arm64.
+# Free GitHub-hosted runners (public repo). No secrets, no deploy, no network
+# beyond cloning sibling public repos; tests bind loopback only.
+#
+# Skipped on purpose (documented, not hidden):
+#   - test_serve_accept, test_serve_gossip: pre-existing failures on main
+#     (serve_accept fails; serve_gossip has no rule for build/gossip-mesh/*.o).
+#     Every other suite from 'make check' runs below, plus both python checks.
+#   - CFLAGS adds -D_DEFAULT_SOURCE: the Makefile default targets macOS and
+#     glibc hides POSIX/BSD prototypes without it.
+name: ci
+on:
+  push:
+    branches: [main, 'ci/**', 'keeper/**', 'fix/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: deps
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends libsqlite3-dev cmake
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: namespace-indexer
+          submodules: true
+          persist-credentials: false
+      - name: build
+        working-directory: namespace-indexer
+        env:
+          CFLAGS: -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Wno-unused-parameter
+        run: |
+          make -j"$(nproc)" build/secp/lib/libsecp256k1.a
+          make -j"$(nproc)" indexerd indexerd-stalltest test_db test_sync test_codec test_serve test_net_policy test_snapshot test_rollback
+      - name: test
+        working-directory: namespace-indexer
+        timeout-minutes: 15
+        run: |
+          rc=0
+          for t in test_db test_sync test_codec test_serve test_net_policy test_snapshot test_rollback; do
+            echo "=== $t"; "./$t" || rc=1
+          done
+          echo "=== test_peer_height.py"; python3 scripts/test_peer_height.py ./indexerd || rc=1
+          echo "=== test_sync_stall.py";  python3 scripts/test_sync_stall.py ./indexerd-stalltest || rc=1
+          exit "$rc"
