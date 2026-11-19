@@ -29,6 +29,8 @@
 //
 // All money is int64 koinu. There is no floating point anywhere in this file.
 #include "db.h"
+#include "sm.h"
+#include <sqlite3.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -437,6 +439,33 @@ static void sec_mesh_nat_backoff(const char *dir) {
     idx_db_close(db); rm_db(p);
 }
 
+// 7. NULL / short blob fields: a names row written with only
+//    name/owner/owner_type/lease_expiry/st (seller/buyer NULL, as a hand-made or
+//    older fixture does) must load, not SIGSEGV in memcpy(…, NULL, 20).
+static void sec_null_blob(const char *dir) {
+    printf("\n-- NULL / short blob fields load without crashing --\n");
+    char p[600]; snprintf(p, sizeof p, "%s/nullblob.db", dir);
+    sqlite3 *db = idx_db_open(p);
+    CHECK(db != NULL, "open nullblob.db");
+    if (!db) return;
+    uint8_t own[20]; mk_h160(own, 0x42);
+    sqlite3_stmt *st;
+    int ok = sqlite3_prepare_v2(db, "INSERT INTO names(name,owner,owner_type,lease_expiry,st) VALUES('nullseller',?,0,1099511627776,0)", -1, &st, NULL) == SQLITE_OK;
+    if (ok) { sqlite3_bind_blob(st, 1, own, 20, SQLITE_STATIC); ok = sqlite3_step(st) == SQLITE_DONE; sqlite3_finalize(st); }
+    ok = ok && sqlite3_exec(db, "INSERT INTO names(name,owner,owner_type,lease_expiry,st) VALUES('shortowner',x'0102',0,1099511627776,0)", NULL, NULL, NULL) == SQLITE_OK;
+    CHECK(ok, "seed rows with NULL seller/buyer and a 2-byte owner");
+    SmState *s = sm_new(0);
+    idx_db_load_state(db, s);                       /* crashed here before the fix */
+    CHECK(1, "idx_db_load_state returns on NULL/short blobs");
+    char hex[41] = "", stv[64] = "";
+    idx_db_resolve(db, "nullseller", hex, stv);
+    CHECK(!strcmp(hex, "4242424242424242424242424242424242424242"), "idx_db_resolve still reads the exact-size owner");
+    IdxNameRow row; memset(&row, 0, sizeof row);
+    CHECK(idx_db_name_row(db, "nullseller", &row) == 1, "idx_db_name_row finds the row with NULL seller/buyer");
+    sm_free(s);
+    idx_db_close(db);
+}
+
 int main(void) {
     char dir[] = "/tmp/idx_test_db_XXXXXX";
     if (!mkdtemp(dir)) { fprintf(stderr, "mkdtemp failed\n"); return 1; }
@@ -455,10 +484,11 @@ int main(void) {
     sec_property(dir);
     sec_idempotence(dir);
     sec_mesh_nat_backoff(dir);
+    sec_null_blob(dir);
 
     // teardown: the temp tree goes away entirely.
     rm_db(main_db);
-    { const char *leftovers[] = { "minunspent.db", "flags.db", "flags2.db", "prop.db", "idem.db" };
+    { const char *leftovers[] = { "minunspent.db", "flags.db", "flags2.db", "prop.db", "idem.db" , "nullblob.db" };
       for (unsigned i = 0; i < sizeof leftovers / sizeof leftovers[0]; i++) {
           char p[600]; snprintf(p, sizeof p, "%s/%s", dir, leftovers[i]); rm_db(p);
       } }

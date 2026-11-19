@@ -942,36 +942,60 @@ int idx_db_ckpt_seed(sqlite3 *db, SmState *s) {
     return -1;
 }
 
+/* A names/muts row written by this indexer always carries 20-byte owner/seller/
+ * buyer blobs, but a hand-made fixture or a damaged db may hold NULL or short
+ * values there. sqlite3_column_blob() returns NULL for those, and copying from it
+ * crashed the sync thread on its first pass (greatdane-node: SIGSEGV seconds after
+ * start, whatever the lazy wait). Copy only exact-size blobs; zero-fill (= "none")
+ * otherwise. Valid dbs are unaffected (no format change). */
+static int col_blob_exact(sqlite3_stmt *st, int col, uint8_t *dst, int n) {
+    const void *b = sqlite3_column_blob(st, col);
+    if (b && sqlite3_column_bytes(st, col) == n) { memcpy(dst, b, (size_t)n); return 1; }
+    memset(dst, 0, (size_t)n);
+    return 0;
+}
+
 int idx_db_load_state(sqlite3 *db, SmState *s) {
-    int n = 0; sqlite3_stmt *st;
+    int n = 0, bad = 0; sqlite3_stmt *st;
     sqlite3_prepare_v2(db, "SELECT name,owner,owner_type,lease_expiry,st,seller,seller_type,price,offer_expiry,buyer,burn_leg,pay_leg,reserve_expiry FROM names", -1, &st, NULL);
     while (sqlite3_step(st) == SQLITE_ROW) {
         const char *name = (const char *)sqlite3_column_text(st, 0); int nl = sqlite3_column_bytes(st, 0);
+        if (!name || nl <= 0 || nl > SM_NAME_MAX) { bad++; continue; }   /* NULL/empty/overlong key: not a name */
         SmNameRow *r = sm_add_name(s, name, (size_t)nl);
-        memcpy(r->owner, sqlite3_column_blob(st, 1), 20); r->owner_type = (uint8_t)sqlite3_column_int(st, 2);
+        if (!r) continue;
+        if (!col_blob_exact(st, 1, r->owner, 20)) bad++;
+        r->owner_type = (uint8_t)sqlite3_column_int(st, 2);
         r->lease_expiry = sqlite3_column_int64(st, 3); r->st = (SmNameState)sqlite3_column_int(st, 4);
-        memcpy(r->seller, sqlite3_column_blob(st, 5), 20); r->seller_type = (uint8_t)sqlite3_column_int(st, 6);
+        if (!col_blob_exact(st, 5, r->seller, 20)) bad++;
+        r->seller_type = (uint8_t)sqlite3_column_int(st, 6);
         r->price = (uint64_t)sqlite3_column_int64(st, 7); r->offer_expiry = sqlite3_column_int64(st, 8);
-        memcpy(r->buyer, sqlite3_column_blob(st, 9), 20);
+        if (!col_blob_exact(st, 9, r->buyer, 20)) bad++;
         r->burn_leg = (uint64_t)sqlite3_column_int64(st, 10); r->pay_leg = (uint64_t)sqlite3_column_int64(st, 11);
         r->reserve_expiry = sqlite3_column_int64(st, 12); n++;
     }
     sqlite3_finalize(st);
     sqlite3_prepare_v2(db, "SELECT commitment,commit_height,tx_index,commit_time FROM commits", -1, &st, NULL);
     while (sqlite3_step(st) == SQLITE_ROW) {
+        if (!sqlite3_column_blob(st, 0) || sqlite3_column_bytes(st, 0) != 32) { bad++; continue; }
         sm_commit_add(s, sqlite3_column_blob(st, 0), sqlite3_column_int64(st, 1), (uint32_t)sqlite3_column_int64(st, 2), sqlite3_column_int64(st, 3)); n++;
     }
     sqlite3_finalize(st);
     sqlite3_prepare_v2(db, "SELECT owner,height FROM muts", -1, &st, NULL);
-    while (sqlite3_step(st) == SQLITE_ROW) { sm_bump_mutation(s, sqlite3_column_blob(st, 0), sqlite3_column_int64(st, 1)); n++; }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (!sqlite3_column_blob(st, 0) || sqlite3_column_bytes(st, 0) != 20) { bad++; continue; }
+        sm_bump_mutation(s, sqlite3_column_blob(st, 0), sqlite3_column_int64(st, 1)); n++;
+    }
     sqlite3_finalize(st);
+    if (bad) {
+        fprintf(stderr, "db: %d malformed row field(s) (NULL/short blob) zero-filled or skipped on load\n", bad);
+    }
     return n;
 }
 
 int idx_db_resolve(sqlite3 *db, const char *name, char owner_hex[41], char *state_out) {
     sqlite3_stmt *st; sqlite3_prepare_v2(db, "SELECT owner,st FROM names WHERE name=?", -1, &st, NULL);
     sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC); int found = 0;
-    if (sqlite3_step(st) == SQLITE_ROW) { tohex(sqlite3_column_blob(st, 0), 20, owner_hex); if (state_out) *state_out = (char)sqlite3_column_int(st, 1); found = 1; }
+    if (sqlite3_step(st) == SQLITE_ROW) { uint8_t ow[20]; col_blob_exact(st, 0, ow, 20); tohex(ow, 20, owner_hex); if (state_out) *state_out = (char)sqlite3_column_int(st, 1); found = 1; }
     sqlite3_finalize(st); return found;
 }
 int idx_db_name_row(sqlite3 *db, const char *name, IdxNameRow *out) {
@@ -980,11 +1004,11 @@ int idx_db_name_row(sqlite3 *db, const char *name, IdxNameRow *out) {
     sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
     if (sqlite3_step(st) == SQLITE_ROW) {
         memset(out, 0, sizeof *out);
-        memcpy(out->owner, sqlite3_column_blob(st, 0), 20); out->owner_type = (uint8_t)sqlite3_column_int(st, 1);
+        col_blob_exact(st, 0, out->owner, 20); out->owner_type = (uint8_t)sqlite3_column_int(st, 1);
         out->lease_expiry = sqlite3_column_int64(st, 2); out->st = sqlite3_column_int(st, 3);
-        memcpy(out->seller, sqlite3_column_blob(st, 4), 20); out->seller_type = (uint8_t)sqlite3_column_int(st, 5);
+        col_blob_exact(st, 4, out->seller, 20); out->seller_type = (uint8_t)sqlite3_column_int(st, 5);
         out->price = (uint64_t)sqlite3_column_int64(st, 6); out->offer_expiry = sqlite3_column_int64(st, 7);
-        memcpy(out->buyer, sqlite3_column_blob(st, 8), 20);
+        col_blob_exact(st, 8, out->buyer, 20);
         out->burn_leg = (uint64_t)sqlite3_column_int64(st, 9); out->pay_leg = (uint64_t)sqlite3_column_int64(st, 10);
         out->reserve_expiry = sqlite3_column_int64(st, 11); found = 1;
     }
